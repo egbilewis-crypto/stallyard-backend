@@ -4,7 +4,7 @@ const bcrypt = require("bcrypt");
 const fetch = require("node-fetch");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -218,6 +218,64 @@ app.post("/checkout", async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+const crypto = require("crypto");
+
+app.post("/webhook/paystack", async (req, res) => {
+  try {
+    const signature = req.headers["x-paystack-signature"];
+    const expectedSignature = crypto
+      .createHmac("sha512", process.env.PAYSTACK_SECRET_KEY)
+      .update(req.rawBody)
+      .digest("hex");
+
+    if (signature !== expectedSignature) {
+      return res.status(401).send("Invalid signature");
+    }
+
+    const event = req.body;
+
+    if (event.event === "charge.success") {
+      const { buyerId, listingId } = event.data.metadata;
+      const client = await pool.connect();
+
+      try {
+        await client.query("BEGIN");
+
+        const listingResult = await client.query(
+          "SELECT * FROM listings WHERE id = $1 AND status != 'sold'",
+          [listingId]
+        );
+
+        if (listingResult.rows.length > 0) {
+          const listing = listingResult.rows[0];
+
+          await client.query(
+            `INSERT INTO orders (buyer_id, total, currency, payment_status)
+             VALUES ($1, $2, $3, 'released')`,
+            [buyerId, listing.price, listing.currency]
+          );
+
+          await client.query(
+            "UPDATE listings SET status = 'sold' WHERE id = $1",
+            [listingId]
+          );
+        }
+
+        await client.query("COMMIT");
+      } catch (err) {
+        await client.query("ROLLBACK");
+        console.error("Webhook processing error:", err.message);
+      } finally {
+        client.release();
+      }
+    }
+
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("Webhook error:", err.message);
+    res.sendStatus(500);
   }
 });
 
