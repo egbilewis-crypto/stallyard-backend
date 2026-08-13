@@ -116,6 +116,62 @@ app.get("/listings", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+app.post("/orders", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { buyerId, listingId } = req.body;
+
+    if (!buyerId || !listingId) {
+      return res.status(400).json({ error: "Missing buyerId or listingId" });
+    }
+
+    await client.query("BEGIN");
+
+    const listingResult = await client.query(
+      "SELECT * FROM listings WHERE id = $1 AND status != 'sold'",
+      [listingId]
+    );
+
+    if (listingResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Listing not found or already sold" });
+    }
+
+    const listing = listingResult.rows[0];
+
+    const orderResult = await client.query(
+      `INSERT INTO orders (buyer_id, total, currency)
+       VALUES ($1, $2, $3)
+       RETURNING *`,
+      [buyerId, listing.price, listing.currency]
+    );
+
+    await client.query(
+      "UPDATE listings SET status = 'sold' WHERE id = $1",
+      [listingId]
+    );
+
+    await client.query("COMMIT");
+    res.status(201).json({ order: orderResult.rows[0], listing });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/orders/:buyerId", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM orders WHERE buyer_id = $1 ORDER BY created_at DESC",
+      [req.params.buyerId]
+    );
+    res.json({ orders: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
