@@ -82,6 +82,40 @@ app.post("/login", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+app.post("/listings", async (req, res) => {
+  try {
+    const { ownerId, title, description, price, category, condition, shippingFee } = req.body;
+
+    if (!ownerId || !title || !price) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO listings (owner_id, title, description, price, category, condition, shipping_fee)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING *`,
+      [ownerId, title, description || "", price, category || "Other", condition || "New", shippingFee || 0]
+    );
+
+    res.status(201).json({ listing: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/listings", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT listings.*, users.display_name AS seller_name
+       FROM listings
+       JOIN users ON listings.owner_id = users.id
+       ORDER BY listings.created_at DESC`
+    );
+    res.json({ listings: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
