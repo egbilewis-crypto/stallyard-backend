@@ -1,6 +1,7 @@
 const express = require("express");
 const { Pool } = require("pg");
 const bcrypt = require("bcrypt");
+const fetch = require("node-fetch");
 
 const app = express();
 app.use(express.json());
@@ -168,6 +169,53 @@ app.get("/orders/:buyerId", async (req, res) => {
       [req.params.buyerId]
     );
     res.json({ orders: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+app.post("/checkout", async (req, res) => {
+  try {
+    const { buyerId, listingId, email } = req.body;
+
+    if (!buyerId || !listingId || !email) {
+      return res.status(400).json({ error: "Missing buyerId, listingId, or email" });
+    }
+
+    const listingResult = await pool.query(
+      "SELECT * FROM listings WHERE id = $1 AND status != 'sold'",
+      [listingId]
+    );
+
+    if (listingResult.rows.length === 0) {
+      return res.status(404).json({ error: "Listing not found or already sold" });
+    }
+
+    const listing = listingResult.rows[0];
+    const amountInKobo = Math.round(Number(listing.price) * 100);
+
+    const paystackRes = await fetch("https://api.paystack.co/transaction/initialize", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        email,
+        amount: amountInKobo,
+        metadata: { buyerId, listingId },
+      }),
+    });
+
+    const paystackData = await paystackRes.json();
+
+    if (!paystackData.status) {
+      return res.status(500).json({ error: paystackData.message || "Paystack error" });
+    }
+
+    res.json({
+      authorizationUrl: paystackData.data.authorization_url,
+      reference: paystackData.data.reference,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
