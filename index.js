@@ -48,6 +48,40 @@ app.post("/signup", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+app.post("/login", async (req, res) => {
+  try {
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({ error: "Missing username or password" });
+    }
+
+    const result = await pool.query(
+      "SELECT id, username, email, display_name, password_hash, is_suspended FROM users WHERE username = $1",
+      [username]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: "Username or password doesn't match" });
+    }
+
+    const user = result.rows[0];
+    const passwordMatches = await bcrypt.compare(password, user.password_hash);
+
+    if (!passwordMatches) {
+      return res.status(401).json({ error: "Username or password doesn't match" });
+    }
+
+    if (user.is_suspended) {
+      return res.status(403).json({ error: "This account has been suspended" });
+    }
+
+    delete user.password_hash;
+    res.json({ user });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
