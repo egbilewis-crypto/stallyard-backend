@@ -278,6 +278,50 @@ app.post("/webhook/paystack", async (req, res) => {
     res.sendStatus(500);
   }
 });
+app.post("/sellers/bank-details", async (req, res) => {
+  try {
+    const { userId, bankCode, accountNumber } = req.body;
+
+    if (!userId || !bankCode || !accountNumber) {
+      return res.status(400).json({ error: "Missing userId, bankCode, or accountNumber" });
+    }
+
+    const userResult = await pool.query("SELECT display_name FROM users WHERE id = $1", [userId]);
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const recipientRes = await fetch("https://api.paystack.co/transferrecipient", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        type: "nuban",
+        name: userResult.rows[0].display_name,
+        account_number: accountNumber,
+        bank_code: bankCode,
+        currency: "NGN",
+      }),
+    });
+
+    const recipientData = await recipientRes.json();
+
+    if (!recipientData.status) {
+      return res.status(400).json({ error: recipientData.message || "Could not verify bank details" });
+    }
+
+    await pool.query(
+      "UPDATE users SET bank_code = $1, account_number = $2, paystack_recipient_code = $3 WHERE id = $4",
+      [bankCode, accountNumber, recipientData.data.recipient_code, userId]
+    );
+
+    res.json({ success: true, recipientCode: recipientData.data.recipient_code });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
