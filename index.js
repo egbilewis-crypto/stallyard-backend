@@ -322,6 +322,51 @@ app.post("/sellers/bank-details", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+app.post("/sellers/payout", async (req, res) => {
+  try {
+    const { userId, amount, reason } = req.body;
+
+    if (!userId || !amount) {
+      return res.status(400).json({ error: "Missing userId or amount" });
+    }
+
+    const userResult = await pool.query(
+      "SELECT paystack_recipient_code FROM users WHERE id = $1",
+      [userId]
+    );
+
+    if (userResult.rows.length === 0 || !userResult.rows[0].paystack_recipient_code) {
+      return res.status(400).json({ error: "This seller hasn't added bank details yet" });
+    }
+
+    const recipientCode = userResult.rows[0].paystack_recipient_code;
+    const amountInKobo = Math.round(Number(amount) * 100);
+
+    const transferRes = await fetch("https://api.paystack.co/transfer", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        source: "balance",
+        amount: amountInKobo,
+        recipient: recipientCode,
+        reason: reason || "Stallyard seller payout",
+      }),
+    });
+
+    const transferData = await transferRes.json();
+
+    if (!transferData.status) {
+      return res.status(400).json({ error: transferData.message || "Payout failed" });
+    }
+
+    res.json({ success: true, transfer: transferData.data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
