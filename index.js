@@ -446,6 +446,52 @@ app.get("/messages/:threadId", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+app.post("/reviews", async (req, res) => {
+  try {
+    const { orderId, listingId, buyerId, sellerId, rating, comment } = req.body;
+
+    if (!orderId || !listingId || !buyerId || !sellerId || !rating) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+    if (rating < 1 || rating > 5) {
+      return res.status(400).json({ error: "Rating must be between 1 and 5" });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO reviews (order_id, listing_id, buyer_id, seller_id, rating, comment)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [orderId, listingId, buyerId, sellerId, rating, comment || null]
+    );
+
+    res.status(201).json({ review: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/listings/:id/reviews", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM reviews WHERE listing_id = $1 ORDER BY created_at DESC",
+      [req.params.id]
+    );
+    res.json({ reviews: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/sellers/:id/reviews", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM reviews WHERE seller_id = $1 ORDER BY created_at DESC",
+      [req.params.id]
+    );
+    res.json({ reviews: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
