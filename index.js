@@ -367,6 +367,85 @@ app.post("/sellers/payout", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+app.post("/threads", async (req, res) => {
+  try {
+    const { listingId, buyerId, sellerId } = req.body;
+
+    if (!listingId || !buyerId || !sellerId) {
+      return res.status(400).json({ error: "Missing listingId, buyerId, or sellerId" });
+    }
+
+    const existing = await pool.query(
+      "SELECT * FROM threads WHERE listing_id = $1 AND buyer_id = $2 AND seller_id = $3",
+      [listingId, buyerId, sellerId]
+    );
+
+    if (existing.rows.length > 0) {
+      return res.json({ thread: existing.rows[0] });
+    }
+
+    const result = await pool.query(
+      "INSERT INTO threads (listing_id, buyer_id, seller_id) VALUES ($1, $2, $3) RETURNING *",
+      [listingId, buyerId, sellerId]
+    );
+
+    res.status(201).json({ thread: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/threads/:userId", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM threads WHERE buyer_id = $1 OR seller_id = $1 ORDER BY created_at DESC",
+      [req.params.userId]
+    );
+    res.json({ threads: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/messages", async (req, res) => {
+  try {
+    const { threadId, senderId, body, messageType, offerAmount } = req.body;
+
+    if (!threadId || !senderId) {
+      return res.status(400).json({ error: "Missing threadId or senderId" });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO messages (thread_id, sender_id, message_type, body, offer_amount, offer_status)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [
+        threadId,
+        senderId,
+        messageType || "text",
+        body || "",
+        offerAmount || null,
+        messageType === "offer" ? "pending" : null,
+      ]
+    );
+
+    res.status(201).json({ message: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/messages/:threadId", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM messages WHERE thread_id = $1 ORDER BY created_at ASC",
+      [req.params.threadId]
+    );
+    res.json({ messages: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
