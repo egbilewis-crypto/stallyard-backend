@@ -26,7 +26,7 @@ app.get("/db-check", async (req, res) => {
 
 app.post("/signup", async (req, res) => {
   try {
-    const { username, email, phone, password, displayName } = req.body;
+    const { username, email, phone, password, displayName, firstName, lastName, officeLocation, country } = req.body;
 
     if (!username || !email || !phone || !password) {
       return res.status(400).json({ error: "Missing required fields" });
@@ -34,11 +34,14 @@ app.post("/signup", async (req, res) => {
 
     const passwordHash = await bcrypt.hash(password, 10);
 
+    const countResult = await pool.query("SELECT COUNT(*) FROM users");
+    const isFirstUser = Number(countResult.rows[0].count) === 0;
+
     const result = await pool.query(
-      `INSERT INTO users (username, email, phone, password_hash, display_name)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, username, email, display_name, created_at`,
-      [username, email, phone, passwordHash, displayName || username]
+      `INSERT INTO users (username, email, phone, password_hash, display_name, first_name, last_name, office_location, country, is_admin, is_approved)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       RETURNING id, username, email, phone, display_name, first_name, last_name, office_location, country, is_admin, is_approved, is_verified, is_suspended, created_at`,
+      [username, email, phone, passwordHash, displayName || username, firstName || "", lastName || "", officeLocation || "", country || "", isFirstUser, isFirstUser]
     );
 
     res.status(201).json({ user: result.rows[0] });
