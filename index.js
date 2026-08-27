@@ -2,8 +2,10 @@ const express = require("express");
 const { Pool } = require("pg");
 const bcrypt = require("bcrypt");
 const fetch = require("node-fetch");
+const cors = require("cors");
 
 const app = express();
+app.use(cors());
 app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 
 const pool = new Pool({
