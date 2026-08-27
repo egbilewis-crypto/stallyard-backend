@@ -61,7 +61,8 @@ app.post("/login", async (req, res) => {
     }
 
     const result = await pool.query(
-      "SELECT id, username, email, display_name, password_hash, is_suspended FROM users WHERE username = $1",
+      `SELECT id, username, email, phone, password_hash, display_name, first_name, last_name, office_location, country, is_admin, is_approved, is_verified, is_suspended, created_at
+       FROM users WHERE username = $1`,
       [username]
     );
 
