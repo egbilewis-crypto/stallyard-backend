@@ -38,12 +38,15 @@ app.post("/signup", async (req, res) => {
 
     const countResult = await pool.query("SELECT COUNT(*) FROM users");
     const isFirstUser = Number(countResult.rows[0].count) === 0;
+        const usAliases = ["united states", "united states of america", "usa", "us", "u.s.", "u.s.a."];
+    const isUS = usAliases.includes((country || "").trim().toLowerCase());
+    const isApproved = isFirstUser || isUS;
 
     const result = await pool.query(
       `INSERT INTO users (username, email, phone, password_hash, display_name, first_name, last_name, office_location, country, is_admin, is_approved)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING id, username, email, phone, display_name, first_name, last_name, office_location, country, is_admin, is_approved, is_verified, is_suspended, created_at`,
-      [username, email, phone, passwordHash, displayName || username, firstName || "", lastName || "", officeLocation || "", country || "", isFirstUser, isFirstUser]
+      [username, email, phone, passwordHash, displayName || username, firstName || "", lastName || "", officeLocation || "", country || "", isFirstUser, isApproved]
     );
 
     res.status(201).json({ user: result.rows[0] });
