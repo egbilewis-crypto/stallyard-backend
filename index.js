@@ -26,9 +26,34 @@ app.get("/db-check", async (req, res) => {
   }
 });
 
+// One-time migration: adds the columns needed for account type, ID
+// verification documents, and admin-facing member data. Safe to visit
+// more than once — IF NOT EXISTS means it won't duplicate anything.
+app.get("/migrate/members-extra", async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS account_type TEXT DEFAULT 'personal',
+        ADD COLUMN IF NOT EXISTS id_type TEXT DEFAULT '',
+        ADD COLUMN IF NOT EXISTS id_country TEXT DEFAULT '',
+        ADD COLUMN IF NOT EXISTS license_number TEXT DEFAULT '',
+        ADD COLUMN IF NOT EXISTS license_photos JSONB DEFAULT '[]'::jsonb,
+        ADD COLUMN IF NOT EXISTS id_verification_exempt BOOLEAN DEFAULT false,
+        ADD COLUMN IF NOT EXISTS has_applied_to_sell BOOLEAN DEFAULT false
+    `);
+    res.send("Migration complete: members-extra columns added.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.post("/signup", async (req, res) => {
   try {
-    const { username, email, phone, password, displayName, firstName, lastName, officeLocation, country } = req.body;
+    const {
+      username, email, phone, password, displayName, firstName, lastName,
+      officeLocation, country, accountType, idType, idCountry, licenseNumber,
+      licensePhotos, idVerificationExempt,
+    } = req.body;
 
     if (!username || !email || !phone || !password) {
       return res.status(400).json({ error: "Missing required fields" });
@@ -38,15 +63,26 @@ app.post("/signup", async (req, res) => {
 
     const countResult = await pool.query("SELECT COUNT(*) FROM users");
     const isFirstUser = Number(countResult.rows[0].count) === 0;
-        const usAliases = ["united states", "united states of america", "usa", "us", "u.s.", "u.s.a."];
+    const usAliases = ["united states", "united states of america", "usa", "us", "u.s.", "u.s.a."];
     const isUS = usAliases.includes((country || "").trim().toLowerCase());
     const isApproved = isFirstUser || isUS;
 
     const result = await pool.query(
-      `INSERT INTO users (username, email, phone, password_hash, display_name, first_name, last_name, office_location, country, is_admin, is_approved)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-       RETURNING id, username, email, phone, display_name, first_name, last_name, office_location, country, is_admin, is_approved, is_verified, is_suspended, created_at`,
-      [username, email, phone, passwordHash, displayName || username, firstName || "", lastName || "", officeLocation || "", country || "", isFirstUser, isApproved]
+      `INSERT INTO users (
+         username, email, phone, password_hash, display_name, first_name, last_name,
+         office_location, country, is_admin, is_approved, account_type, id_type,
+         id_country, license_number, license_photos, id_verification_exempt
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+       RETURNING id, username, email, phone, display_name, first_name, last_name, office_location,
+         country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type,
+         id_country, license_number, license_photos, id_verification_exempt, created_at`,
+      [
+        username, email, phone, passwordHash, displayName || username, firstName || "", lastName || "",
+        officeLocation || "", country || "", isFirstUser, isApproved, accountType || "personal",
+        idType || "", idCountry || "", licenseNumber || "", JSON.stringify(licensePhotos || []),
+        !!idVerificationExempt,
+      ]
     );
 
     res.status(201).json({ user: result.rows[0] });
@@ -57,6 +93,21 @@ app.post("/signup", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+// Full member list for the admin dashboard. No password hashes returned.
+app.get("/users", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, username, email, phone, display_name, first_name, last_name, office_location,
+         country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
+         license_number, license_photos, id_verification_exempt, has_applied_to_sell, created_at
+       FROM users ORDER BY display_name ASC`
+    );
+    res.json({ users: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/login", async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -66,7 +117,9 @@ app.post("/login", async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT id, username, email, phone, password_hash, display_name, first_name, last_name, office_location, country, is_admin, is_approved, is_verified, is_suspended, created_at
+      `SELECT id, username, email, phone, password_hash, display_name, first_name, last_name, office_location,
+         country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
+         license_number, license_photos, id_verification_exempt, created_at
        FROM users WHERE username = $1`,
       [username]
     );
