@@ -47,6 +47,24 @@ app.get("/migrate/members-extra", async (req, res) => {
   }
 });
 
+// One-time migration: creates the follows table (seller storefront follow/unfollow).
+app.get("/migrate/follows", async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS follows (
+        id SERIAL PRIMARY KEY,
+        follower_username TEXT NOT NULL,
+        followed_username TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE (follower_username, followed_username)
+      )
+    `);
+    res.send("Migration complete: follows table created.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.post("/signup", async (req, res) => {
   try {
     const {
@@ -170,6 +188,86 @@ app.delete("/users/:id", async (req, res) => {
   try {
     const result = await pool.query("DELETE FROM users WHERE id = $1 RETURNING id", [req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Lets an admin create a real account directly (used by the admin "Add member" tool).
+app.post("/admin/create-member", async (req, res) => {
+  try {
+    const { username, email, phone, password, displayName, isAdmin, isApproved, isVerified } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({ error: "Missing username or password" });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    const result = await pool.query(
+      `INSERT INTO users (username, email, phone, password_hash, display_name, is_admin, is_approved, is_verified)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING ${USER_RETURNING_FIELDS}`,
+      [
+        username,
+        email || "",
+        phone || "",
+        passwordHash,
+        displayName || username,
+        !!isAdmin,
+        isApproved !== false,
+        !!isVerified,
+      ]
+    );
+
+    res.status(201).json({ user: result.rows[0] });
+  } catch (err) {
+    if (err.code === "23505") {
+      return res.status(409).json({ error: "Username, email, or phone already in use" });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Follows — who follows whom on seller storefronts.
+app.get("/follows", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT follower_username, followed_username FROM follows");
+    res.json({ follows: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/follows", async (req, res) => {
+  try {
+    const { followerUsername, followedUsername } = req.body;
+    if (!followerUsername || !followedUsername) {
+      return res.status(400).json({ error: "Missing followerUsername or followedUsername" });
+    }
+    await pool.query(
+      `INSERT INTO follows (follower_username, followed_username)
+       VALUES ($1, $2)
+       ON CONFLICT (follower_username, followed_username) DO NOTHING`,
+      [followerUsername, followedUsername]
+    );
+    res.status(201).json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/follows", async (req, res) => {
+  try {
+    const { followerUsername, followedUsername } = req.body;
+    if (!followerUsername || !followedUsername) {
+      return res.status(400).json({ error: "Missing followerUsername or followedUsername" });
+    }
+    await pool.query(
+      "DELETE FROM follows WHERE follower_username = $1 AND followed_username = $2",
+      [followerUsername, followedUsername]
+    );
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
