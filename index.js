@@ -108,6 +108,74 @@ app.get("/users", async (req, res) => {
   }
 });
 
+const USER_RETURNING_FIELDS = `id, username, email, phone, display_name, first_name, last_name, office_location,
+  country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
+  license_number, license_photos, id_verification_exempt, has_applied_to_sell, created_at`;
+
+app.patch("/users/:id/verify", async (req, res) => {
+  try {
+    const { isVerified } = req.body;
+    const result = await pool.query(
+      `UPDATE users SET is_verified = $1 WHERE id = $2 RETURNING ${USER_RETURNING_FIELDS}`,
+      [!!isVerified, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
+    res.json({ user: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/users/:id/suspend", async (req, res) => {
+  try {
+    const { isSuspended } = req.body;
+    const result = await pool.query(
+      `UPDATE users SET is_suspended = $1 WHERE id = $2 RETURNING ${USER_RETURNING_FIELDS}`,
+      [!!isSuspended, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
+    res.json({ user: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/users/:id/promote", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE users SET is_admin = true WHERE id = $1 RETURNING ${USER_RETURNING_FIELDS}`,
+      [req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
+    res.json({ user: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/users/:id/approve", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE users SET is_approved = true WHERE id = $1 RETURNING ${USER_RETURNING_FIELDS}`,
+      [req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
+    res.json({ user: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/users/:id", async (req, res) => {
+  try {
+    const result = await pool.query("DELETE FROM users WHERE id = $1 RETURNING id", [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/login", async (req, res) => {
   try {
     const { username, password } = req.body;
