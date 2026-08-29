@@ -65,6 +65,32 @@ app.get("/migrate/follows", async (req, res) => {
   }
 });
 
+// One-time migration: adds every field a real listing needs (images, auctions,
+// currency, fitment, status, featured flag) that the original listings table
+// didn't have.
+app.get("/migrate/listings-extra", async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE listings
+        ADD COLUMN IF NOT EXISTS emoji TEXT DEFAULT '📦',
+        ADD COLUMN IF NOT EXISTS fit_make TEXT DEFAULT '',
+        ADD COLUMN IF NOT EXISTS fit_model TEXT DEFAULT '',
+        ADD COLUMN IF NOT EXISTS fit_year TEXT DEFAULT '',
+        ADD COLUMN IF NOT EXISTS images JSONB DEFAULT '[]'::jsonb,
+        ADD COLUMN IF NOT EXISTS listing_type TEXT DEFAULT 'fixed',
+        ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'USD',
+        ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending',
+        ADD COLUMN IF NOT EXISTS is_featured BOOLEAN DEFAULT false,
+        ADD COLUMN IF NOT EXISTS auction_end_time TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS bid_history JSONB DEFAULT '[]'::jsonb,
+        ADD COLUMN IF NOT EXISTS highest_bidder_username TEXT
+    `);
+    res.send("Migration complete: listings-extra columns added.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.post("/signup", async (req, res) => {
   try {
     const {
@@ -313,17 +339,30 @@ app.post("/login", async (req, res) => {
 });
 app.post("/listings", async (req, res) => {
   try {
-    const { ownerId, title, description, price, category, condition, shippingFee } = req.body;
+    const {
+      ownerId, title, description, price, category, condition, shippingFee,
+      emoji, fitMake, fitModel, fitYear, images, listingType, currency,
+      status, auctionEndTime,
+    } = req.body;
 
     if (!ownerId || !title || !price) {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
     const result = await pool.query(
-      `INSERT INTO listings (owner_id, title, description, price, category, condition, shipping_fee)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO listings (
+         owner_id, title, description, price, category, condition, shipping_fee,
+         emoji, fit_make, fit_model, fit_year, images, listing_type, currency,
+         status, auction_end_time
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
        RETURNING *`,
-      [ownerId, title, description || "", price, category || "Other", condition || "New", shippingFee || 0]
+      [
+        ownerId, title, description || "", price, category || "Other", condition || "New", shippingFee || 0,
+        emoji || "📦", fitMake || "", fitModel || "", fitYear || "", JSON.stringify(images || []),
+        listingType || "fixed", currency || "USD", status || "pending",
+        auctionEndTime ? new Date(auctionEndTime) : null,
+      ]
     );
 
     res.status(201).json({ listing: result.rows[0] });
@@ -335,12 +374,83 @@ app.post("/listings", async (req, res) => {
 app.get("/listings", async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT listings.*, users.display_name AS seller_name
+      `SELECT listings.*, users.display_name AS seller_name, users.username AS owner_username
        FROM listings
        JOIN users ON listings.owner_id = users.id
        ORDER BY listings.created_at DESC`
     );
     res.json({ listings: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Generic partial update — covers editing, admin approve/remove, feature toggle,
+// and auction bid updates, all through one whitelisted column map.
+const LISTING_FIELD_MAP = {
+  title: "title",
+  description: "description",
+  price: "price",
+  category: "category",
+  condition: "condition",
+  shippingFee: "shipping_fee",
+  emoji: "emoji",
+  fitMake: "fit_make",
+  fitModel: "fit_model",
+  fitYear: "fit_year",
+  images: "images",
+  listingType: "listing_type",
+  currency: "currency",
+  status: "status",
+  isFeatured: "is_featured",
+  auctionEndTime: "auction_end_time",
+  bidHistory: "bid_history",
+  highestBidderUsername: "highest_bidder_username",
+};
+const LISTING_JSON_FIELDS = new Set(["images", "bidHistory"]);
+
+app.patch("/listings/:id", async (req, res) => {
+  try {
+    const sets = [];
+    const values = [];
+    let i = 1;
+    for (const [key, column] of Object.entries(LISTING_FIELD_MAP)) {
+      if (Object.prototype.hasOwnProperty.call(req.body, key)) {
+        sets.push(`${column} = $${i}`);
+        const raw = req.body[key];
+        values.push(LISTING_JSON_FIELDS.has(key) ? JSON.stringify(raw) : raw);
+        i++;
+      }
+    }
+    if (sets.length === 0) {
+      return res.status(400).json({ error: "No valid fields to update" });
+    }
+    values.push(req.params.id);
+    const result = await pool.query(
+      `UPDATE listings SET ${sets.join(", ")} WHERE id = $${i} RETURNING *`,
+      values
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Listing not found" });
+    res.json({ listing: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/listings/:id", async (req, res) => {
+  try {
+    const result = await pool.query("DELETE FROM listings WHERE id = $1 RETURNING id", [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: "Listing not found" });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/listings/by-owner/:ownerId", async (req, res) => {
+  try {
+    await pool.query("DELETE FROM listings WHERE owner_id = $1", [req.params.ownerId]);
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
