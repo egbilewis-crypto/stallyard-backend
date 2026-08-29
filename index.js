@@ -132,6 +132,58 @@ app.get("/migrate/listings-extra", async (req, res) => {
   }
 });
 
+// One-time migration: real multi-seller cart orders, per-item payout tracking,
+// and a withdrawals ledger with server-computed balances.
+app.get("/migrate/orders-wallet", async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE orders
+        ADD COLUMN IF NOT EXISTS buyer_username TEXT,
+        ADD COLUMN IF NOT EXISTS shipping_address JSONB DEFAULT '{}'::jsonb,
+        ADD COLUMN IF NOT EXISTS subtotal NUMERIC DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS shipping_total NUMERIC DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS commission_rate NUMERIC DEFAULT 0.05,
+        ADD COLUMN IF NOT EXISTS commission_amount NUMERIC DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'held',
+        ADD COLUMN IF NOT EXISTS is_disputed BOOLEAN DEFAULT false
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS order_items (
+        id SERIAL PRIMARY KEY,
+        order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+        listing_id INTEGER,
+        title TEXT NOT NULL,
+        emoji TEXT DEFAULT '📦',
+        price NUMERIC NOT NULL,
+        qty INTEGER NOT NULL DEFAULT 1,
+        shipping_fee NUMERIC DEFAULT 0,
+        seller_id INTEGER NOT NULL REFERENCES users(id),
+        seller_username TEXT NOT NULL,
+        seller_name TEXT,
+        fulfillment_status TEXT DEFAULT 'new',
+        tracking_number TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS withdrawals (
+        id SERIAL PRIMARY KEY,
+        seller_id INTEGER NOT NULL REFERENCES users(id),
+        seller_username TEXT NOT NULL,
+        amount NUMERIC NOT NULL,
+        status TEXT DEFAULT 'processing',
+        failure_reason TEXT,
+        paystack_transfer_code TEXT,
+        requested_at TIMESTAMP DEFAULT NOW(),
+        processed_at TIMESTAMP
+      )
+    `);
+    res.send("Migration complete: orders-wallet columns and tables added.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.post("/signup", async (req, res) => {
   try {
     const {
@@ -516,43 +568,94 @@ app.delete("/listings/by-owner/:ownerId", authenticate, requireAdmin, async (req
     res.status(500).json({ error: err.message });
   }
 });
-app.post("/orders", async (req, res) => {
+const PLATFORM_COMMISSION_RATE = 0.05;
+
+// Real cart checkout — recomputes every price server-side from the live
+// listings table rather than trusting whatever the cart claims, and creates
+// one order with one order_items row per cart line, grouped by seller.
+app.post("/checkout", authenticate, async (req, res) => {
   const client = await pool.connect();
   try {
-    const { buyerId, listingId } = req.body;
-
-    if (!buyerId || !listingId) {
-      return res.status(400).json({ error: "Missing buyerId or listingId" });
+    const { items, shippingAddress, currency } = req.body;
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Cart is empty" });
     }
 
     await client.query("BEGIN");
 
-    const listingResult = await client.query(
-      "SELECT * FROM listings WHERE id = $1 AND status != 'sold'",
-      [listingId]
-    );
+    let subtotal = 0;
+    let shippingTotal = 0;
+    const resolvedItems = [];
 
-    if (listingResult.rows.length === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Listing not found or already sold" });
+    for (const cartItem of items) {
+      const qty = Number(cartItem.qty);
+      if (!cartItem.listingId || !Number.isInteger(qty) || qty <= 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "Each cart item needs a valid listingId and a positive quantity" });
+      }
+
+      const listingResult = await client.query(
+        "SELECT * FROM listings WHERE id = $1 AND status = 'approved' FOR UPDATE",
+        [cartItem.listingId]
+      );
+      if (listingResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: `Listing ${cartItem.listingId} isn't available` });
+      }
+      const listing = listingResult.rows[0];
+      const price = Number(listing.price);
+      const shippingFee = Number(listing.shipping_fee) || 0;
+      if (!(price > 0)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "Listing has an invalid price" });
+      }
+
+      subtotal += price * qty;
+      shippingTotal += shippingFee * qty;
+      resolvedItems.push({ listing, qty, price, shippingFee });
     }
 
-    const listing = listingResult.rows[0];
+    const commissionRate = PLATFORM_COMMISSION_RATE;
+    const commissionAmount = Math.round(subtotal * commissionRate * 100) / 100;
+    const total = Math.round((subtotal + shippingTotal) * 100) / 100;
 
     const orderResult = await client.query(
-      `INSERT INTO orders (buyer_id, total, currency)
-       VALUES ($1, $2, $3)
+      `INSERT INTO orders (
+         buyer_id, buyer_username, total, currency, shipping_address, subtotal,
+         shipping_total, commission_rate, commission_amount, payment_status
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'held')
        RETURNING *`,
-      [buyerId, listing.price, listing.currency]
+      [
+        req.user.id, req.user.username, total, currency || "USD",
+        JSON.stringify(shippingAddress || {}), subtotal, shippingTotal,
+        commissionRate, commissionAmount,
+      ]
     );
+    const order = orderResult.rows[0];
 
-    await client.query(
-      "UPDATE listings SET status = 'sold' WHERE id = $1",
-      [listingId]
-    );
+    const insertedItems = [];
+    for (const { listing, qty, price, shippingFee } of resolvedItems) {
+      const sellerResult = await client.query("SELECT username, display_name FROM users WHERE id = $1", [listing.owner_id]);
+      const seller = sellerResult.rows[0];
+      const itemResult = await client.query(
+        `INSERT INTO order_items (
+           order_id, listing_id, title, emoji, price, qty, shipping_fee,
+           seller_id, seller_username, seller_name, fulfillment_status
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'new')
+         RETURNING *`,
+        [
+          order.id, listing.id, listing.title, listing.emoji, price, qty, shippingFee,
+          listing.owner_id, seller?.username, seller?.display_name,
+        ]
+      );
+      insertedItems.push(itemResult.rows[0]);
+      await client.query("UPDATE listings SET status = 'sold' WHERE id = $1", [listing.id]);
+    }
 
     await client.query("COMMIT");
-    res.status(201).json({ order: orderResult.rows[0], listing });
+    res.status(201).json({ order: { ...order, items: insertedItems } });
   } catch (err) {
     await client.query("ROLLBACK");
     res.status(500).json({ error: err.message });
@@ -561,23 +664,143 @@ app.post("/orders", async (req, res) => {
   }
 });
 
-app.get("/orders/:buyerId", async (req, res) => {
+async function fetchOrdersWithItems(whereClause, params) {
+  const ordersResult = await pool.query(
+    `SELECT * FROM orders WHERE ${whereClause} ORDER BY created_at DESC`,
+    params
+  );
+  const orders = ordersResult.rows;
+  if (orders.length === 0) return [];
+  const orderIds = orders.map((o) => o.id);
+  const itemsResult = await pool.query(
+    `SELECT * FROM order_items WHERE order_id = ANY($1) ORDER BY id ASC`,
+    [orderIds]
+  );
+  return orders.map((o) => ({
+    ...o,
+    items: itemsResult.rows.filter((i) => i.order_id === o.id),
+  }));
+}
+
+// A buyer's own purchase history.
+app.get("/orders/mine", authenticate, async (req, res) => {
   try {
-    const result = await pool.query(
-      "SELECT * FROM orders WHERE buyer_id = $1 ORDER BY created_at DESC",
-      [req.params.buyerId]
-    );
-    res.json({ orders: result.rows });
+    const orders = await fetchOrdersWithItems("buyer_id = $1", [req.user.id]);
+    res.json({ orders });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
-app.post("/checkout", async (req, res) => {
-  try {
-    const { buyerId, listingId, email } = req.body;
 
-    if (!buyerId || !listingId || !email) {
-      return res.status(400).json({ error: "Missing buyerId, listingId, or email" });
+// A seller's own sales — orders containing at least one of their items.
+app.get("/orders/selling", authenticate, async (req, res) => {
+  try {
+    const orders = await fetchOrdersWithItems(
+      "id IN (SELECT order_id FROM order_items WHERE seller_id = $1)",
+      [req.user.id]
+    );
+    res.json({ orders });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin view of every order.
+app.get("/orders", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const orders = await fetchOrdersWithItems("TRUE", []);
+    res.json({ orders });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/orders/:id/release", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "UPDATE orders SET payment_status = 'released' WHERE id = $1 RETURNING *",
+      [req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Order not found" });
+    res.json({ order: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/orders/:id/refund", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "UPDATE orders SET payment_status = 'refunded' WHERE id = $1 RETURNING *",
+      [req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Order not found" });
+    res.json({ order: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/orders/:id/dispute", authenticate, async (req, res) => {
+  try {
+    const { isDisputed } = req.body;
+    const result = await pool.query(
+      "UPDATE orders SET is_disputed = $1 WHERE id = $2 RETURNING *",
+      [!!isDisputed, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Order not found" });
+    res.json({ order: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const ORDER_ITEM_STATUSES = new Set(["new", "shipped", "delivered", "cancelled", "returned"]);
+
+// Update one item's fulfillment status/tracking — only that item's seller or an admin.
+app.patch("/order-items/:id", authenticate, async (req, res) => {
+  try {
+    const existing = await pool.query("SELECT seller_id FROM order_items WHERE id = $1", [req.params.id]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: "Order item not found" });
+    if (!req.user.isAdmin && existing.rows[0].seller_id !== req.user.id) {
+      return res.status(403).json({ error: "You can only update your own items" });
+    }
+    const { fulfillmentStatus, trackingNumber } = req.body;
+    if (fulfillmentStatus && !ORDER_ITEM_STATUSES.has(fulfillmentStatus)) {
+      return res.status(400).json({ error: "Invalid fulfillment status" });
+    }
+    const sets = [];
+    const values = [];
+    let i = 1;
+    if (fulfillmentStatus) {
+      sets.push(`fulfillment_status = $${i++}`);
+      values.push(fulfillmentStatus);
+    }
+    if (typeof trackingNumber === "string") {
+      sets.push(`tracking_number = $${i++}`);
+      values.push(trackingNumber);
+    }
+    if (sets.length === 0) return res.status(400).json({ error: "No valid fields to update" });
+    values.push(req.params.id);
+    const result = await pool.query(
+      `UPDATE order_items SET ${sets.join(", ")} WHERE id = $${i} RETURNING *`,
+      values
+    );
+    res.json({ item: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Pre-existing single-listing Paystack payment page flow (initiate → buyer pays
+// on Paystack's hosted page → webhook below confirms and creates the order).
+// Kept under its own path since /checkout is now the real cart-checkout endpoint.
+app.post("/checkout/single-item-payment", authenticate, async (req, res) => {
+  try {
+    const { listingId, email } = req.body;
+
+    if (!listingId || !email) {
+      return res.status(400).json({ error: "Missing listingId or email" });
     }
 
     const listingResult = await pool.query(
@@ -601,7 +824,7 @@ app.post("/checkout", async (req, res) => {
       body: JSON.stringify({
         email,
         amount: amountInKobo,
-        metadata: { buyerId, listingId },
+        metadata: { buyerId: req.user.id, listingId },
       }),
     });
 
@@ -677,12 +900,15 @@ app.post("/webhook/paystack", async (req, res) => {
     res.sendStatus(500);
   }
 });
-app.post("/sellers/bank-details", async (req, res) => {
+app.post("/sellers/bank-details", authenticate, async (req, res) => {
   try {
     const { userId, bankCode, accountNumber } = req.body;
 
     if (!userId || !bankCode || !accountNumber) {
       return res.status(400).json({ error: "Missing userId, bankCode, or accountNumber" });
+    }
+    if (req.user.id !== Number(userId) && !req.user.isAdmin) {
+      return res.status(403).json({ error: "You can only set your own bank details" });
     }
 
     const userResult = await pool.query("SELECT display_name FROM users WHERE id = $1", [userId]);
@@ -721,12 +947,34 @@ app.post("/sellers/bank-details", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-app.post("/sellers/payout", async (req, res) => {
+// Shared helper — actually moves money via Paystack. Used by both the
+// automatic withdrawal flow and the admin manual-override endpoint below.
+async function sendPaystackTransfer(recipientCode, amountInKobo, reason) {
+  const transferRes = await fetch("https://api.paystack.co/transfer", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      source: "balance",
+      amount: amountInKobo,
+      recipient: recipientCode,
+      reason: reason || "Stallyard seller payout",
+    }),
+  });
+  return transferRes.json();
+}
+
+// Admin-only manual override — the normal path for sellers is POST /withdrawals,
+// which validates their real balance server-side before calling the same
+// transfer logic. This endpoint bypasses that balance check, so it's admin-only.
+app.post("/sellers/payout", authenticate, requireAdmin, async (req, res) => {
   try {
     const { userId, amount, reason } = req.body;
 
-    if (!userId || !amount) {
-      return res.status(400).json({ error: "Missing userId or amount" });
+    if (!userId || !(Number(amount) > 0)) {
+      return res.status(400).json({ error: "Missing userId or amount must be a positive number" });
     }
 
     const userResult = await pool.query(
@@ -740,22 +988,7 @@ app.post("/sellers/payout", async (req, res) => {
 
     const recipientCode = userResult.rows[0].paystack_recipient_code;
     const amountInKobo = Math.round(Number(amount) * 100);
-
-    const transferRes = await fetch("https://api.paystack.co/transfer", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        source: "balance",
-        amount: amountInKobo,
-        recipient: recipientCode,
-        reason: reason || "Stallyard seller payout",
-      }),
-    });
-
-    const transferData = await transferRes.json();
+    const transferData = await sendPaystackTransfer(recipientCode, amountInKobo, reason);
 
     if (!transferData.status) {
       return res.status(400).json({ error: transferData.message || "Payout failed" });
@@ -766,6 +999,130 @@ app.post("/sellers/payout", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+// A seller's true available balance, computed entirely from real order data —
+// released order items, minus commission, minus anything already withdrawn
+// or currently mid-withdrawal. Never trusts a client-supplied number.
+async function computeAvailableBalance(client, sellerId) {
+  const releasedResult = await client.query(
+    `SELECT COALESCE(SUM(
+       CASE WHEN oi.fulfillment_status NOT IN ('cancelled', 'returned')
+         THEN (oi.price * oi.qty) - (oi.price * oi.qty * o.commission_rate) + oi.shipping_fee
+         ELSE 0
+       END
+     ), 0) AS released_total
+     FROM order_items oi
+     JOIN orders o ON oi.order_id = o.id
+     WHERE oi.seller_id = $1 AND o.payment_status = 'released'`,
+    [sellerId]
+  );
+  const reservedResult = await client.query(
+    `SELECT COALESCE(SUM(amount), 0) AS reserved
+     FROM withdrawals WHERE seller_id = $1 AND status IN ('processing', 'paid')`,
+    [sellerId]
+  );
+  const released = Number(releasedResult.rows[0].released_total);
+  const reserved = Number(reservedResult.rows[0].reserved);
+  return Math.round((released - reserved) * 100) / 100;
+}
+
+// Sellers request their own withdrawal — no admin approval step. The balance
+// check and the reservation happen in one locked transaction so two requests
+// fired at once can't both succeed against the same money.
+app.post("/withdrawals", authenticate, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const amount = Math.round(Number(req.body.amount) * 100) / 100;
+    if (!(amount > 0)) {
+      return res.status(400).json({ error: "Amount must be a positive number" });
+    }
+
+    await client.query("BEGIN");
+    // Locks this seller's row for the duration of the transaction, so a
+    // second concurrent request from the same seller has to wait its turn.
+    await client.query("SELECT id, paystack_recipient_code FROM users WHERE id = $1 FOR UPDATE", [req.user.id]);
+
+    const available = await computeAvailableBalance(client, req.user.id);
+    if (amount > available) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: `You can't withdraw more than your available balance of $${available.toFixed(2)}` });
+    }
+
+    const userResult = await client.query("SELECT paystack_recipient_code FROM users WHERE id = $1", [req.user.id]);
+    const recipientCode = userResult.rows[0]?.paystack_recipient_code;
+    if (!recipientCode) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Add your bank details before requesting a withdrawal" });
+    }
+
+    const withdrawalResult = await client.query(
+      `INSERT INTO withdrawals (seller_id, seller_username, amount, status)
+       VALUES ($1, $2, $3, 'processing') RETURNING *`,
+      [req.user.id, req.user.username, amount]
+    );
+    const withdrawal = withdrawalResult.rows[0];
+    await client.query("COMMIT");
+
+    // Money actually moves here, outside the DB transaction so the external
+    // network call doesn't hold a lock open.
+    try {
+      const transferData = await sendPaystackTransfer(recipientCode, Math.round(amount * 100), "Stallyard seller withdrawal");
+      if (transferData.status) {
+        const updated = await pool.query(
+          `UPDATE withdrawals SET status = 'paid', processed_at = NOW(), paystack_transfer_code = $1 WHERE id = $2 RETURNING *`,
+          [transferData.data?.transfer_code || null, withdrawal.id]
+        );
+        return res.status(201).json({ withdrawal: updated.rows[0] });
+      }
+      const failed = await pool.query(
+        `UPDATE withdrawals SET status = 'failed', processed_at = NOW(), failure_reason = $1 WHERE id = $2 RETURNING *`,
+        [transferData.message || "Payout failed", withdrawal.id]
+      );
+      return res.status(400).json({ error: transferData.message || "Payout failed", withdrawal: failed.rows[0] });
+    } catch (transferErr) {
+      const failed = await pool.query(
+        `UPDATE withdrawals SET status = 'failed', processed_at = NOW(), failure_reason = $1 WHERE id = $2 RETURNING *`,
+        [transferErr.message, withdrawal.id]
+      );
+      return res.status(500).json({ error: "Payout failed — try again shortly", withdrawal: failed.rows[0] });
+    }
+  } catch (err) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/withdrawals/mine", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM withdrawals WHERE seller_id = $1 ORDER BY requested_at DESC",
+      [req.user.id]
+    );
+    res.json({ withdrawals: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/withdrawals", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM withdrawals ORDER BY requested_at DESC");
+    res.json({ withdrawals: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/wallet/balance", authenticate, async (req, res) => {
+  try {
+    const available = await computeAvailableBalance(pool, req.user.id);
+    res.json({ available });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/threads", async (req, res) => {
   try {
     const { listingId, buyerId, sellerId } = req.body;
