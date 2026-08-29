@@ -3,6 +3,7 @@ const { Pool } = require("pg");
 const bcrypt = require("bcrypt");
 const fetch = require("node-fetch");
 const cors = require("cors");
+const jwt = require("jsonwebtoken");
 
 const app = express();
 app.use(cors());
@@ -12,6 +13,46 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
+
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error("WARNING: JWT_SECRET is not set. Set it in Railway's Variables tab or tokens cannot be verified.");
+}
+
+function signToken(user) {
+  return jwt.sign(
+    { id: user.id, username: user.username, isAdmin: !!user.is_admin },
+    JWT_SECRET,
+    { expiresIn: "30d" }
+  );
+}
+
+// Reads and verifies a bearer token if present. Returns the decoded payload,
+// or null if there's no token or it's invalid/expired — never throws.
+function getRequester(req) {
+  const authHeader = req.headers.authorization || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!token || !JWT_SECRET) return null;
+  try {
+    return jwt.verify(token, JWT_SECRET);
+  } catch {
+    return null;
+  }
+}
+
+// Requires a valid token. Attaches the decoded payload as req.user.
+function authenticate(req, res, next) {
+  const requester = getRequester(req);
+  if (!requester) return res.status(401).json({ error: "Sign in required" });
+  req.user = requester;
+  next();
+}
+
+// Must follow authenticate(). Requires the token to belong to an admin.
+function requireAdmin(req, res, next) {
+  if (!req.user?.isAdmin) return res.status(403).json({ error: "Admin access required" });
+  next();
+}
 
 app.get("/", (req, res) => {
   res.send("Stallyard backend is running!");
@@ -129,7 +170,7 @@ app.post("/signup", async (req, res) => {
       ]
     );
 
-    res.status(201).json({ user: result.rows[0] });
+    res.status(201).json({ user: result.rows[0], token: signToken(result.rows[0]) });
   } catch (err) {
     if (err.code === "23505") {
       return res.status(409).json({ error: "Username, email, or phone already in use" });
@@ -138,14 +179,21 @@ app.post("/signup", async (req, res) => {
   }
 });
 // Full member list for the admin dashboard. No password hashes returned.
+// Fields visible to everyone — used for storefronts, follower lists, etc.
+// Deliberately excludes email, phone, and ID/document fields.
+const USER_PUBLIC_FIELDS = `id, username, display_name, first_name, last_name, office_location,
+  country, is_admin, is_approved, is_verified, is_suspended, account_type, created_at`;
+
+// Full fields — only returned to a signed-in admin.
+const USER_FULL_FIELDS = `id, username, email, phone, display_name, first_name, last_name, office_location,
+  country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
+  license_number, license_photos, id_verification_exempt, has_applied_to_sell, created_at`;
+
 app.get("/users", async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT id, username, email, phone, display_name, first_name, last_name, office_location,
-         country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
-         license_number, license_photos, id_verification_exempt, has_applied_to_sell, created_at
-       FROM users ORDER BY display_name ASC`
-    );
+    const requester = getRequester(req);
+    const fields = requester?.isAdmin ? USER_FULL_FIELDS : USER_PUBLIC_FIELDS;
+    const result = await pool.query(`SELECT ${fields} FROM users ORDER BY display_name ASC`);
     res.json({ users: result.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -156,7 +204,7 @@ const USER_RETURNING_FIELDS = `id, username, email, phone, display_name, first_n
   country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, created_at`;
 
-app.patch("/users/:id/verify", async (req, res) => {
+app.patch("/users/:id/verify", authenticate, requireAdmin, async (req, res) => {
   try {
     const { isVerified } = req.body;
     const result = await pool.query(
@@ -170,7 +218,7 @@ app.patch("/users/:id/verify", async (req, res) => {
   }
 });
 
-app.patch("/users/:id/suspend", async (req, res) => {
+app.patch("/users/:id/suspend", authenticate, requireAdmin, async (req, res) => {
   try {
     const { isSuspended } = req.body;
     const result = await pool.query(
@@ -184,7 +232,7 @@ app.patch("/users/:id/suspend", async (req, res) => {
   }
 });
 
-app.patch("/users/:id/promote", async (req, res) => {
+app.patch("/users/:id/promote", authenticate, requireAdmin, async (req, res) => {
   try {
     const result = await pool.query(
       `UPDATE users SET is_admin = true WHERE id = $1 RETURNING ${USER_RETURNING_FIELDS}`,
@@ -197,7 +245,7 @@ app.patch("/users/:id/promote", async (req, res) => {
   }
 });
 
-app.patch("/users/:id/approve", async (req, res) => {
+app.patch("/users/:id/approve", authenticate, requireAdmin, async (req, res) => {
   try {
     const result = await pool.query(
       `UPDATE users SET is_approved = true WHERE id = $1 RETURNING ${USER_RETURNING_FIELDS}`,
@@ -210,7 +258,7 @@ app.patch("/users/:id/approve", async (req, res) => {
   }
 });
 
-app.delete("/users/:id", async (req, res) => {
+app.delete("/users/:id", authenticate, requireAdmin, async (req, res) => {
   try {
     const result = await pool.query("DELETE FROM users WHERE id = $1 RETURNING id", [req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
@@ -221,7 +269,7 @@ app.delete("/users/:id", async (req, res) => {
 });
 
 // Lets an admin create a real account directly (used by the admin "Add member" tool).
-app.post("/admin/create-member", async (req, res) => {
+app.post("/admin/create-member", authenticate, requireAdmin, async (req, res) => {
   try {
     const { username, email, phone, password, displayName, isAdmin, isApproved, isVerified } = req.body;
 
@@ -247,7 +295,7 @@ app.post("/admin/create-member", async (req, res) => {
       ]
     );
 
-    res.status(201).json({ user: result.rows[0] });
+    res.status(201).json({ user: result.rows[0], token: signToken(result.rows[0]) });
   } catch (err) {
     if (err.code === "23505") {
       return res.status(409).json({ error: "Username, email, or phone already in use" });
@@ -266,11 +314,12 @@ app.get("/follows", async (req, res) => {
   }
 });
 
-app.post("/follows", async (req, res) => {
+app.post("/follows", authenticate, async (req, res) => {
   try {
-    const { followerUsername, followedUsername } = req.body;
-    if (!followerUsername || !followedUsername) {
-      return res.status(400).json({ error: "Missing followerUsername or followedUsername" });
+    const followerUsername = req.user.username;
+    const { followedUsername } = req.body;
+    if (!followedUsername) {
+      return res.status(400).json({ error: "Missing followedUsername" });
     }
     await pool.query(
       `INSERT INTO follows (follower_username, followed_username)
@@ -284,11 +333,12 @@ app.post("/follows", async (req, res) => {
   }
 });
 
-app.delete("/follows", async (req, res) => {
+app.delete("/follows", authenticate, async (req, res) => {
   try {
-    const { followerUsername, followedUsername } = req.body;
-    if (!followerUsername || !followedUsername) {
-      return res.status(400).json({ error: "Missing followerUsername or followedUsername" });
+    const followerUsername = req.user.username;
+    const { followedUsername } = req.body;
+    if (!followedUsername) {
+      return res.status(400).json({ error: "Missing followedUsername" });
     }
     await pool.query(
       "DELETE FROM follows WHERE follower_username = $1 AND followed_username = $2",
@@ -332,20 +382,21 @@ app.post("/login", async (req, res) => {
     }
 
     delete user.password_hash;
-    res.json({ user });
+    res.json({ user, token: signToken(user) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
-app.post("/listings", async (req, res) => {
+app.post("/listings", authenticate, async (req, res) => {
   try {
     const {
-      ownerId, title, description, price, category, condition, shippingFee,
+      title, description, price, category, condition, shippingFee,
       emoji, fitMake, fitModel, fitYear, images, listingType, currency,
       status, auctionEndTime,
     } = req.body;
+    const ownerId = req.user.id; // always the signed-in user — never trust a client-supplied owner
 
-    if (!ownerId || !title || !price) {
+    if (!title || !price) {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
@@ -409,8 +460,13 @@ const LISTING_FIELD_MAP = {
 };
 const LISTING_JSON_FIELDS = new Set(["images", "bidHistory"]);
 
-app.patch("/listings/:id", async (req, res) => {
+app.patch("/listings/:id", authenticate, async (req, res) => {
   try {
+    const existing = await pool.query("SELECT owner_id FROM listings WHERE id = $1", [req.params.id]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: "Listing not found" });
+    if (!req.user.isAdmin && existing.rows[0].owner_id !== req.user.id) {
+      return res.status(403).json({ error: "You can only edit your own listings" });
+    }
     const sets = [];
     const values = [];
     let i = 1;
@@ -437,8 +493,13 @@ app.patch("/listings/:id", async (req, res) => {
   }
 });
 
-app.delete("/listings/:id", async (req, res) => {
+app.delete("/listings/:id", authenticate, async (req, res) => {
   try {
+    const existing = await pool.query("SELECT owner_id FROM listings WHERE id = $1", [req.params.id]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: "Listing not found" });
+    if (!req.user.isAdmin && existing.rows[0].owner_id !== req.user.id) {
+      return res.status(403).json({ error: "You can only remove your own listings" });
+    }
     const result = await pool.query("DELETE FROM listings WHERE id = $1 RETURNING id", [req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: "Listing not found" });
     res.json({ success: true });
@@ -447,7 +508,7 @@ app.delete("/listings/:id", async (req, res) => {
   }
 });
 
-app.delete("/listings/by-owner/:ownerId", async (req, res) => {
+app.delete("/listings/by-owner/:ownerId", authenticate, requireAdmin, async (req, res) => {
   try {
     await pool.query("DELETE FROM listings WHERE owner_id = $1", [req.params.ownerId]);
     res.json({ success: true });
