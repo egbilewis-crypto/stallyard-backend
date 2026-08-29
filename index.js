@@ -900,6 +900,23 @@ app.post("/webhook/paystack", async (req, res) => {
     res.sendStatus(500);
   }
 });
+// Proxies Paystack's bank list so the frontend can show a dropdown instead of
+// asking sellers to type a bank code by hand (typos there would silently fail).
+app.get("/paystack/banks", authenticate, async (req, res) => {
+  try {
+    const banksRes = await fetch("https://api.paystack.co/bank?country=nigeria", {
+      headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` },
+    });
+    const banksData = await banksRes.json();
+    if (!banksData.status) {
+      return res.status(500).json({ error: banksData.message || "Couldn't load bank list" });
+    }
+    res.json({ banks: banksData.data.map((b) => ({ name: b.name, code: b.code })) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/sellers/bank-details", authenticate, async (req, res) => {
   try {
     const { userId, bankCode, accountNumber } = req.body;
