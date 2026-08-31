@@ -6,6 +6,7 @@ const cors = require("cors");
 const jwt = require("jsonwebtoken");
 
 const app = express();
+app.set("trust proxy", true);
 app.use(cors());
 app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 
@@ -52,6 +53,80 @@ function authenticate(req, res, next) {
 function requireAdmin(req, res, next) {
   if (!req.user?.isAdmin) return res.status(403).json({ error: "Admin access required" });
   next();
+}
+
+// Simple in-memory cache so repeat requests from the same network within 24h
+// don't burn through the IPQualityScore free-tier quota (1,000/month).
+const vpnCheckCache = new Map();
+const VPN_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+function getClientIp(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (forwarded) return forwarded.split(",")[0].trim();
+  return req.ip;
+}
+
+// Returns true (VPN/proxy/Tor detected), false (clean), or null (couldn't
+// check — caller should fail open rather than lock everyone out over a
+// third-party outage or missing API key).
+async function isVpnOrProxy(ip) {
+  if (!ip || ip === "::1" || ip === "127.0.0.1") return false; // local/dev testing
+  const cached = vpnCheckCache.get(ip);
+  if (cached && Date.now() - cached.checkedAt < VPN_CACHE_TTL_MS) return cached.result;
+
+  if (!process.env.IPQS_API_KEY) {
+    console.error("WARNING: IPQS_API_KEY is not set — VPN checks are being skipped.");
+    return null;
+  }
+
+  try {
+    const url = `https://www.ipqualityscore.com/api/json/ip/${process.env.IPQS_API_KEY}/${ip}?strictness=0&allow_public_access_points=true`;
+    const response = await fetch(url);
+    const data = await response.json();
+    if (!data.success) return null;
+    const result = !!(data.vpn || data.proxy || data.tor);
+    vpnCheckCache.set(ip, { result, checkedAt: Date.now() });
+    return result;
+  } catch {
+    return null;
+  }
+}
+
+// Phone numbers are far more stable than IP/VPN status, so this cache lasts
+// much longer (7 days) — same key as the VPN check, no extra setup needed.
+const phoneCheckCache = new Map();
+const PHONE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Returns { blocked: boolean, reason: string } or null if the check couldn't
+// run (missing key or API error) — callers should fail open in that case.
+async function checkPhoneNumber(phone) {
+  const cached = phoneCheckCache.get(phone);
+  if (cached && Date.now() - cached.checkedAt < PHONE_CACHE_TTL_MS) return cached.result;
+
+  if (!process.env.IPQS_API_KEY) {
+    console.error("WARNING: IPQS_API_KEY is not set — phone validation is being skipped.");
+    return null;
+  }
+
+  try {
+    const url = `https://ipqualityscore.com/api/json/phone/${process.env.IPQS_API_KEY}/${encodeURIComponent(phone)}`;
+    const response = await fetch(url);
+    const data = await response.json();
+    if (!data.success) return null;
+
+    let result = null;
+    if (data.valid === false) {
+      result = { blocked: true, reason: "That doesn't look like a valid phone number." };
+    } else if (data.recent_abuse) {
+      result = { blocked: true, reason: "This phone number has been linked to recent abuse. Try a different number." };
+    } else {
+      result = { blocked: false, reason: "" };
+    }
+    phoneCheckCache.set(phone, { result, checkedAt: Date.now() });
+    return result;
+  } catch {
+    return null;
+  }
 }
 
 app.get("/", (req, res) => {
@@ -194,6 +269,16 @@ app.post("/signup", async (req, res) => {
 
     if (!username || !email || !phone || !password) {
       return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    const vpnDetected = await isVpnOrProxy(getClientIp(req));
+    if (vpnDetected) {
+      return res.status(403).json({ error: "Sign-ups aren't allowed over a VPN, proxy, or Tor connection. Please disable it and try again." });
+    }
+
+    const phoneCheck = await checkPhoneNumber(phone);
+    if (phoneCheck?.blocked) {
+      return res.status(400).json({ error: phoneCheck.reason });
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
@@ -431,6 +516,11 @@ app.post("/login", async (req, res) => {
 
     if (user.is_suspended) {
       return res.status(403).json({ error: "This account has been suspended" });
+    }
+
+    const vpnDetected = await isVpnOrProxy(getClientIp(req));
+    if (vpnDetected) {
+      return res.status(403).json({ error: "Login isn't allowed over a VPN, proxy, or Tor connection. Please disable it and try again." });
     }
 
     delete user.password_hash;
