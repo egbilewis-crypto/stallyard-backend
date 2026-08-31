@@ -129,6 +129,87 @@ async function checkPhoneNumber(phone) {
   }
 }
 
+// In-memory store mapping phone -> Termii's pinId, so the frontend only ever
+// has to deal with phone + code, same as before. Short TTL matching the OTP
+// lifetime itself.
+const termiiPinIds = new Map();
+const TERMII_PIN_TTL_MS = 10 * 60 * 1000;
+
+// Sends a real SMS one-time code via Termii — a Nigeria-founded provider with
+// much better deliverability to Nigerian carriers (MTN, Airtel, Glo, 9mobile)
+// than generic international providers, including DND bypass for OTPs.
+app.post("/phone-verify/send", async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ error: "Missing phone number" });
+    if (!process.env.TERMII_API_KEY) {
+      return res.status(500).json({ error: "SMS verification isn't configured yet" });
+    }
+
+    const to = phone.replace(/[^0-9]/g, ""); // Termii wants digits only, no leading +
+    const termiiRes = await fetch("https://api.ng.termii.com/api/sms/otp/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        api_key: process.env.TERMII_API_KEY,
+        message_type: "NUMERIC",
+        to,
+        from: process.env.TERMII_SENDER_ID || "N-Alert",
+        channel: "generic",
+        pin_attempts: 3,
+        pin_time_to_live: 10,
+        pin_length: 6,
+        pin_placeholder: "< 1234 >",
+        message_text: "Your Stallyard verification code is < 1234 >. This code expires in 10 minutes. Do not share with anyone.",
+        pin_type: "NUMERIC",
+      }),
+    });
+    const data = await termiiRes.json();
+    if (!termiiRes.ok || !data.pinId) {
+      return res.status(400).json({ error: data.message || "Couldn't send that code — check the phone number and try again" });
+    }
+    termiiPinIds.set(phone, { pinId: data.pinId, sentAt: Date.now() });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Checks the code the user typed in against Termii's record for that number.
+app.post("/phone-verify/check", async (req, res) => {
+  try {
+    const { phone, code } = req.body;
+    if (!phone || !code) return res.status(400).json({ error: "Missing phone number or code" });
+    if (!process.env.TERMII_API_KEY) {
+      return res.status(500).json({ error: "SMS verification isn't configured yet" });
+    }
+
+    const stored = termiiPinIds.get(phone);
+    if (!stored || Date.now() - stored.sentAt > TERMII_PIN_TTL_MS) {
+      return res.status(400).json({ error: "That code has expired — request a new one" });
+    }
+
+    const termiiRes = await fetch("https://api.ng.termii.com/api/sms/otp/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        api_key: process.env.TERMII_API_KEY,
+        pin_id: stored.pinId,
+        pin: code,
+      }),
+    });
+    const data = await termiiRes.json();
+    if (!termiiRes.ok) {
+      return res.status(400).json({ error: data.message || "Couldn't check that code" });
+    }
+    const valid = data.verified === "True" || data.verified === true;
+    if (valid) termiiPinIds.delete(phone);
+    res.json({ valid });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/", (req, res) => {
   res.send("Stallyard backend is running!");
 });
@@ -1230,12 +1311,15 @@ app.get("/wallet/balance", authenticate, async (req, res) => {
   }
 });
 
-app.post("/threads", async (req, res) => {
+app.post("/threads", authenticate, async (req, res) => {
   try {
     const { listingId, buyerId, sellerId } = req.body;
 
     if (!listingId || !buyerId || !sellerId) {
       return res.status(400).json({ error: "Missing listingId, buyerId, or sellerId" });
+    }
+    if (req.user.id !== Number(buyerId) && req.user.id !== Number(sellerId)) {
+      return res.status(403).json({ error: "You can only start a thread you're a part of" });
     }
 
     const existing = await pool.query(
@@ -1258,8 +1342,11 @@ app.post("/threads", async (req, res) => {
   }
 });
 
-app.get("/threads/:userId", async (req, res) => {
+app.get("/threads/:userId", authenticate, async (req, res) => {
   try {
+    if (req.user.id !== Number(req.params.userId) && !req.user.isAdmin) {
+      return res.status(403).json({ error: "You can only view your own threads" });
+    }
     const result = await pool.query(
       "SELECT * FROM threads WHERE buyer_id = $1 OR seller_id = $1 ORDER BY created_at DESC",
       [req.params.userId]
@@ -1270,12 +1357,18 @@ app.get("/threads/:userId", async (req, res) => {
   }
 });
 
-app.post("/messages", async (req, res) => {
+app.post("/messages", authenticate, async (req, res) => {
   try {
-    const { threadId, senderId, body, messageType, offerAmount } = req.body;
+    const { threadId, body, messageType, offerAmount } = req.body;
+    const senderId = req.user.id; // never trust a client-supplied sender
 
-    if (!threadId || !senderId) {
-      return res.status(400).json({ error: "Missing threadId or senderId" });
+    if (!threadId) {
+      return res.status(400).json({ error: "Missing threadId" });
+    }
+    const thread = await pool.query("SELECT buyer_id, seller_id FROM threads WHERE id = $1", [threadId]);
+    if (thread.rows.length === 0) return res.status(404).json({ error: "Thread not found" });
+    if (thread.rows[0].buyer_id !== senderId && thread.rows[0].seller_id !== senderId) {
+      return res.status(403).json({ error: "You're not a part of this thread" });
     }
 
     const result = await pool.query(
@@ -1298,8 +1391,13 @@ app.post("/messages", async (req, res) => {
   }
 });
 
-app.get("/messages/:threadId", async (req, res) => {
+app.get("/messages/:threadId", authenticate, async (req, res) => {
   try {
+    const thread = await pool.query("SELECT buyer_id, seller_id FROM threads WHERE id = $1", [req.params.threadId]);
+    if (thread.rows.length === 0) return res.status(404).json({ error: "Thread not found" });
+    if (thread.rows[0].buyer_id !== req.user.id && thread.rows[0].seller_id !== req.user.id && !req.user.isAdmin) {
+      return res.status(403).json({ error: "You're not a part of this thread" });
+    }
     const result = await pool.query(
       "SELECT * FROM messages WHERE thread_id = $1 ORDER BY created_at ASC",
       [req.params.threadId]
@@ -1309,15 +1407,81 @@ app.get("/messages/:threadId", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-app.post("/reviews", async (req, res) => {
-  try {
-    const { orderId, listingId, buyerId, sellerId, rating, comment } = req.body;
 
-    if (!orderId || !listingId || !buyerId || !sellerId || !rating) {
+// Accept or decline an offer — only the person who *received* it (not the
+// one who sent it) can respond.
+app.patch("/messages/:id/offer", authenticate, async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (!["accepted", "declined"].includes(status)) {
+      return res.status(400).json({ error: "Status must be accepted or declined" });
+    }
+    const msgResult = await pool.query(
+      "SELECT thread_id, sender_id, message_type FROM messages WHERE id = $1",
+      [req.params.id]
+    );
+    if (msgResult.rows.length === 0) return res.status(404).json({ error: "Message not found" });
+    const msg = msgResult.rows[0];
+    if (msg.message_type !== "offer") return res.status(400).json({ error: "That message isn't an offer" });
+
+    const threadResult = await pool.query("SELECT buyer_id, seller_id FROM threads WHERE id = $1", [msg.thread_id]);
+    if (threadResult.rows.length === 0) return res.status(404).json({ error: "Thread not found" });
+    const thread = threadResult.rows[0];
+    const recipientId = msg.sender_id === thread.buyer_id ? thread.seller_id : thread.buyer_id;
+    if (req.user.id !== recipientId && !req.user.isAdmin) {
+      return res.status(403).json({ error: "Only the offer recipient can respond to it" });
+    }
+
+    const result = await pool.query(
+      "UPDATE messages SET offer_status = $1 WHERE id = $2 RETURNING *",
+      [status, req.params.id]
+    );
+    res.json({ message: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// All reviews, public — used to compute seller ratings across the whole app.
+app.get("/reviews", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM reviews ORDER BY created_at DESC");
+    res.json({ reviews: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/reviews", authenticate, async (req, res) => {
+  try {
+    const { orderId, listingId, sellerId, rating, comment } = req.body;
+    const buyerId = req.user.id; // never trust a client-supplied reviewer identity
+
+    if (!orderId || !listingId || !sellerId || !rating) {
       return res.status(400).json({ error: "Missing required fields" });
     }
     if (rating < 1 || rating > 5) {
       return res.status(400).json({ error: "Rating must be between 1 and 5" });
+    }
+
+    // A review is only allowed if this buyer actually bought this exact item,
+    // from this seller, in this order — no reviewing things you never bought.
+    const purchase = await pool.query(
+      `SELECT 1 FROM orders o
+       JOIN order_items oi ON oi.order_id = o.id
+       WHERE o.id = $1 AND o.buyer_id = $2 AND oi.listing_id = $3 AND oi.seller_id = $4`,
+      [orderId, buyerId, listingId, sellerId]
+    );
+    if (purchase.rows.length === 0) {
+      return res.status(403).json({ error: "You can only review items you've actually purchased" });
+    }
+
+    const existing = await pool.query(
+      "SELECT 1 FROM reviews WHERE order_id = $1 AND listing_id = $2 AND buyer_id = $3",
+      [orderId, listingId, buyerId]
+    );
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: "You've already reviewed this item" });
     }
 
     const result = await pool.query(
@@ -1327,6 +1491,27 @@ app.post("/reviews", async (req, res) => {
     );
 
     res.status(201).json({ review: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/reviews/:id", authenticate, async (req, res) => {
+  try {
+    const { rating, comment } = req.body;
+    if (rating != null && (rating < 1 || rating > 5)) {
+      return res.status(400).json({ error: "Rating must be between 1 and 5" });
+    }
+    const existing = await pool.query("SELECT buyer_id FROM reviews WHERE id = $1", [req.params.id]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: "Review not found" });
+    if (existing.rows[0].buyer_id !== req.user.id && !req.user.isAdmin) {
+      return res.status(403).json({ error: "You can only edit your own review" });
+    }
+    const result = await pool.query(
+      "UPDATE reviews SET rating = COALESCE($1, rating), comment = COALESCE($2, comment) WHERE id = $3 RETURNING *",
+      [rating ?? null, comment ?? null, req.params.id]
+    );
+    res.json({ review: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
