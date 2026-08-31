@@ -210,6 +210,68 @@ app.post("/phone-verify/check", async (req, res) => {
   }
 });
 
+// In-memory store mapping email -> {code, sentAt}. Mirrors the Termii pinId
+// bridge pattern used for phone, but simpler since we generate the code
+// ourselves rather than relying on the provider to hold state for us.
+const emailCodes = new Map();
+const EMAIL_CODE_TTL_MS = 15 * 60 * 1000;
+
+// Sends a real verification email via Resend. Phone/SMS verification is
+// paused for now (Termii country-activation issues) — email is the primary
+// verification channel while Stallyard focuses on Nigeria.
+app.post("/email-verify/send", async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: "Missing email address" });
+    if (!process.env.RESEND_API_KEY) {
+      return res.status(500).json({ error: "Email verification isn't configured yet" });
+    }
+
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
+
+    const resendRes = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+      },
+      body: JSON.stringify({
+        from: fromAddress,
+        to: [email],
+        subject: `Your Stallyard verification code is ${code}`,
+        html: `<p>Your Stallyard verification code is <strong>${code}</strong>.</p><p>This code expires in 15 minutes. If you didn't request this, you can ignore this email.</p>`,
+      }),
+    });
+    const data = await resendRes.json();
+    if (!resendRes.ok) {
+      return res.status(400).json({ error: data.message || "Couldn't send that email — check the address and try again" });
+    }
+    emailCodes.set(email.toLowerCase(), { code, sentAt: Date.now() });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Checks the code the user typed in against our record for that email.
+app.post("/email-verify/check", async (req, res) => {
+  try {
+    const { email, code } = req.body;
+    if (!email || !code) return res.status(400).json({ error: "Missing email or code" });
+
+    const stored = emailCodes.get(email.toLowerCase());
+    if (!stored || Date.now() - stored.sentAt > EMAIL_CODE_TTL_MS) {
+      return res.status(400).json({ error: "That code has expired — request a new one" });
+    }
+    const valid = stored.code === String(code).trim();
+    if (valid) emailCodes.delete(email.toLowerCase());
+    res.json({ valid });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/", (req, res) => {
   res.send("Stallyard backend is running!");
 });
@@ -342,6 +404,22 @@ app.get("/migrate/orders-wallet", async (req, res) => {
 
 // One-time migration: cart and watchlist tables, so they follow the user
 // across devices instead of living only in one browser's local storage.
+app.get("/migrate/signup-stages", async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS is_email_verified BOOLEAN DEFAULT false,
+        ADD COLUMN IF NOT EXISTS profile_complete BOOLEAN DEFAULT false
+    `);
+    // Phone is no longer required at stage one — SMS verification is
+    // paused, and email is now the primary verification channel.
+    await pool.query(`ALTER TABLE users ALTER COLUMN phone DROP NOT NULL`);
+    res.send("Migration complete: signup-stages columns added, phone made optional.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/cart-watchlist", async (req, res) => {
   try {
     await pool.query(`
@@ -369,16 +447,21 @@ app.get("/migrate/cart-watchlist", async (req, res) => {
   }
 });
 
+// Stage one: the fast, minimal sign-up. Just enough to create an account
+// and log in — username, email, password. Everything else (name, country,
+// account type, ID documents) is filled in later via /profile/complete, and
+// the user can log in and resume that at any time since profile_complete
+// starts false. Email must already be verified (via /email-verify/send +
+// /email-verify/check) before this is called.
 app.post("/signup", async (req, res) => {
   try {
-    const {
-      username, email, phone, password, displayName, firstName, lastName,
-      officeLocation, country, accountType, idType, idCountry, licenseNumber,
-      licensePhotos, idVerificationExempt,
-    } = req.body;
+    const { username, email, password, emailVerified, displayName } = req.body;
 
-    if (!username || !email || !phone || !password) {
+    if (!username || !email || !password) {
       return res.status(400).json({ error: "Missing required fields" });
+    }
+    if (!emailVerified) {
+      return res.status(400).json({ error: "Verify your email before creating an account" });
     }
 
     const vpnDetected = await isVpnOrProxy(getClientIp(req));
@@ -386,41 +469,94 @@ app.post("/signup", async (req, res) => {
       return res.status(403).json({ error: "Sign-ups aren't allowed over a VPN, proxy, or Tor connection. Please disable it and try again." });
     }
 
-    const phoneCheck = await checkPhoneNumber(phone);
-    if (phoneCheck?.blocked) {
-      return res.status(400).json({ error: phoneCheck.reason });
-    }
-
     const passwordHash = await bcrypt.hash(password, 10);
-
     const countResult = await pool.query("SELECT COUNT(*) FROM users");
     const isFirstUser = Number(countResult.rows[0].count) === 0;
-    const usAliases = ["united states", "united states of america", "usa", "us", "u.s.", "u.s.a."];
-    const isUS = usAliases.includes((country || "").trim().toLowerCase());
-    const isApproved = isFirstUser || isUS;
 
     const result = await pool.query(
       `INSERT INTO users (
-         username, email, phone, password_hash, display_name, first_name, last_name,
-         office_location, country, is_admin, is_approved, account_type, id_type,
-         id_country, license_number, license_photos, id_verification_exempt
+         username, email, password_hash, display_name, is_admin, is_approved,
+         is_email_verified, profile_complete
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+       VALUES ($1, $2, $3, $4, $5, $6, true, false)
        RETURNING id, username, email, phone, display_name, first_name, last_name, office_location,
          country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type,
-         id_country, license_number, license_photos, id_verification_exempt, created_at`,
-      [
-        username, email, phone, passwordHash, displayName || username, firstName || "", lastName || "",
-        officeLocation || "", country || "", isFirstUser, isApproved, accountType || "personal",
-        idType || "", idCountry || "", licenseNumber || "", JSON.stringify(licensePhotos || []),
-        !!idVerificationExempt,
-      ]
+         id_country, license_number, license_photos, id_verification_exempt,
+         is_email_verified, profile_complete, created_at`,
+      [username, email, passwordHash, displayName || username, isFirstUser, isFirstUser]
     );
 
     res.status(201).json({ user: result.rows[0], token: signToken(result.rows[0]) });
   } catch (err) {
     if (err.code === "23505") {
-      return res.status(409).json({ error: "Username, email, or phone already in use" });
+      return res.status(409).json({ error: "Username or email already in use" });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Stage two: fill in the rest of the profile (name, phone, country, account
+// type, ID documents). Can be called as many times as needed — a user can
+// stop partway through and resume later, since nothing here is required to
+// log in. Country/US-block and seller approval rules are evaluated here,
+// once we actually know the country.
+app.patch("/profile/complete", authenticate, async (req, res) => {
+  try {
+    const {
+      firstName, lastName, phone, officeLocation, country, accountType,
+      idType, idCountry, licenseNumber, licensePhotos, idVerificationExempt,
+    } = req.body;
+
+    const usAliases = ["united states", "united states of america", "usa", "us", "u.s.", "u.s.a."];
+    const isUS = usAliases.includes((country || "").trim().toLowerCase());
+    if (isUS) {
+      return res.status(403).json({ error: "US sign-ups are coming soon — Stallyard is Nigeria-only for now" });
+    }
+
+    if (phone) {
+      const phoneCheck = await checkPhoneNumber(phone);
+      if (phoneCheck?.blocked) {
+        return res.status(400).json({ error: phoneCheck.reason });
+      }
+    }
+
+    const hasCore = firstName && lastName && country;
+    const skipId = isUS;
+    const hasId = skipId || !!idVerificationExempt || (idType && licenseNumber);
+    const nowComplete = !!(hasCore && (accountType === "personal" || hasId));
+
+    const result = await pool.query(
+      `UPDATE users SET
+         first_name = COALESCE($1, first_name),
+         last_name = COALESCE($2, last_name),
+         phone = COALESCE($3, phone),
+         office_location = COALESCE($4, office_location),
+         country = COALESCE($5, country),
+         account_type = COALESCE($6, account_type),
+         id_type = COALESCE($7, id_type),
+         id_country = COALESCE($8, id_country),
+         license_number = COALESCE($9, license_number),
+         license_photos = COALESCE($10, license_photos),
+         id_verification_exempt = COALESCE($11, id_verification_exempt),
+         profile_complete = $12
+       WHERE id = $13
+       RETURNING id, username, email, phone, display_name, first_name, last_name, office_location,
+         country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type,
+         id_country, license_number, license_photos, id_verification_exempt,
+         is_email_verified, profile_complete, created_at`,
+      [
+        firstName || null, lastName || null, phone || null, officeLocation || null,
+        country || null, accountType || null, idType || null, idCountry || null,
+        licenseNumber || null, licensePhotos ? JSON.stringify(licensePhotos) : null,
+        idVerificationExempt === undefined ? null : !!idVerificationExempt,
+        nowComplete, req.user.id,
+      ]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: "User not found" });
+    res.json({ user: result.rows[0] });
+  } catch (err) {
+    if (err.code === "23505") {
+      return res.status(409).json({ error: "That phone number is already in use" });
     }
     res.status(500).json({ error: err.message });
   }
