@@ -647,6 +647,16 @@ app.delete("/users/:id", authenticate, requireAdmin, async (req, res) => {
     if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
     res.json({ success: true });
   } catch (err) {
+    // Postgres foreign-key-violation code — this member has order or
+    // withdrawal history that references them, so a hard delete would
+    // either fail or destroy financial records other users depend on.
+    // Tell the frontend so it can offer suspending instead.
+    if (err.code === "23503") {
+      return res.status(409).json({
+        error: "This member has order or payout history and can't be permanently deleted. Suspend them instead to block access while keeping records intact.",
+        code: "HAS_HISTORY",
+      });
+    }
     res.status(500).json({ error: err.message });
   }
 });
