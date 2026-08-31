@@ -340,6 +340,35 @@ app.get("/migrate/orders-wallet", async (req, res) => {
   }
 });
 
+// One-time migration: cart and watchlist tables, so they follow the user
+// across devices instead of living only in one browser's local storage.
+app.get("/migrate/cart-watchlist", async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS cart_items (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        listing_id INTEGER NOT NULL,
+        qty INTEGER NOT NULL DEFAULT 1,
+        offer_price NUMERIC,
+        UNIQUE (user_id, listing_id)
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS watchlist_items (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        listing_id INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE (user_id, listing_id)
+      )
+    `);
+    res.send("Migration complete: cart_items and watchlist_items tables added.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.post("/signup", async (req, res) => {
   try {
     const {
@@ -565,6 +594,81 @@ app.delete("/follows", authenticate, async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Cart and watchlist — always sent/returned as a whole list, matching the
+// "replace the whole thing" pattern the frontend already uses.
+app.get("/cart", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT listing_id, qty, offer_price FROM cart_items WHERE user_id = $1",
+      [req.user.id]
+    );
+    res.json({ items: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/cart", authenticate, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { items } = req.body;
+    if (!Array.isArray(items)) return res.status(400).json({ error: "items must be an array" });
+    await client.query("BEGIN");
+    await client.query("DELETE FROM cart_items WHERE user_id = $1", [req.user.id]);
+    for (const item of items) {
+      if (!item.listingId || !(Number(item.qty) > 0)) continue;
+      await client.query(
+        `INSERT INTO cart_items (user_id, listing_id, qty, offer_price)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (user_id, listing_id) DO UPDATE SET qty = $3, offer_price = $4`,
+        [req.user.id, item.listingId, item.qty, item.offerPrice || null]
+      );
+    }
+    await client.query("COMMIT");
+    res.json({ success: true });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/watchlist", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT listing_id FROM watchlist_items WHERE user_id = $1",
+      [req.user.id]
+    );
+    res.json({ listingIds: result.rows.map((r) => r.listing_id) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/watchlist", authenticate, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { listingIds } = req.body;
+    if (!Array.isArray(listingIds)) return res.status(400).json({ error: "listingIds must be an array" });
+    await client.query("BEGIN");
+    await client.query("DELETE FROM watchlist_items WHERE user_id = $1", [req.user.id]);
+    for (const listingId of listingIds) {
+      await client.query(
+        "INSERT INTO watchlist_items (user_id, listing_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        [req.user.id, listingId]
+      );
+    }
+    await client.query("COMMIT");
+    res.json({ success: true });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
