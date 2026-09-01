@@ -650,6 +650,18 @@ app.get("/migrate/order-management", requireMigrationKey, async (req, res) => {
   }
 });
 
+app.get("/migrate/proof-of-delivery", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE order_items
+        ADD COLUMN IF NOT EXISTS proof_of_delivery_url TEXT DEFAULT ''
+    `);
+    res.send("Migration complete: proof_of_delivery_url column added to order_items.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/cart-watchlist", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -1504,7 +1516,7 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
     if (!req.user.isAdmin && existing.rows[0].seller_id !== req.user.id) {
       return res.status(403).json({ error: "You can only update your own items" });
     }
-    const { fulfillmentStatus, trackingNumber, carrier } = req.body;
+    const { fulfillmentStatus, trackingNumber, carrier, proofOfDeliveryUrl } = req.body;
     if (fulfillmentStatus && !ORDER_ITEM_STATUSES.has(fulfillmentStatus)) {
       return res.status(400).json({ error: "Invalid fulfillment status" });
     }
@@ -1522,6 +1534,10 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
     if (typeof carrier === "string") {
       sets.push(`carrier = $${i++}`);
       values.push(carrier);
+    }
+    if (typeof proofOfDeliveryUrl === "string") {
+      sets.push(`proof_of_delivery_url = $${i++}`);
+      values.push(proofOfDeliveryUrl);
     }
     if (sets.length === 0) return res.status(400).json({ error: "No valid fields to update" });
     values.push(req.params.id);
