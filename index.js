@@ -353,6 +353,12 @@ const PASSWORD_RESET_CODE_TTL_MS = 15 * 60 * 1000;
 const twoFactorCodes = new Map();
 const TWO_FACTOR_CODE_TTL_MS = 10 * 60 * 1000;
 
+// Pending bank-account changes awaiting email confirmation — only required
+// when *changing* an existing account on file, not the first-time setup.
+// Keyed by user id; holds the new details until the code is confirmed.
+const pendingBankChanges = new Map();
+const BANK_CHANGE_CODE_TTL_MS = 15 * 60 * 1000;
+
 // Step 1: look up the account by username, email the code to the address
 // on file. Deliberately doesn't reveal the email address itself in the
 // response beyond a masked preview, and doesn't let the frontend supply
@@ -2235,6 +2241,39 @@ app.get("/paystack/banks", authenticate, async (req, res) => {
   }
 });
 
+// Shared by both first-time setup (saves immediately) and a confirmed
+// bank-account change (after the email code is verified) — actually
+// creates the Paystack transfer recipient and saves it.
+async function verifyAndSaveBankDetails(userId, bankCode, accountNumber) {
+  const userResult = await pool.query("SELECT display_name FROM users WHERE id = $1", [userId]);
+  if (userResult.rows.length === 0) {
+    return { error: "User not found", status: 404 };
+  }
+  const recipientRes = await fetch("https://api.paystack.co/transferrecipient", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      type: "nuban",
+      name: userResult.rows[0].display_name,
+      account_number: accountNumber,
+      bank_code: bankCode,
+      currency: "NGN",
+    }),
+  });
+  const recipientData = await recipientRes.json();
+  if (!recipientData.status) {
+    return { error: recipientData.message || "Could not verify bank details", status: 400 };
+  }
+  await pool.query(
+    "UPDATE users SET bank_code = $1, account_number = $2, paystack_recipient_code = $3 WHERE id = $4",
+    [bankCode, accountNumber, recipientData.data.recipient_code, userId]
+  );
+  return { recipientCode: recipientData.data.recipient_code };
+}
+
 app.post("/sellers/bank-details", authenticate, async (req, res) => {
   try {
     const { userId, bankCode, accountNumber } = req.body;
@@ -2246,38 +2285,64 @@ app.post("/sellers/bank-details", authenticate, async (req, res) => {
       return res.status(403).json({ error: "You can only set your own bank details" });
     }
 
-    const userResult = await pool.query("SELECT display_name FROM users WHERE id = $1", [userId]);
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ error: "User not found" });
+    // First-time setup saves immediately. Changing an account that's
+    // already on file needs an emailed confirmation first — protects
+    // against payouts getting silently redirected if a session's ever
+    // compromised.
+    const existing = await pool.query("SELECT account_number, email FROM users WHERE id = $1", [userId]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: "User not found" });
+    const hadAccountBefore = !!existing.rows[0].account_number;
+
+    if (!hadAccountBefore || (req.user.isAdmin && req.user.id !== Number(userId))) {
+      const result = await verifyAndSaveBankDetails(userId, bankCode, accountNumber);
+      if (result.error) return res.status(result.status).json({ error: result.error });
+      return res.json({ success: true, recipientCode: result.recipientCode });
     }
 
-    const recipientRes = await fetch("https://api.paystack.co/transferrecipient", {
+    const email = existing.rows[0].email;
+    if (!email) {
+      return res.status(400).json({ error: "No email on file to confirm this change — contact support" });
+    }
+    if (!process.env.RESEND_API_KEY) {
+      return res.status(500).json({ error: "Bank-change confirmation isn't configured yet" });
+    }
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
+    const resendRes = await fetch("https://api.resend.com/emails", {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
-        "Content-Type": "application/json",
-      },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
       body: JSON.stringify({
-        type: "nuban",
-        name: userResult.rows[0].display_name,
-        account_number: accountNumber,
-        bank_code: bankCode,
-        currency: "NGN",
+        from: fromAddress,
+        to: [email],
+        subject: `Confirm your bank account change — code ${code}`,
+        html: `<p>Someone (hopefully you) is changing the bank account your Stallyard payouts go to.</p><p>Your confirmation code is <strong>${code}</strong>. It expires in 15 minutes.</p><p>If this wasn't you, change your password immediately and contact support.</p>`,
       }),
     });
-
-    const recipientData = await recipientRes.json();
-
-    if (!recipientData.status) {
-      return res.status(400).json({ error: recipientData.message || "Could not verify bank details" });
+    if (!resendRes.ok) {
+      return res.status(400).json({ error: "Couldn't send a confirmation code — try again" });
     }
+    pendingBankChanges.set(Number(userId), { code, sentAt: Date.now(), bankCode, accountNumber });
+    res.json({ confirmationRequired: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
-    await pool.query(
-      "UPDATE users SET bank_code = $1, account_number = $2, paystack_recipient_code = $3 WHERE id = $4",
-      [bankCode, accountNumber, recipientData.data.recipient_code, userId]
-    );
-
-    res.json({ success: true, recipientCode: recipientData.data.recipient_code });
+app.post("/sellers/bank-details/confirm", authenticate, async (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: "Enter the code we emailed you" });
+    const pending = pendingBankChanges.get(req.user.id);
+    if (!pending || Date.now() - pending.sentAt > BANK_CHANGE_CODE_TTL_MS) {
+      return res.status(400).json({ error: "That code has expired — start the change again" });
+    }
+    if (pending.code !== String(code).trim()) {
+      return res.status(400).json({ error: "That code doesn't match — check and try again" });
+    }
+    pendingBankChanges.delete(req.user.id);
+    const result = await verifyAndSaveBankDetails(req.user.id, pending.bankCode, pending.accountNumber);
+    if (result.error) return res.status(result.status).json({ error: result.error });
+    res.json({ success: true, recipientCode: result.recipientCode });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
