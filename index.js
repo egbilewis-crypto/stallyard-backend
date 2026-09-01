@@ -662,6 +662,19 @@ app.get("/migrate/proof-of-delivery", requireMigrationKey, async (req, res) => {
   }
 });
 
+app.get("/migrate/delivery-token", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE order_items
+        ADD COLUMN IF NOT EXISTS delivery_token TEXT,
+        ADD COLUMN IF NOT EXISTS delivery_token_generated_at TIMESTAMP
+    `);
+    res.send("Migration complete: delivery_token and delivery_token_generated_at columns added to order_items.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/cart-watchlist", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -1556,6 +1569,33 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
 // Once every non-cancelled/non-returned item in the order is confirmed,
 // the order's held payment auto-releases to the seller(s) — the same
 // status flip the "Release payout" admin action performs.
+// Shared by both the buyer's direct "Confirm receipt" click and a seller
+// redeeming a buyer-given delivery token: marks one item as buyer-confirmed,
+// then — once every non-cancelled/non-returned item in the order is
+// confirmed — auto-releases the order's held payment, the same status flip
+// the "Release payout" admin action performs.
+async function markItemReceivedAndMaybeRelease(itemId) {
+  const result = await pool.query(
+    "UPDATE order_items SET buyer_confirmed_at = NOW(), delivery_token = NULL, delivery_token_generated_at = NULL WHERE id = $1 RETURNING *",
+    [itemId]
+  );
+  const item = result.rows[0];
+  const allItems = await pool.query("SELECT * FROM order_items WHERE order_id = $1", [item.order_id]);
+  const relevant = allItems.rows.filter((r) => !["cancelled", "returned"].includes(r.fulfillment_status));
+  const allConfirmed = relevant.length > 0 && relevant.every((r) => r.buyer_confirmed_at);
+  let order = null;
+  if (allConfirmed) {
+    const orderRes = await pool.query(
+      "UPDATE orders SET payment_status = 'released' WHERE id = $1 AND payment_status = 'held' RETURNING *",
+      [item.order_id]
+    );
+    order = orderRes.rows[0] || null;
+  }
+  return { item, order };
+}
+
+// Buyer confirms they received an item. Only the order's buyer can do this,
+// and only once the seller has actually marked it shipped or delivered.
 app.patch("/order-items/:id/confirm-receipt", authenticate, async (req, res) => {
   try {
     const existing = await pool.query(
@@ -1572,22 +1612,75 @@ app.patch("/order-items/:id/confirm-receipt", authenticate, async (req, res) => 
     if (!["shipped", "delivered"].includes(item.fulfillment_status)) {
       return res.status(400).json({ error: "This item hasn't been shipped yet" });
     }
-    const result = await pool.query(
-      "UPDATE order_items SET buyer_confirmed_at = NOW() WHERE id = $1 RETURNING *",
+    const { item: updatedItem, order } = await markItemReceivedAndMaybeRelease(req.params.id);
+    res.json({ item: updatedItem, order });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const DELIVERY_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Buyer generates a 10-digit code to hand to the seller in person as proof
+// of a successful delivery — an alternative to tapping "Confirm receipt"
+// themselves, useful for cash-on-delivery or in-person handoffs. Only the
+// order's buyer can generate one, and only once the item's shipped.
+app.post("/order-items/:id/generate-delivery-token", authenticate, async (req, res) => {
+  try {
+    const existing = await pool.query(
+      `SELECT oi.*, o.buyer_id
+       FROM order_items oi JOIN orders o ON oi.order_id = o.id
+       WHERE oi.id = $1`,
       [req.params.id]
     );
-    const allItems = await pool.query("SELECT * FROM order_items WHERE order_id = $1", [item.order_id]);
-    const relevant = allItems.rows.filter((r) => !["cancelled", "returned"].includes(r.fulfillment_status));
-    const allConfirmed = relevant.length > 0 && relevant.every((r) => r.buyer_confirmed_at);
-    let order = null;
-    if (allConfirmed && item.payment_status === "held") {
-      const orderRes = await pool.query(
-        "UPDATE orders SET payment_status = 'released' WHERE id = $1 RETURNING *",
-        [item.order_id]
-      );
-      order = orderRes.rows[0];
+    if (existing.rows.length === 0) return res.status(404).json({ error: "Order item not found" });
+    const item = existing.rows[0];
+    if (item.buyer_id !== req.user.id) {
+      return res.status(403).json({ error: "Only the buyer can generate a delivery code for this item" });
     }
-    res.json({ item: result.rows[0], order });
+    if (!["shipped", "delivered"].includes(item.fulfillment_status)) {
+      return res.status(400).json({ error: "This item hasn't been shipped yet" });
+    }
+    if (item.buyer_confirmed_at) {
+      return res.status(400).json({ error: "This item has already been confirmed as received" });
+    }
+    const token = Math.floor(1000000000 + Math.random() * 9000000000).toString();
+    await pool.query(
+      "UPDATE order_items SET delivery_token = $1, delivery_token_generated_at = NOW() WHERE id = $2",
+      [token, req.params.id]
+    );
+    res.json({ token });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Seller enters the code the buyer gave them. On a match, this confirms
+// receipt exactly like the buyer clicking "Confirm receipt" themselves —
+// same auto-release-payment behavior — since the buyer generating and
+// handing over the code IS their confirmation.
+app.post("/order-items/:id/redeem-delivery-token", authenticate, codeRateLimit, async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ error: "Enter the code the buyer gave you" });
+    const existing = await pool.query("SELECT * FROM order_items WHERE id = $1", [req.params.id]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: "Order item not found" });
+    const item = existing.rows[0];
+    if (!req.user.isAdmin && item.seller_id !== req.user.id) {
+      return res.status(403).json({ error: "You can only redeem codes for your own items" });
+    }
+    if (
+      !item.delivery_token ||
+      !item.delivery_token_generated_at ||
+      Date.now() - new Date(item.delivery_token_generated_at).getTime() > DELIVERY_TOKEN_TTL_MS
+    ) {
+      return res.status(400).json({ error: "No active code for this item — ask the buyer to generate a new one" });
+    }
+    if (item.delivery_token !== String(token).trim()) {
+      return res.status(400).json({ error: "That code doesn't match — check and try again" });
+    }
+    const { item: updatedItem, order } = await markItemReceivedAndMaybeRelease(req.params.id);
+    res.json({ item: updatedItem, order });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
