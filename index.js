@@ -50,7 +50,7 @@ async function authenticate(req, res, next) {
   if (!requester) return res.status(401).json({ error: "Sign in required" });
   try {
     const result = await pool.query(
-      "SELECT is_admin, is_suspended, token_version, admin_role FROM users WHERE id = $1",
+      "SELECT is_admin, is_suspended, token_version, admin_role, two_factor_enabled FROM users WHERE id = $1",
       [requester.id]
     );
     if (result.rows.length === 0) {
@@ -63,16 +63,27 @@ async function authenticate(req, res, next) {
     if ((requester.tokenVersion || 0) !== currentVersion) {
       return res.status(401).json({ error: "Your session was signed out from another device — log in again" });
     }
-    req.user = { ...requester, isAdmin: !!result.rows[0].is_admin, adminRole: result.rows[0].admin_role || null };
+    req.user = {
+      ...requester,
+      isAdmin: !!result.rows[0].is_admin,
+      adminRole: result.rows[0].admin_role || null,
+      twoFactorEnabled: !!result.rows[0].two_factor_enabled,
+    };
     next();
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 }
 
-// Must follow authenticate(). Requires the token to belong to an admin.
+// Must follow authenticate(). Requires the token to belong to an admin —
+// and, since two-factor is mandatory for admins, that they've actually
+// turned it on. (The /profile/two-factor endpoint itself doesn't use this
+// gate, so an admin can always reach it to turn 2FA on in the first place.)
 function requireAdmin(req, res, next) {
   if (!req.user?.isAdmin) return res.status(403).json({ error: "Admin access required" });
+  if (!req.user.twoFactorEnabled) {
+    return res.status(403).json({ error: "Two-factor authentication is required for admin accounts — enable it to continue.", code: "2FA_REQUIRED" });
+  }
   next();
 }
 
@@ -99,6 +110,7 @@ const ROLE_PERMISSIONS = {
 // always meant, preserved exactly as it worked before this feature.
 function hasPermission(user, permission) {
   if (!user?.isAdmin) return false;
+  if (!user.twoFactorEnabled) return false;
   if (!user.adminRole || user.adminRole === "super_admin") return true;
   const allowed = ROLE_PERMISSIONS[user.adminRole];
   return allowed ? allowed.has(permission) : false;
@@ -111,6 +123,9 @@ function hasPermission(user, permission) {
 // higher-stakes actions.
 function requirePermission(permission) {
   return (req, res, next) => {
+    if (req.user?.isAdmin && !req.user.twoFactorEnabled) {
+      return res.status(403).json({ error: "Two-factor authentication is required for admin accounts — enable it to continue.", code: "2FA_REQUIRED" });
+    }
     if (!hasPermission(req.user, permission)) {
       return res.status(403).json({ error: "You don't have permission to do that" });
     }
@@ -1280,12 +1295,77 @@ app.patch("/profile/two-factor", authenticate, async (req, res) => {
         return res.status(400).json({ error: "Add a verified email to your account before turning this on" });
       }
     }
+    if (!enabled && req.user.isAdmin) {
+      return res.status(403).json({ error: "Admin accounts can't turn off two-factor authentication" });
+    }
     const result = await pool.query(
       "UPDATE users SET two_factor_enabled = $1 WHERE id = $2 RETURNING two_factor_enabled",
       [!!enabled, req.user.id]
     );
     if (!result.rows.length) return res.status(404).json({ error: "Account not found" });
     res.json({ twoFactorEnabled: result.rows[0].two_factor_enabled });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Re-authentication gate for entering the admin panel. Being logged in
+// normally isn't enough — opening Admin requires proving it's really you,
+// right then, even with a valid 30-day session. Step 1: password.
+app.post("/admin/reauth", authenticate, authRateLimit, async (req, res) => {
+  try {
+    if (!req.user.isAdmin) return res.status(403).json({ error: "Admin access required" });
+    const { password } = req.body;
+    if (!password) return res.status(400).json({ error: "Enter your password" });
+    const result = await pool.query("SELECT password_hash, email, two_factor_enabled FROM users WHERE id = $1", [req.user.id]);
+    if (!result.rows.length) return res.status(404).json({ error: "Account not found" });
+    const matches = await bcrypt.compare(password, result.rows[0].password_hash);
+    if (!matches) return res.status(401).json({ error: "Password doesn't match" });
+
+    if (!result.rows[0].two_factor_enabled) {
+      // Shouldn't normally happen since 2FA is required for admin actions,
+      // but handle it rather than leaving a dead end.
+      return res.json({ success: true });
+    }
+    if (!result.rows[0].email || !process.env.RESEND_API_KEY) {
+      return res.status(500).json({ error: "Two-factor isn't configured — contact support" });
+    }
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
+    const resendRes = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
+      body: JSON.stringify({
+        from: fromAddress,
+        to: [result.rows[0].email],
+        subject: `Your Stallyard admin access code is ${code}`,
+        html: `<p>Your code to unlock the admin panel is <strong>${code}</strong>.</p><p>Expires in 10 minutes. If this wasn't you, change your password immediately.</p>`,
+      }),
+    });
+    if (!resendRes.ok) {
+      return res.status(400).json({ error: "Couldn't send your code — try again" });
+    }
+    twoFactorCodes.set(req.user.id, { code, sentAt: Date.now() });
+    res.json({ twoFactorRequired: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Step 2: the code from that email actually unlocks the panel.
+app.post("/admin/reauth/verify", authenticate, authRateLimit, async (req, res) => {
+  try {
+    if (!req.user.isAdmin) return res.status(403).json({ error: "Admin access required" });
+    const { code } = req.body;
+    const stored = twoFactorCodes.get(req.user.id);
+    if (!stored || Date.now() - stored.sentAt > TWO_FACTOR_CODE_TTL_MS) {
+      return res.status(400).json({ error: "That code has expired — start over" });
+    }
+    if (stored.code !== String(code || "").trim()) {
+      return res.status(400).json({ error: "That code doesn't match" });
+    }
+    twoFactorCodes.delete(req.user.id);
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
