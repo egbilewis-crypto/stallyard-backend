@@ -717,6 +717,30 @@ app.get("/migrate/returns", requireMigrationKey, async (req, res) => {
   }
 });
 
+app.get("/migrate/review-features", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE reviews
+        ADD COLUMN IF NOT EXISTS seller_response TEXT,
+        ADD COLUMN IF NOT EXISTS seller_response_at TIMESTAMP
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS review_reports (
+        id SERIAL PRIMARY KEY,
+        review_id INTEGER NOT NULL,
+        reporter_id INTEGER NOT NULL,
+        reason TEXT DEFAULT '',
+        status TEXT DEFAULT 'open',
+        created_at TIMESTAMP DEFAULT NOW(),
+        resolved_at TIMESTAMP
+      )
+    `);
+    res.send("Migration complete: seller_response columns added to reviews, review_reports table created.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/cart-watchlist", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -2466,6 +2490,99 @@ app.get("/sellers/:id/reviews", async (req, res) => {
       [req.params.id]
     );
     res.json({ reviews: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Seller replies to a review left on one of their sales. One reply per
+// review — resubmitting overwrites the previous response.
+app.patch("/reviews/:id/respond", authenticate, async (req, res) => {
+  try {
+    const { response } = req.body;
+    if (!response || !response.trim()) {
+      return res.status(400).json({ error: "Write a response first" });
+    }
+    const existing = await pool.query("SELECT seller_id FROM reviews WHERE id = $1", [req.params.id]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: "Review not found" });
+    if (existing.rows[0].seller_id !== req.user.id && !req.user.isAdmin) {
+      return res.status(403).json({ error: "You can only respond to reviews on your own sales" });
+    }
+    const result = await pool.query(
+      "UPDATE reviews SET seller_response = $1, seller_response_at = NOW() WHERE id = $2 RETURNING *",
+      [response.trim(), req.params.id]
+    );
+    res.json({ review: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Anyone signed in can flag a review as abusive or fraudulent — not
+// restricted to the seller it's about, since a false or malicious review
+// could be spotted by anyone browsing.
+app.post("/reviews/:id/report", authenticate, async (req, res) => {
+  try {
+    const { reason } = req.body;
+    const existing = await pool.query("SELECT id FROM reviews WHERE id = $1", [req.params.id]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: "Review not found" });
+    const result = await pool.query(
+      `INSERT INTO review_reports (review_id, reporter_id, reason) VALUES ($1, $2, $3) RETURNING *`,
+      [req.params.id, req.user.id, reason || ""]
+    );
+    res.status(201).json({ report: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin queue of reported reviews, joined with the review content and who
+// wrote it/reported it.
+app.get("/review-reports", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT rr.*,
+         r.rating AS review_rating, r.comment AS review_comment, r.seller_id AS review_seller_id,
+         buyer.username AS review_buyer_username, buyer.display_name AS review_buyer_display_name,
+         seller.username AS review_seller_username, seller.display_name AS review_seller_display_name,
+         reporter.username AS reporter_username, reporter.display_name AS reporter_display_name
+       FROM review_reports rr
+       JOIN reviews r ON rr.review_id = r.id
+       LEFT JOIN users buyer ON r.buyer_id = buyer.id
+       LEFT JOIN users seller ON r.seller_id = seller.id
+       LEFT JOIN users reporter ON rr.reporter_id = reporter.id
+       ORDER BY rr.created_at DESC`
+    );
+    res.json({ reports: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/review-reports/:id/resolve", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "UPDATE review_reports SET status = 'resolved', resolved_at = NOW() WHERE id = $1 RETURNING *",
+      [req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Report not found" });
+    res.json({ report: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Public trust signal for a seller's storefront — just a count, no order
+// details exposed. "Completed" = the item actually made it to the buyer.
+app.get("/sellers/:username/completed-sales-count", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT COUNT(*) FROM order_items oi
+       JOIN users u ON oi.seller_id = u.id
+       WHERE u.username = $1 AND oi.fulfillment_status = 'delivered'`,
+      [req.params.username]
+    );
+    res.json({ count: Number(result.rows[0].count) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
