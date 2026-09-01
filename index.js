@@ -420,6 +420,29 @@ app.get("/migrate/signup-stages", async (req, res) => {
   }
 });
 
+app.get("/migrate/seller-verification", async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS verification_status TEXT DEFAULT 'none',
+        ADD COLUMN IF NOT EXISTS bank_statement_url TEXT,
+        ADD COLUMN IF NOT EXISTS rejection_reason TEXT
+    `);
+    // Backfill verification_status from the existing is_approved /
+    // has_applied_to_sell booleans so nobody's current state changes.
+    await pool.query(`
+      UPDATE users SET verification_status =
+        CASE WHEN is_approved THEN 'approved'
+             WHEN has_applied_to_sell THEN 'pending'
+             ELSE 'none' END
+      WHERE verification_status IS NULL OR verification_status = 'none'
+    `);
+    res.send("Migration complete: verification_status, bank_statement_url, rejection_reason columns added.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/cart-watchlist", async (req, res) => {
   try {
     await pool.query(`
@@ -561,16 +584,42 @@ app.patch("/profile/complete", authenticate, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// Submit (or resubmit) a seller application. Sets status back to "pending"
+// so a previously-rejected member can try again after fixing whatever
+// was wrong. bankStatementUrl is optional — a data URL from the frontend's
+// file upload, same pattern as license photos.
+app.post("/profile/apply-to-sell", authenticate, async (req, res) => {
+  try {
+    const { bankStatementUrl } = req.body;
+    const result = await pool.query(
+      `UPDATE users SET
+         has_applied_to_sell = true,
+         verification_status = 'pending',
+         bank_statement_url = COALESCE($1, bank_statement_url),
+         rejection_reason = NULL
+       WHERE id = $2
+       RETURNING ${USER_RETURNING_FIELDS}`,
+      [bankStatementUrl || null, req.user.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: "User not found" });
+    res.json({ user: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 // Full member list for the admin dashboard. No password hashes returned.
 // Fields visible to everyone — used for storefronts, follower lists, etc.
 // Deliberately excludes email, phone, and ID/document fields.
 const USER_PUBLIC_FIELDS = `id, username, display_name, first_name, last_name, office_location,
-  country, is_admin, is_approved, is_verified, is_suspended, account_type, created_at`;
+  country, is_admin, is_approved, is_verified, is_suspended, account_type, verification_status, created_at`;
 
-// Full fields — only returned to a signed-in admin.
+// Full fields — only returned to a signed-in admin. bank_statement_url and
+// rejection_reason are sensitive/internal, so they stay out of USER_PUBLIC_FIELDS.
 const USER_FULL_FIELDS = `id, username, email, phone, display_name, first_name, last_name, office_location,
   country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
-  license_number, license_photos, id_verification_exempt, has_applied_to_sell, created_at`;
+  license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
+  bank_statement_url, rejection_reason, created_at`;
 
 app.get("/users", async (req, res) => {
   try {
@@ -585,7 +634,8 @@ app.get("/users", async (req, res) => {
 
 const USER_RETURNING_FIELDS = `id, username, email, phone, display_name, first_name, last_name, office_location,
   country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
-  license_number, license_photos, id_verification_exempt, has_applied_to_sell, created_at`;
+  license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
+  bank_statement_url, rejection_reason, created_at`;
 
 app.patch("/users/:id/verify", authenticate, requireAdmin, async (req, res) => {
   try {
@@ -631,8 +681,24 @@ app.patch("/users/:id/promote", authenticate, requireAdmin, async (req, res) => 
 app.patch("/users/:id/approve", authenticate, requireAdmin, async (req, res) => {
   try {
     const result = await pool.query(
-      `UPDATE users SET is_approved = true WHERE id = $1 RETURNING ${USER_RETURNING_FIELDS}`,
+      `UPDATE users SET is_approved = true, verification_status = 'approved', rejection_reason = NULL
+       WHERE id = $1 RETURNING ${USER_RETURNING_FIELDS}`,
       [req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
+    res.json({ user: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/users/:id/reject", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { reason } = req.body;
+    const result = await pool.query(
+      `UPDATE users SET is_approved = false, verification_status = 'rejected', rejection_reason = $1
+       WHERE id = $2 RETURNING ${USER_RETURNING_FIELDS}`,
+      [reason || null, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
     res.json({ user: result.rows[0] });
@@ -672,9 +738,10 @@ app.post("/admin/create-member", authenticate, requireAdmin, async (req, res) =>
 
     const passwordHash = await bcrypt.hash(password, 10);
 
+    const approved = isApproved !== false;
     const result = await pool.query(
-      `INSERT INTO users (username, email, phone, password_hash, display_name, is_admin, is_approved, is_verified)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      `INSERT INTO users (username, email, phone, password_hash, display_name, is_admin, is_approved, is_verified, verification_status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING ${USER_RETURNING_FIELDS}`,
       [
         username,
@@ -683,8 +750,9 @@ app.post("/admin/create-member", authenticate, requireAdmin, async (req, res) =>
         passwordHash,
         displayName || username,
         !!isAdmin,
-        isApproved !== false,
+        approved,
         !!isVerified,
+        approved ? "approved" : "none",
       ]
     );
 
@@ -871,6 +939,14 @@ app.post("/listings", authenticate, async (req, res) => {
 
     if (!title || !price) {
       return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    // The frontend already hides the listing form until a seller is
+    // approved, but that's only a UI convenience — enforce it here too,
+    // since nothing stops someone from calling this endpoint directly.
+    const sellerCheck = await pool.query("SELECT is_approved FROM users WHERE id = $1", [ownerId]);
+    if (!sellerCheck.rows.length || !sellerCheck.rows[0].is_approved) {
+      return res.status(403).json({ error: "Your seller account must be approved before you can list items." });
     }
 
     const result = await pool.query(
