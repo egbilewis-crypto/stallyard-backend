@@ -700,6 +700,23 @@ app.get("/migrate/message-features", requireMigrationKey, async (req, res) => {
   }
 });
 
+app.get("/migrate/returns", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE order_items
+        ADD COLUMN IF NOT EXISTS return_status TEXT,
+        ADD COLUMN IF NOT EXISTS return_reason TEXT,
+        ADD COLUMN IF NOT EXISTS return_note TEXT,
+        ADD COLUMN IF NOT EXISTS return_requested_at TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS return_tracking_number TEXT,
+        ADD COLUMN IF NOT EXISTS return_evidence_urls JSONB DEFAULT '[]'::jsonb
+    `);
+    res.send("Migration complete: return_status and related columns added to order_items.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/cart-watchlist", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -1639,6 +1656,102 @@ app.patch("/order-items/:id/confirm-receipt", authenticate, async (req, res) => 
     }
     const { item: updatedItem, order } = await markItemReceivedAndMaybeRelease(req.params.id);
     res.json({ item: updatedItem, order });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Buyer requests a return on a shipped/delivered item, with a reason,
+// optional note, and optional photo evidence (data URLs, same pattern as
+// bank statements and proof-of-delivery photos elsewhere in the app).
+app.post("/order-items/:id/request-return", authenticate, async (req, res) => {
+  try {
+    const { reason, note, evidenceUrls } = req.body;
+    if (!reason) return res.status(400).json({ error: "Pick a reason for the return" });
+    const existing = await pool.query(
+      `SELECT oi.*, o.buyer_id
+       FROM order_items oi JOIN orders o ON oi.order_id = o.id
+       WHERE oi.id = $1`,
+      [req.params.id]
+    );
+    if (existing.rows.length === 0) return res.status(404).json({ error: "Order item not found" });
+    const item = existing.rows[0];
+    if (item.buyer_id !== req.user.id) {
+      return res.status(403).json({ error: "Only the buyer can request a return on this item" });
+    }
+    if (!["shipped", "delivered"].includes(item.fulfillment_status)) {
+      return res.status(400).json({ error: "This item hasn't been shipped yet" });
+    }
+    if (item.return_status === "requested" || item.return_status === "approved") {
+      return res.status(400).json({ error: "A return is already in progress for this item" });
+    }
+    const result = await pool.query(
+      `UPDATE order_items SET
+         return_status = 'requested', return_reason = $1, return_note = $2,
+         return_requested_at = NOW(), return_evidence_urls = $3,
+         return_tracking_number = NULL
+       WHERE id = $4 RETURNING *`,
+      [reason, note || "", JSON.stringify(evidenceUrls || []), req.params.id]
+    );
+    res.json({ item: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Seller (or admin) accepts or denies a pending return request.
+app.patch("/order-items/:id/return-response", authenticate, async (req, res) => {
+  try {
+    const { decision } = req.body;
+    if (!["approved", "denied"].includes(decision)) {
+      return res.status(400).json({ error: "Invalid decision" });
+    }
+    const existing = await pool.query("SELECT * FROM order_items WHERE id = $1", [req.params.id]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: "Order item not found" });
+    const item = existing.rows[0];
+    if (!req.user.isAdmin && item.seller_id !== req.user.id) {
+      return res.status(403).json({ error: "You can only respond to returns on your own items" });
+    }
+    if (item.return_status !== "requested") {
+      return res.status(400).json({ error: "This item doesn't have a pending return request" });
+    }
+    const result =
+      decision === "approved"
+        ? await pool.query(
+            `UPDATE order_items SET return_status = 'approved', fulfillment_status = 'returned' WHERE id = $1 RETURNING *`,
+            [req.params.id]
+          )
+        : await pool.query(`UPDATE order_items SET return_status = 'denied' WHERE id = $1 RETURNING *`, [req.params.id]);
+    res.json({ item: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Buyer adds tracking for shipping the item back, once their return's approved.
+app.patch("/order-items/:id/return-tracking", authenticate, async (req, res) => {
+  try {
+    const { trackingNumber } = req.body;
+    if (typeof trackingNumber !== "string") return res.status(400).json({ error: "Missing tracking number" });
+    const existing = await pool.query(
+      `SELECT oi.*, o.buyer_id
+       FROM order_items oi JOIN orders o ON oi.order_id = o.id
+       WHERE oi.id = $1`,
+      [req.params.id]
+    );
+    if (existing.rows.length === 0) return res.status(404).json({ error: "Order item not found" });
+    const item = existing.rows[0];
+    if (item.buyer_id !== req.user.id) {
+      return res.status(403).json({ error: "Only the buyer can add return tracking" });
+    }
+    if (item.return_status !== "approved") {
+      return res.status(400).json({ error: "This item's return hasn't been approved yet" });
+    }
+    const result = await pool.query(
+      "UPDATE order_items SET return_tracking_number = $1 WHERE id = $2 RETURNING *",
+      [trackingNumber, req.params.id]
+    );
+    res.json({ item: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
