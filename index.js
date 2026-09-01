@@ -186,6 +186,14 @@ async function createNotification(userId, type, message) {
   }
 }
 
+// Same fire-and-forget pattern, for the admin audit log — records who did
+// what, without ever letting a logging failure break the actual action.
+function logAdminAction(adminId, action, details) {
+  pool
+    .query("INSERT INTO admin_audit_log (admin_id, action, details) VALUES ($1, $2, $3)", [adminId, action, details])
+    .catch((err) => console.error("Failed to write audit log:", err.message));
+}
+
 const codeRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 8, message: "Too many attempts — please wait 15 minutes and try again." });
 
 // Returns true (VPN/proxy/Tor detected), false (clean), or null (couldn't
@@ -1474,6 +1482,7 @@ app.patch("/users/:id/verify", authenticate, requirePermission("user_management"
       [!!isVerified, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
+    logAdminAction(req.user.id, "user_verified", `${isVerified ? "Verified" : "Unverified"} ${result.rows[0].username}`);
     res.json({ user: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1488,6 +1497,7 @@ app.patch("/users/:id/suspend", authenticate, requirePermission("user_management
       [!!isSuspended, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
+    logAdminAction(req.user.id, "user_suspended", `${isSuspended ? "Suspended" : "Unsuspended"} ${result.rows[0].username}`);
     res.json({ user: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1508,13 +1518,7 @@ app.patch("/users/:id/admin-role", authenticate, requirePermission("role_assignm
       [role !== null, role, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
-    pool
-      .query("INSERT INTO admin_audit_log (admin_id, action, details) VALUES ($1, $2, $3)", [
-        req.user.id,
-        "admin_role_changed",
-        `Set ${result.rows[0].username}'s admin role to ${role || "none (revoked)"}`,
-      ])
-      .catch((err) => console.error("Failed to write audit log:", err.message));
+    logAdminAction(req.user.id, "admin_role_changed", `Set ${result.rows[0].username}'s admin role to ${role || "none (revoked)"}`);
     res.json({ user: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1545,6 +1549,7 @@ app.patch("/users/:id/approve", authenticate, requirePermission("seller_verifica
       [req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
+    logAdminAction(req.user.id, "seller_approved", `Approved ${result.rows[0].username}'s seller application`);
     res.json({ user: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1560,6 +1565,7 @@ app.patch("/users/:id/reject", authenticate, requirePermission("seller_verificat
       [reason || null, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
+    logAdminAction(req.user.id, "seller_rejected", `Rejected ${result.rows[0].username}'s seller application${reason ? ": " + reason : ""}`);
     createNotification(
       req.params.id,
       "verification_problem",
@@ -1573,8 +1579,10 @@ app.patch("/users/:id/reject", authenticate, requirePermission("seller_verificat
 
 app.delete("/users/:id", authenticate, requirePermission("user_management"), async (req, res) => {
   try {
+    const target = await pool.query("SELECT username FROM users WHERE id = $1", [req.params.id]);
     const result = await pool.query("DELETE FROM users WHERE id = $1 RETURNING id", [req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
+    logAdminAction(req.user.id, "user_deleted", `Deleted member ${target.rows[0]?.username || req.params.id}`);
     res.json({ success: true });
   } catch (err) {
     // Postgres foreign-key-violation code — this member has order or
@@ -1983,6 +1991,9 @@ app.patch("/listings/:id", authenticate, async (req, res) => {
       values
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Listing not found" });
+    if (existing.rows[0].owner_id !== req.user.id) {
+      logAdminAction(req.user.id, "listing_moderated", `Updated listing "${result.rows[0].title}" (${Object.keys(req.body).join(", ")})`);
+    }
     if (req.body.status === "rejected") {
       createNotification(existing.rows[0].owner_id, "listing_rejected", `Your listing "${result.rows[0].title}" was rejected`);
     }
@@ -1994,13 +2005,16 @@ app.patch("/listings/:id", authenticate, async (req, res) => {
 
 app.delete("/listings/:id", authenticate, async (req, res) => {
   try {
-    const existing = await pool.query("SELECT owner_id FROM listings WHERE id = $1", [req.params.id]);
+    const existing = await pool.query("SELECT owner_id, title FROM listings WHERE id = $1", [req.params.id]);
     if (existing.rows.length === 0) return res.status(404).json({ error: "Listing not found" });
     if (existing.rows[0].owner_id !== req.user.id && !hasPermission(req.user, "listing_moderation")) {
       return res.status(403).json({ error: "You can only remove your own listings" });
     }
     const result = await pool.query("DELETE FROM listings WHERE id = $1 RETURNING id", [req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: "Listing not found" });
+    if (existing.rows[0].owner_id !== req.user.id) {
+      logAdminAction(req.user.id, "listing_removed", `Removed listing "${existing.rows[0].title}"`);
+    }
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2044,6 +2058,7 @@ app.patch("/settings", authenticate, async (req, res) => {
         "INSERT INTO site_settings (id, commission_rate) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET commission_rate = $1",
         [rate]
       );
+      logAdminAction(req.user.id, "commission_rate_changed", `Set commission rate to ${(rate * 100).toFixed(1)}%`);
     }
     if (authImage !== undefined) {
       if (!hasPermission(req.user, "content_management")) {
@@ -2227,6 +2242,7 @@ app.patch("/orders/:id/release", authenticate, requirePermission("finance"), asy
       [req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Order not found" });
+    logAdminAction(req.user.id, "payment_released", `Released payment for order #${result.rows[0].id} ($${result.rows[0].total})`);
     const sellerIds = await pool.query(
       "SELECT DISTINCT seller_id FROM order_items WHERE order_id = $1",
       [req.params.id]
@@ -2247,6 +2263,7 @@ app.patch("/orders/:id/refund", authenticate, requirePermission("finance"), asyn
       [req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Order not found" });
+    logAdminAction(req.user.id, "order_refunded", `Refunded order #${result.rows[0].id} ($${result.rows[0].total})`);
     res.json({ order: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2258,12 +2275,14 @@ app.patch("/orders/:id/dispute", authenticate, async (req, res) => {
     const { isDisputed } = req.body;
     const orderCheck = await pool.query("SELECT buyer_id FROM orders WHERE id = $1", [req.params.id]);
     if (orderCheck.rows.length === 0) return res.status(404).json({ error: "Order not found" });
-    if (orderCheck.rows[0].buyer_id !== req.user.id) {
+    let isParty = orderCheck.rows[0].buyer_id === req.user.id;
+    if (!isParty) {
       const sellerCheck = await pool.query(
         "SELECT 1 FROM order_items WHERE order_id = $1 AND seller_id = $2 LIMIT 1",
         [req.params.id, req.user.id]
       );
-      if (sellerCheck.rows.length === 0 && !hasPermission(req.user, "dispute_resolution")) {
+      isParty = sellerCheck.rows.length > 0;
+      if (!isParty && !hasPermission(req.user, "dispute_resolution")) {
         return res.status(403).json({ error: "You can only dispute orders you're part of" });
       }
     }
@@ -2272,6 +2291,9 @@ app.patch("/orders/:id/dispute", authenticate, async (req, res) => {
       [!!isDisputed, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Order not found" });
+    if (!isParty) {
+      logAdminAction(req.user.id, "dispute_updated", `${isDisputed ? "Opened" : "Resolved"} dispute on order #${req.params.id}`);
+    }
     if (isDisputed) {
       const sellerIds = await pool.query(
         "SELECT DISTINCT seller_id FROM order_items WHERE order_id = $1",
@@ -2461,6 +2483,9 @@ app.patch("/order-items/:id/return-response", authenticate, async (req, res) => 
             [req.params.id]
           )
         : await pool.query(`UPDATE order_items SET return_status = 'denied' WHERE id = $1 RETURNING *`, [req.params.id]);
+    if (item.seller_id !== req.user.id) {
+      logAdminAction(req.user.id, "return_decided", `${decision === "approved" ? "Approved" : "Denied"} return on item "${item.title}"`);
+    }
     res.json({ item: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2845,6 +2870,7 @@ app.post("/sellers/payout", authenticate, requirePermission("finance"), async (r
       return res.status(400).json({ error: transferData.message || "Payout failed" });
     }
 
+    logAdminAction(req.user.id, "manual_payout", `Manually paid out $${amount} to user #${userId}${reason ? ` (${reason})` : ""}`);
     res.json({ success: true, transfer: transferData.data });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -3173,6 +3199,7 @@ app.patch("/message-reports/:id/resolve", authenticate, requirePermission("dispu
       [req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Report not found" });
+    logAdminAction(req.user.id, "message_report_resolved", `Resolved message report #${req.params.id}`);
     res.json({ report: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -3349,6 +3376,7 @@ app.patch("/review-reports/:id/resolve", authenticate, requirePermission("disput
       [req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Report not found" });
+    logAdminAction(req.user.id, "review_report_resolved", `Resolved review report #${req.params.id}`);
     res.json({ report: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -3395,6 +3423,7 @@ app.patch("/account-reports/:id/resolve", authenticate, requirePermission("user_
       [req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Report not found" });
+    logAdminAction(req.user.id, "account_report_resolved", `Resolved account report #${req.params.id}`);
     res.json({ report: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -3413,6 +3442,7 @@ app.post("/users/:id/warnings", authenticate, requirePermission("user_management
       "INSERT INTO seller_warnings (user_id, admin_id, message) VALUES ($1, $2, $3) RETURNING *",
       [req.params.id, req.user.id, message.trim()]
     );
+    logAdminAction(req.user.id, "warning_issued", `Issued a warning to user #${req.params.id}: ${message.trim()}`);
     res.status(201).json({ warning: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -3529,6 +3559,7 @@ app.patch("/content/banners/:id", authenticate, requirePermission("content_manag
 app.delete("/content/banners/:id", authenticate, requirePermission("content_management"), async (req, res) => {
   try {
     await pool.query("DELETE FROM banners WHERE id = $1", [req.params.id]);
+    logAdminAction(req.user.id, "banner_removed", `Removed banner #${req.params.id}`);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -3567,6 +3598,7 @@ app.patch("/content/articles/:id", authenticate, requirePermission("content_mana
 app.delete("/content/articles/:id", authenticate, requirePermission("content_management"), async (req, res) => {
   try {
     await pool.query("DELETE FROM help_articles WHERE id = $1", [req.params.id]);
+    logAdminAction(req.user.id, "article_removed", `Removed help article #${req.params.id}`);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -3605,6 +3637,7 @@ app.patch("/content/faqs/:id", authenticate, requirePermission("content_manageme
 app.delete("/content/faqs/:id", authenticate, requirePermission("content_management"), async (req, res) => {
   try {
     await pool.query("DELETE FROM help_faqs WHERE id = $1", [req.params.id]);
+    logAdminAction(req.user.id, "faq_removed", `Removed FAQ #${req.params.id}`);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -3638,6 +3671,7 @@ app.patch("/policies/:category", authenticate, requirePermission("content_manage
        RETURNING *`,
       [req.params.category, body || ""]
     );
+    logAdminAction(req.user.id, "policy_updated", `Updated the "${req.params.category}" policy`);
     res.json({ policy: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
