@@ -50,7 +50,7 @@ async function authenticate(req, res, next) {
   if (!requester) return res.status(401).json({ error: "Sign in required" });
   try {
     const result = await pool.query(
-      "SELECT is_admin, is_suspended, token_version FROM users WHERE id = $1",
+      "SELECT is_admin, is_suspended, token_version, admin_role FROM users WHERE id = $1",
       [requester.id]
     );
     if (result.rows.length === 0) {
@@ -63,7 +63,7 @@ async function authenticate(req, res, next) {
     if ((requester.tokenVersion || 0) !== currentVersion) {
       return res.status(401).json({ error: "Your session was signed out from another device — log in again" });
     }
-    req.user = { ...requester, isAdmin: !!result.rows[0].is_admin };
+    req.user = { ...requester, isAdmin: !!result.rows[0].is_admin, adminRole: result.rows[0].admin_role || null };
     next();
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -74,6 +74,48 @@ async function authenticate(req, res, next) {
 function requireAdmin(req, res, next) {
   if (!req.user?.isAdmin) return res.status(403).json({ error: "Admin access required" });
   next();
+}
+
+// Six admin roles, matching Stallyard's actual moderation/finance/support
+// workflows. super_admin has every permission implicitly (checked as a
+// special case below, rather than listed out) — everyone else only gets
+// exactly what their role needs, on the principle that most staff should
+// never be able to touch money or user accounts.
+const ADMIN_ROLES = new Set([
+  "super_admin", "seller_verification", "listing_moderator",
+  "order_dispute", "finance", "customer_support",
+]);
+
+const ROLE_PERMISSIONS = {
+  seller_verification: new Set(["seller_verification"]),
+  listing_moderator: new Set(["listing_moderation"]),
+  order_dispute: new Set(["dispute_resolution"]),
+  finance: new Set(["finance"]),
+  customer_support: new Set(["support_tickets"]),
+};
+
+// A missing admin_role (legacy admins from before roles existed, or any
+// edge case) is treated as super_admin — that's simply what is_admin has
+// always meant, preserved exactly as it worked before this feature.
+function hasPermission(user, permission) {
+  if (!user?.isAdmin) return false;
+  if (!user.adminRole || user.adminRole === "super_admin") return true;
+  const allowed = ROLE_PERMISSIONS[user.adminRole];
+  return allowed ? allowed.has(permission) : false;
+}
+
+// Must follow authenticate(). Use for actions scoped to one specific role's
+// job — approving sellers, moderating listings, resolving disputes, moving
+// money, or replying to support tickets. Every admin can still view
+// accounts/orders (that's just requireAdmin) — this is for the narrower,
+// higher-stakes actions.
+function requirePermission(permission) {
+  return (req, res, next) => {
+    if (!hasPermission(req.user, permission)) {
+      return res.status(403).json({ error: "You don't have permission to do that" });
+    }
+    next();
+  };
 }
 
 // Simple in-memory cache so repeat requests from the same network within 24h
@@ -894,6 +936,45 @@ app.get("/migrate/seller-performance", requireMigrationKey, async (req, res) => 
   }
 });
 
+app.get("/migrate/admin-roles", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_role TEXT`);
+    // Every existing admin becomes super_admin — preserves exactly the
+    // access they already had. Going forward, new admins need an explicit
+    // role assigned.
+    await pool.query(`UPDATE users SET admin_role = 'super_admin' WHERE is_admin = true AND admin_role IS NULL`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS admin_audit_log (
+        id SERIAL PRIMARY KEY,
+        admin_id INTEGER REFERENCES users(id),
+        action TEXT NOT NULL,
+        details TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    res.send("Migration complete: admin_role added to users (existing admins set to super_admin), admin_audit_log table created.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
+app.get("/migrate/site-settings", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS site_settings (
+        id INTEGER PRIMARY KEY DEFAULT 1,
+        commission_rate NUMERIC DEFAULT 0.05,
+        auth_image TEXT DEFAULT '',
+        CHECK (id = 1)
+      )
+    `);
+    await pool.query(`INSERT INTO site_settings (id, commission_rate) VALUES (1, 0.05) ON CONFLICT (id) DO NOTHING`);
+    res.send("Migration complete: site_settings table created (commission rate is now real, was previously hardcoded and disconnected from the admin UI).");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/help-support", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -1286,7 +1367,7 @@ const USER_FULL_FIELDS = `id, username, email, phone, display_name, first_name, 
   country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
   bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
-  is_email_verified, is_phone_verified`;
+  is_email_verified, is_phone_verified, admin_role`;
 
 app.get("/users", async (req, res) => {
   try {
@@ -1303,9 +1384,9 @@ const USER_RETURNING_FIELDS = `id, username, email, phone, display_name, first_n
   country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
   bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
-  is_email_verified, is_phone_verified, token_version`;
+  is_email_verified, is_phone_verified, token_version, admin_role`;
 
-app.patch("/users/:id/verify", authenticate, requireAdmin, async (req, res) => {
+app.patch("/users/:id/verify", authenticate, requirePermission("user_management"), async (req, res) => {
   try {
     const { isVerified } = req.body;
     const result = await pool.query(
@@ -1319,7 +1400,7 @@ app.patch("/users/:id/verify", authenticate, requireAdmin, async (req, res) => {
   }
 });
 
-app.patch("/users/:id/suspend", authenticate, requireAdmin, async (req, res) => {
+app.patch("/users/:id/suspend", authenticate, requirePermission("user_management"), async (req, res) => {
   try {
     const { isSuspended } = req.body;
     const result = await pool.query(
@@ -1333,20 +1414,50 @@ app.patch("/users/:id/suspend", authenticate, requireAdmin, async (req, res) => 
   }
 });
 
-app.patch("/users/:id/promote", authenticate, requireAdmin, async (req, res) => {
+// Grants, changes, or revokes admin access with a specific role. Passing
+// role: null revokes admin entirely. Only super_admin can do this — it's
+// the one action that controls who controls everything else.
+app.patch("/users/:id/admin-role", authenticate, requirePermission("role_assignment"), async (req, res) => {
   try {
+    const { role } = req.body;
+    if (role !== null && !ADMIN_ROLES.has(role)) {
+      return res.status(400).json({ error: "Invalid role" });
+    }
     const result = await pool.query(
-      `UPDATE users SET is_admin = true WHERE id = $1 RETURNING ${USER_RETURNING_FIELDS}`,
-      [req.params.id]
+      `UPDATE users SET is_admin = $1, admin_role = $2 WHERE id = $3 RETURNING ${USER_RETURNING_FIELDS}`,
+      [role !== null, role, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
+    pool
+      .query("INSERT INTO admin_audit_log (admin_id, action, details) VALUES ($1, $2, $3)", [
+        req.user.id,
+        "admin_role_changed",
+        `Set ${result.rows[0].username}'s admin role to ${role || "none (revoked)"}`,
+      ])
+      .catch((err) => console.error("Failed to write audit log:", err.message));
     res.json({ user: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.patch("/users/:id/approve", authenticate, requireAdmin, async (req, res) => {
+// Currently only logs role changes — the table's ready to log more admin
+// actions later without needing another migration.
+app.get("/admin-audit-log", authenticate, requirePermission("role_assignment"), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT aal.*, u.username, u.display_name
+       FROM admin_audit_log aal
+       LEFT JOIN users u ON aal.admin_id = u.id
+       ORDER BY aal.created_at DESC LIMIT 100`
+    );
+    res.json({ log: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/users/:id/approve", authenticate, requirePermission("seller_verification"), async (req, res) => {
   try {
     const result = await pool.query(
       `UPDATE users SET is_approved = true, verification_status = 'approved', rejection_reason = NULL
@@ -1360,7 +1471,7 @@ app.patch("/users/:id/approve", authenticate, requireAdmin, async (req, res) => 
   }
 });
 
-app.patch("/users/:id/reject", authenticate, requireAdmin, async (req, res) => {
+app.patch("/users/:id/reject", authenticate, requirePermission("seller_verification"), async (req, res) => {
   try {
     const { reason } = req.body;
     const result = await pool.query(
@@ -1380,7 +1491,7 @@ app.patch("/users/:id/reject", authenticate, requireAdmin, async (req, res) => {
   }
 });
 
-app.delete("/users/:id", authenticate, requireAdmin, async (req, res) => {
+app.delete("/users/:id", authenticate, requirePermission("user_management"), async (req, res) => {
   try {
     const result = await pool.query("DELETE FROM users WHERE id = $1 RETURNING id", [req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
@@ -1401,7 +1512,7 @@ app.delete("/users/:id", authenticate, requireAdmin, async (req, res) => {
 });
 
 // Lets an admin create a real account directly (used by the admin "Add member" tool).
-app.post("/admin/create-member", authenticate, requireAdmin, async (req, res) => {
+app.post("/admin/create-member", authenticate, requirePermission("user_management"), async (req, res) => {
   try {
     const { username, email, phone, password, displayName, isAdmin, isApproved, isVerified } = req.body;
 
@@ -1765,7 +1876,7 @@ app.patch("/listings/:id", authenticate, async (req, res) => {
   try {
     const existing = await pool.query("SELECT owner_id FROM listings WHERE id = $1", [req.params.id]);
     if (existing.rows.length === 0) return res.status(404).json({ error: "Listing not found" });
-    if (!req.user.isAdmin && existing.rows[0].owner_id !== req.user.id) {
+    if (existing.rows[0].owner_id !== req.user.id && !hasPermission(req.user, "listing_moderation")) {
       return res.status(403).json({ error: "You can only edit your own listings" });
     }
     const sets = [];
@@ -1805,7 +1916,7 @@ app.delete("/listings/:id", authenticate, async (req, res) => {
   try {
     const existing = await pool.query("SELECT owner_id FROM listings WHERE id = $1", [req.params.id]);
     if (existing.rows.length === 0) return res.status(404).json({ error: "Listing not found" });
-    if (!req.user.isAdmin && existing.rows[0].owner_id !== req.user.id) {
+    if (existing.rows[0].owner_id !== req.user.id && !hasPermission(req.user, "listing_moderation")) {
       return res.status(403).json({ error: "You can only remove your own listings" });
     }
     const result = await pool.query("DELETE FROM listings WHERE id = $1 RETURNING id", [req.params.id]);
@@ -1816,7 +1927,7 @@ app.delete("/listings/:id", authenticate, async (req, res) => {
   }
 });
 
-app.delete("/listings/by-owner/:ownerId", authenticate, requireAdmin, async (req, res) => {
+app.delete("/listings/by-owner/:ownerId", authenticate, requirePermission("user_management"), async (req, res) => {
   try {
     await pool.query("DELETE FROM listings WHERE owner_id = $1", [req.params.ownerId]);
     res.json({ success: true });
@@ -1824,7 +1935,60 @@ app.delete("/listings/by-owner/:ownerId", authenticate, requireAdmin, async (req
     res.status(500).json({ error: err.message });
   }
 });
-const PLATFORM_COMMISSION_RATE = 0.05;
+// Public settings: homepage auth image and the commission rate. Both used
+// to be admin-editable in the UI but never actually persisted anywhere —
+// the "save" button wrote to the browser only, and checkout used a
+// hardcoded 5% regardless of what the admin panel showed. Both are real now.
+app.get("/settings", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT commission_rate, auth_image FROM site_settings WHERE id = 1");
+    const row = result.rows[0] || { commission_rate: 0.05, auth_image: "" };
+    res.json({ commissionRate: Number(row.commission_rate), authImage: row.auth_image || "" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/settings", authenticate, async (req, res) => {
+  try {
+    const { commissionRate, authImage } = req.body;
+    if (commissionRate !== undefined) {
+      if (!hasPermission(req.user, "finance")) {
+        return res.status(403).json({ error: "You don't have permission to change the commission rate" });
+      }
+      const rate = Number(commissionRate);
+      if (!(rate >= 0 && rate <= 1)) {
+        return res.status(400).json({ error: "Commission rate must be between 0 and 1 (e.g. 0.05 for 5%)" });
+      }
+      await pool.query(
+        "INSERT INTO site_settings (id, commission_rate) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET commission_rate = $1",
+        [rate]
+      );
+    }
+    if (authImage !== undefined) {
+      if (!hasPermission(req.user, "content_management")) {
+        return res.status(403).json({ error: "You don't have permission to change site branding" });
+      }
+      await pool.query(
+        "INSERT INTO site_settings (id, auth_image) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET auth_image = $1",
+        [authImage]
+      );
+    }
+    const result = await pool.query("SELECT commission_rate, auth_image FROM site_settings WHERE id = 1");
+    res.json({ commissionRate: Number(result.rows[0].commission_rate), authImage: result.rows[0].auth_image || "" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+async function getCommissionRate() {
+  try {
+    const result = await pool.query("SELECT commission_rate FROM site_settings WHERE id = 1");
+    return result.rows.length ? Number(result.rows[0].commission_rate) : 0.05;
+  } catch {
+    return 0.05; // safe fallback if the settings row is ever missing
+  }
+}
 
 // Real cart checkout — recomputes every price server-side from the live
 // listings table rather than trusting whatever the cart claims, and creates
@@ -1871,7 +2035,7 @@ app.post("/checkout", authenticate, async (req, res) => {
       resolvedItems.push({ listing, qty, price, shippingFee });
     }
 
-    const commissionRate = PLATFORM_COMMISSION_RATE;
+    const commissionRate = await getCommissionRate();
     const commissionAmount = Math.round(subtotal * commissionRate * 100) / 100;
     const total = Math.round((subtotal + shippingTotal) * 100) / 100;
 
@@ -1976,7 +2140,7 @@ app.get("/orders", authenticate, requireAdmin, async (req, res) => {
   }
 });
 
-app.patch("/orders/:id/release", authenticate, requireAdmin, async (req, res) => {
+app.patch("/orders/:id/release", authenticate, requirePermission("finance"), async (req, res) => {
   try {
     const result = await pool.query(
       "UPDATE orders SET payment_status = 'released' WHERE id = $1 RETURNING *",
@@ -1996,7 +2160,7 @@ app.patch("/orders/:id/release", authenticate, requireAdmin, async (req, res) =>
   }
 });
 
-app.patch("/orders/:id/refund", authenticate, requireAdmin, async (req, res) => {
+app.patch("/orders/:id/refund", authenticate, requirePermission("finance"), async (req, res) => {
   try {
     const result = await pool.query(
       "UPDATE orders SET payment_status = 'refunded' WHERE id = $1 RETURNING *",
@@ -2014,12 +2178,12 @@ app.patch("/orders/:id/dispute", authenticate, async (req, res) => {
     const { isDisputed } = req.body;
     const orderCheck = await pool.query("SELECT buyer_id FROM orders WHERE id = $1", [req.params.id]);
     if (orderCheck.rows.length === 0) return res.status(404).json({ error: "Order not found" });
-    if (!req.user.isAdmin && orderCheck.rows[0].buyer_id !== req.user.id) {
+    if (orderCheck.rows[0].buyer_id !== req.user.id) {
       const sellerCheck = await pool.query(
         "SELECT 1 FROM order_items WHERE order_id = $1 AND seller_id = $2 LIMIT 1",
         [req.params.id, req.user.id]
       );
-      if (sellerCheck.rows.length === 0) {
+      if (sellerCheck.rows.length === 0 && !hasPermission(req.user, "dispute_resolution")) {
         return res.status(403).json({ error: "You can only dispute orders you're part of" });
       }
     }
@@ -2204,7 +2368,7 @@ app.patch("/order-items/:id/return-response", authenticate, async (req, res) => 
     const existing = await pool.query("SELECT * FROM order_items WHERE id = $1", [req.params.id]);
     if (existing.rows.length === 0) return res.status(404).json({ error: "Order item not found" });
     const item = existing.rows[0];
-    if (!req.user.isAdmin && item.seller_id !== req.user.id) {
+    if (item.seller_id !== req.user.id && !hasPermission(req.user, "dispute_resolution")) {
       return res.status(403).json({ error: "You can only respond to returns on your own items" });
     }
     if (item.return_status !== "requested") {
@@ -2576,7 +2740,7 @@ async function sendPaystackTransfer(recipientCode, amountInKobo, reason) {
 // Admin-only manual override — the normal path for sellers is POST /withdrawals,
 // which validates their real balance server-side before calling the same
 // transfer logic. This endpoint bypasses that balance check, so it's admin-only.
-app.post("/sellers/payout", authenticate, requireAdmin, async (req, res) => {
+app.post("/sellers/payout", authenticate, requirePermission("finance"), async (req, res) => {
   try {
     const { userId, amount, reason } = req.body;
 
@@ -2713,7 +2877,7 @@ app.get("/withdrawals/mine", authenticate, async (req, res) => {
   }
 });
 
-app.get("/withdrawals", authenticate, requireAdmin, async (req, res) => {
+app.get("/withdrawals", authenticate, requirePermission("finance"), async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM withdrawals ORDER BY requested_at DESC");
     res.json({ withdrawals: result.rows });
@@ -2900,7 +3064,7 @@ app.post("/messages/:id/report", authenticate, async (req, res) => {
 
 // Admin queue of reported messages — joined with the message body/image,
 // who sent it, who reported it, and which listing the thread is about.
-app.get("/message-reports", authenticate, requireAdmin, async (req, res) => {
+app.get("/message-reports", authenticate, requirePermission("dispute_resolution"), async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT mr.*,
@@ -2922,7 +3086,7 @@ app.get("/message-reports", authenticate, requireAdmin, async (req, res) => {
   }
 });
 
-app.patch("/message-reports/:id/resolve", authenticate, requireAdmin, async (req, res) => {
+app.patch("/message-reports/:id/resolve", authenticate, requirePermission("dispute_resolution"), async (req, res) => {
   try {
     const result = await pool.query(
       "UPDATE message_reports SET status = 'resolved', resolved_at = NOW() WHERE id = $1 RETURNING *",
@@ -3077,7 +3241,7 @@ app.post("/reviews/:id/report", authenticate, async (req, res) => {
 
 // Admin queue of reported reviews, joined with the review content and who
 // wrote it/reported it.
-app.get("/review-reports", authenticate, requireAdmin, async (req, res) => {
+app.get("/review-reports", authenticate, requirePermission("dispute_resolution"), async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT rr.*,
@@ -3098,7 +3262,7 @@ app.get("/review-reports", authenticate, requireAdmin, async (req, res) => {
   }
 });
 
-app.patch("/review-reports/:id/resolve", authenticate, requireAdmin, async (req, res) => {
+app.patch("/review-reports/:id/resolve", authenticate, requirePermission("dispute_resolution"), async (req, res) => {
   try {
     const result = await pool.query(
       "UPDATE review_reports SET status = 'resolved', resolved_at = NOW() WHERE id = $1 RETURNING *",
@@ -3130,7 +3294,7 @@ app.post("/account-reports", authenticate, async (req, res) => {
   }
 });
 
-app.get("/account-reports", authenticate, requireAdmin, async (req, res) => {
+app.get("/account-reports", authenticate, requirePermission("user_management"), async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT ar.*, u.username, u.display_name
@@ -3144,7 +3308,7 @@ app.get("/account-reports", authenticate, requireAdmin, async (req, res) => {
   }
 });
 
-app.patch("/account-reports/:id/resolve", authenticate, requireAdmin, async (req, res) => {
+app.patch("/account-reports/:id/resolve", authenticate, requirePermission("user_management"), async (req, res) => {
   try {
     const result = await pool.query(
       "UPDATE account_reports SET status = 'resolved', resolved_at = NOW() WHERE id = $1 RETURNING *",
@@ -3159,7 +3323,7 @@ app.patch("/account-reports/:id/resolve", authenticate, requireAdmin, async (req
 
 // Admin issues a warning to a seller — a lighter-weight step than
 // suspension, visible to both the admin team and the seller themselves.
-app.post("/users/:id/warnings", authenticate, requireAdmin, async (req, res) => {
+app.post("/users/:id/warnings", authenticate, requirePermission("user_management"), async (req, res) => {
   try {
     const { message } = req.body;
     if (!message || !message.trim()) {
@@ -3176,7 +3340,7 @@ app.post("/users/:id/warnings", authenticate, requireAdmin, async (req, res) => 
 });
 
 // Admin views warning history for a specific seller.
-app.get("/users/:id/warnings", authenticate, requireAdmin, async (req, res) => {
+app.get("/users/:id/warnings", authenticate, requirePermission("user_management"), async (req, res) => {
   try {
     const result = await pool.query(
       "SELECT * FROM seller_warnings WHERE user_id = $1 ORDER BY created_at DESC",
@@ -3245,7 +3409,7 @@ app.get("/content", async (req, res) => {
   }
 });
 
-app.post("/content/banners", authenticate, requireAdmin, async (req, res) => {
+app.post("/content/banners", authenticate, requirePermission("content_management"), async (req, res) => {
   try {
     const { message, tone, mediaType, imageUrl, videoUrl } = req.body;
     if (!message || !message.trim()) return res.status(400).json({ error: "Missing banner message" });
@@ -3260,7 +3424,7 @@ app.post("/content/banners", authenticate, requireAdmin, async (req, res) => {
   }
 });
 
-app.patch("/content/banners/:id", authenticate, requireAdmin, async (req, res) => {
+app.patch("/content/banners/:id", authenticate, requirePermission("content_management"), async (req, res) => {
   try {
     const { message, tone, isActive, mediaType, imageUrl, videoUrl } = req.body;
     const sets = [];
@@ -3282,7 +3446,7 @@ app.patch("/content/banners/:id", authenticate, requireAdmin, async (req, res) =
   }
 });
 
-app.delete("/content/banners/:id", authenticate, requireAdmin, async (req, res) => {
+app.delete("/content/banners/:id", authenticate, requirePermission("content_management"), async (req, res) => {
   try {
     await pool.query("DELETE FROM banners WHERE id = $1", [req.params.id]);
     res.json({ success: true });
@@ -3291,7 +3455,7 @@ app.delete("/content/banners/:id", authenticate, requireAdmin, async (req, res) 
   }
 });
 
-app.post("/content/articles", authenticate, requireAdmin, async (req, res) => {
+app.post("/content/articles", authenticate, requirePermission("content_management"), async (req, res) => {
   try {
     const { title, body } = req.body;
     if (!title?.trim() || !body?.trim()) return res.status(400).json({ error: "Missing title or body" });
@@ -3305,7 +3469,7 @@ app.post("/content/articles", authenticate, requireAdmin, async (req, res) => {
   }
 });
 
-app.patch("/content/articles/:id", authenticate, requireAdmin, async (req, res) => {
+app.patch("/content/articles/:id", authenticate, requirePermission("content_management"), async (req, res) => {
   try {
     const { title, body } = req.body;
     const result = await pool.query(
@@ -3320,7 +3484,7 @@ app.patch("/content/articles/:id", authenticate, requireAdmin, async (req, res) 
   }
 });
 
-app.delete("/content/articles/:id", authenticate, requireAdmin, async (req, res) => {
+app.delete("/content/articles/:id", authenticate, requirePermission("content_management"), async (req, res) => {
   try {
     await pool.query("DELETE FROM help_articles WHERE id = $1", [req.params.id]);
     res.json({ success: true });
@@ -3329,7 +3493,7 @@ app.delete("/content/articles/:id", authenticate, requireAdmin, async (req, res)
   }
 });
 
-app.post("/content/faqs", authenticate, requireAdmin, async (req, res) => {
+app.post("/content/faqs", authenticate, requirePermission("content_management"), async (req, res) => {
   try {
     const { question, answer } = req.body;
     if (!question?.trim() || !answer?.trim()) return res.status(400).json({ error: "Missing question or answer" });
@@ -3343,7 +3507,7 @@ app.post("/content/faqs", authenticate, requireAdmin, async (req, res) => {
   }
 });
 
-app.patch("/content/faqs/:id", authenticate, requireAdmin, async (req, res) => {
+app.patch("/content/faqs/:id", authenticate, requirePermission("content_management"), async (req, res) => {
   try {
     const { question, answer } = req.body;
     const result = await pool.query(
@@ -3358,7 +3522,7 @@ app.patch("/content/faqs/:id", authenticate, requireAdmin, async (req, res) => {
   }
 });
 
-app.delete("/content/faqs/:id", authenticate, requireAdmin, async (req, res) => {
+app.delete("/content/faqs/:id", authenticate, requirePermission("content_management"), async (req, res) => {
   try {
     await pool.query("DELETE FROM help_faqs WHERE id = $1", [req.params.id]);
     res.json({ success: true });
@@ -3382,7 +3546,7 @@ const POLICY_CATEGORIES = new Set([
   "seller_rules", "prohibited_items", "fees", "payment_rules", "shipping_rules", "returns_disputes",
 ]);
 
-app.patch("/policies/:category", authenticate, requireAdmin, async (req, res) => {
+app.patch("/policies/:category", authenticate, requirePermission("content_management"), async (req, res) => {
   try {
     if (!POLICY_CATEGORIES.has(req.params.category)) {
       return res.status(400).json({ error: "Invalid policy category" });
@@ -3435,7 +3599,7 @@ app.get("/support-tickets/mine", authenticate, async (req, res) => {
   }
 });
 
-app.get("/support-tickets", authenticate, requireAdmin, async (req, res) => {
+app.get("/support-tickets", authenticate, requirePermission("support_tickets"), async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT st.*, u.username, u.display_name
@@ -3452,7 +3616,7 @@ async function requireTicketAccess(req, res, next) {
   try {
     const result = await pool.query("SELECT user_id FROM support_tickets WHERE id = $1", [req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: "Ticket not found" });
-    if (result.rows[0].user_id !== req.user.id && !req.user.isAdmin) {
+    if (result.rows[0].user_id !== req.user.id && !hasPermission(req.user, "support_tickets")) {
       return res.status(403).json({ error: "You can only view your own tickets" });
     }
     next();
@@ -3492,7 +3656,7 @@ app.post("/support-tickets/:id/messages", authenticate, requireTicketAccess, asy
 
 const TICKET_STATUSES = new Set(["open", "in_progress", "resolved"]);
 
-app.patch("/support-tickets/:id/status", authenticate, requireAdmin, async (req, res) => {
+app.patch("/support-tickets/:id/status", authenticate, requirePermission("support_tickets"), async (req, res) => {
   try {
     const { status } = req.body;
     if (!TICKET_STATUSES.has(status)) return res.status(400).json({ error: "Invalid status" });
