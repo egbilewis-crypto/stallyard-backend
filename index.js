@@ -443,6 +443,24 @@ app.get("/migrate/seller-verification", async (req, res) => {
   }
 });
 
+app.get("/migrate/listings-extra-fields", async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE listings
+        ADD COLUMN IF NOT EXISTS quantity INTEGER,
+        ADD COLUMN IF NOT EXISTS sku TEXT DEFAULT '',
+        ADD COLUMN IF NOT EXISTS brand TEXT DEFAULT '',
+        ADD COLUMN IF NOT EXISTS state TEXT DEFAULT '',
+        ADD COLUMN IF NOT EXISTS shipping_methods JSONB DEFAULT '[]'::jsonb,
+        ADD COLUMN IF NOT EXISTS return_policy TEXT DEFAULT '',
+        ADD COLUMN IF NOT EXISTS vin TEXT DEFAULT ''
+    `);
+    res.send("Migration complete: quantity, sku, brand, state, shipping_methods, return_policy, vin columns added to listings.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/cart-watchlist", async (req, res) => {
   try {
     await pool.query(`
@@ -933,7 +951,8 @@ app.post("/listings", authenticate, async (req, res) => {
     const {
       title, description, price, category, condition, shippingFee,
       emoji, fitMake, fitModel, fitYear, images, listingType, currency,
-      status, auctionEndTime,
+      status, auctionEndTime, quantity, sku, brand, state, shippingMethods,
+      returnPolicy, vin,
     } = req.body;
     const ownerId = req.user.id; // always the signed-in user — never trust a client-supplied owner
 
@@ -953,15 +972,19 @@ app.post("/listings", authenticate, async (req, res) => {
       `INSERT INTO listings (
          owner_id, title, description, price, category, condition, shipping_fee,
          emoji, fit_make, fit_model, fit_year, images, listing_type, currency,
-         status, auction_end_time
+         status, auction_end_time, quantity, sku, brand, state, shipping_methods,
+         return_policy, vin
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
        RETURNING *`,
       [
         ownerId, title, description || "", price, category || "Other", condition || "New", shippingFee || 0,
         emoji || "📦", fitMake || "", fitModel || "", fitYear || "", JSON.stringify(images || []),
         listingType || "fixed", currency || "USD", status || "pending",
         auctionEndTime ? new Date(auctionEndTime) : null,
+        quantity === "" || quantity === undefined || quantity === null ? null : Number(quantity),
+        sku || "", brand || "", state || "", JSON.stringify(shippingMethods || []),
+        returnPolicy || "", vin || "",
       ]
     );
 
@@ -1006,8 +1029,15 @@ const LISTING_FIELD_MAP = {
   auctionEndTime: "auction_end_time",
   bidHistory: "bid_history",
   highestBidderUsername: "highest_bidder_username",
+  quantity: "quantity",
+  sku: "sku",
+  brand: "brand",
+  state: "state",
+  shippingMethods: "shipping_methods",
+  returnPolicy: "return_policy",
+  vin: "vin",
 };
-const LISTING_JSON_FIELDS = new Set(["images", "bidHistory"]);
+const LISTING_JSON_FIELDS = new Set(["images", "bidHistory", "shippingMethods"]);
 
 app.patch("/listings/:id", authenticate, async (req, res) => {
   try {
@@ -1023,7 +1053,11 @@ app.patch("/listings/:id", authenticate, async (req, res) => {
       if (Object.prototype.hasOwnProperty.call(req.body, key)) {
         sets.push(`${column} = $${i}`);
         const raw = req.body[key];
-        values.push(LISTING_JSON_FIELDS.has(key) ? JSON.stringify(raw) : raw);
+        if (key === "quantity") {
+          values.push(raw === "" || raw === undefined || raw === null ? null : Number(raw));
+        } else {
+          values.push(LISTING_JSON_FIELDS.has(key) ? JSON.stringify(raw) : raw);
+        }
         i++;
       }
     }
