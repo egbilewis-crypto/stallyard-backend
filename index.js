@@ -348,6 +348,11 @@ app.post("/email-verify/check", codeRateLimit, async (req, res) => {
 const passwordResetCodes = new Map();
 const PASSWORD_RESET_CODE_TTL_MS = 15 * 60 * 1000;
 
+// Two-factor login codes — keyed by user id, since by this point in the
+// login flow the account is already resolved.
+const twoFactorCodes = new Map();
+const TWO_FACTOR_CODE_TTL_MS = 10 * 60 * 1000;
+
 // Step 1: look up the account by username, email the code to the address
 // on file. Deliberately doesn't reveal the email address itself in the
 // response beyond a masked preview, and doesn't let the frontend supply
@@ -807,6 +812,17 @@ app.get("/migrate/login-history", requireMigrationKey, async (req, res) => {
   }
 });
 
+app.get("/migrate/two-factor", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS two_factor_enabled BOOLEAN DEFAULT false
+    `);
+    res.send("Migration complete: two_factor_enabled column added to users.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/cart-watchlist", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -1005,6 +1021,29 @@ app.patch("/profile/change-password", authenticate, authRateLimit, async (req, r
   }
 });
 
+// Turning it on requires the account to have a verified email on file —
+// that's where codes go. Turning it off just requires being logged in
+// (already a meaningful bar, since you're authenticated to call this).
+app.patch("/profile/two-factor", authenticate, async (req, res) => {
+  try {
+    const { enabled } = req.body;
+    if (enabled) {
+      const check = await pool.query("SELECT email FROM users WHERE id = $1", [req.user.id]);
+      if (!check.rows.length || !check.rows[0].email) {
+        return res.status(400).json({ error: "Add a verified email to your account before turning this on" });
+      }
+    }
+    const result = await pool.query(
+      "UPDATE users SET two_factor_enabled = $1 WHERE id = $2 RETURNING two_factor_enabled",
+      [!!enabled, req.user.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: "Account not found" });
+    res.json({ twoFactorEnabled: result.rows[0].two_factor_enabled });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Submit (or resubmit) a seller application. Sets status back to "pending"
 // so a previously-rejected member can try again after fixing whatever
 // was wrong. bankStatementUrl is optional — a data URL from the frontend's
@@ -1040,7 +1079,7 @@ const USER_PUBLIC_FIELDS = `id, username, display_name, first_name, last_name, o
 const USER_FULL_FIELDS = `id, username, email, phone, display_name, first_name, last_name, office_location,
   country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
-  bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies`;
+  bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled`;
 
 app.get("/users", async (req, res) => {
   try {
@@ -1056,7 +1095,7 @@ app.get("/users", async (req, res) => {
 const USER_RETURNING_FIELDS = `id, username, email, phone, display_name, first_name, last_name, office_location,
   country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
-  bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies`;
+  bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled`;
 
 app.patch("/users/:id/verify", authenticate, requireAdmin, async (req, res) => {
   try {
@@ -1323,7 +1362,7 @@ app.post("/login", authRateLimit, async (req, res) => {
     const result = await pool.query(
       `SELECT id, username, email, phone, password_hash, display_name, first_name, last_name, office_location,
          country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
-         license_number, license_photos, id_verification_exempt, created_at
+         license_number, license_photos, id_verification_exempt, created_at, two_factor_enabled
        FROM users WHERE username = $1`,
       [username]
     );
@@ -1348,6 +1387,32 @@ app.post("/login", authRateLimit, async (req, res) => {
       return res.status(403).json({ error: "Login isn't allowed over a VPN, proxy, or Tor connection. Please disable it and try again." });
     }
 
+    if (user.two_factor_enabled) {
+      if (!user.email) {
+        return res.status(400).json({ error: "Two-factor is on but this account has no email on file — contact support." });
+      }
+      if (!process.env.RESEND_API_KEY) {
+        return res.status(500).json({ error: "Two-factor login isn't configured yet" });
+      }
+      const code = Math.floor(100000 + Math.random() * 900000).toString();
+      const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
+      const resendRes = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
+        body: JSON.stringify({
+          from: fromAddress,
+          to: [user.email],
+          subject: `Your Stallyard login code is ${code}`,
+          html: `<p>Your Stallyard login code is <strong>${code}</strong>.</p><p>This code expires in 10 minutes. If this wasn't you, change your password right away.</p>`,
+        }),
+      });
+      if (!resendRes.ok) {
+        return res.status(400).json({ error: "Couldn't send your login code — try again" });
+      }
+      twoFactorCodes.set(user.id, { code, sentAt: Date.now() });
+      return res.json({ twoFactorRequired: true, userId: user.id });
+    }
+
     delete user.password_hash;
     const ip = getClientIp(req);
     const userAgent = req.headers["user-agent"] || "";
@@ -1359,6 +1424,42 @@ app.post("/login", authRateLimit, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// Step 2 of a two-factor login: check the emailed code, then actually
+// issue the session token — mirrors what /login does for accounts without
+// two-factor turned on, including recording login history.
+app.post("/login/verify-2fa", authRateLimit, async (req, res) => {
+  try {
+    const { userId, code } = req.body;
+    if (!userId || !code) return res.status(400).json({ error: "Missing userId or code" });
+    const stored = twoFactorCodes.get(Number(userId));
+    if (!stored || Date.now() - stored.sentAt > TWO_FACTOR_CODE_TTL_MS) {
+      return res.status(400).json({ error: "That code has expired — log in again to get a new one" });
+    }
+    if (stored.code !== String(code).trim()) {
+      return res.status(400).json({ error: "That code doesn't match — check and try again" });
+    }
+    twoFactorCodes.delete(Number(userId));
+    const result = await pool.query(
+      `SELECT id, username, email, phone, display_name, first_name, last_name, office_location,
+         country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
+         license_number, license_photos, id_verification_exempt, created_at
+       FROM users WHERE id = $1`,
+      [userId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Account not found" });
+    const user = result.rows[0];
+    const ip = getClientIp(req);
+    const userAgent = req.headers["user-agent"] || "";
+    pool
+      .query("INSERT INTO login_history (user_id, ip, user_agent) VALUES ($1, $2, $3)", [user.id, ip, userAgent])
+      .catch((err) => console.error("Failed to record login history:", err.message));
+    res.json({ user, token: signToken(user) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/listings", authenticate, async (req, res) => {
   try {
     const {
