@@ -874,6 +874,26 @@ app.get("/migrate/sessions", requireMigrationKey, async (req, res) => {
   }
 });
 
+app.get("/migrate/seller-performance", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE order_items ADD COLUMN IF NOT EXISTS shipped_at TIMESTAMP
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS seller_warnings (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        admin_id INTEGER REFERENCES users(id),
+        message TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    res.send("Migration complete: shipped_at added to order_items, seller_warnings table created.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/cart-watchlist", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -1974,6 +1994,11 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
     if (fulfillmentStatus) {
       sets.push(`fulfillment_status = $${i++}`);
       values.push(fulfillmentStatus);
+      if (fulfillmentStatus === "shipped") {
+        // Only set the first time — re-saving other fields shouldn't reset
+        // the on-time-shipping clock.
+        sets.push(`shipped_at = COALESCE(shipped_at, NOW())`);
+      }
     }
     if (typeof trackingNumber === "string") {
       sets.push(`tracking_number = $${i++}`);
@@ -3058,6 +3083,50 @@ app.patch("/account-reports/:id/resolve", authenticate, requireAdmin, async (req
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Report not found" });
     res.json({ report: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin issues a warning to a seller — a lighter-weight step than
+// suspension, visible to both the admin team and the seller themselves.
+app.post("/users/:id/warnings", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { message } = req.body;
+    if (!message || !message.trim()) {
+      return res.status(400).json({ error: "Write a message for the warning" });
+    }
+    const result = await pool.query(
+      "INSERT INTO seller_warnings (user_id, admin_id, message) VALUES ($1, $2, $3) RETURNING *",
+      [req.params.id, req.user.id, message.trim()]
+    );
+    res.status(201).json({ warning: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin views warning history for a specific seller.
+app.get("/users/:id/warnings", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM seller_warnings WHERE user_id = $1 ORDER BY created_at DESC",
+      [req.params.id]
+    );
+    res.json({ warnings: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// A seller views their own warning history.
+app.get("/warnings/mine", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM seller_warnings WHERE user_id = $1 ORDER BY created_at DESC",
+      [req.user.id]
+    );
+    res.json({ warnings: result.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
