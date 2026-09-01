@@ -963,6 +963,31 @@ app.patch("/profile/store", authenticate, async (req, res) => {
   }
 });
 
+// Change password while logged in — requires the current password, unlike
+// the forgot-password flow which is for when you're locked out entirely.
+app.patch("/profile/change-password", authenticate, authRateLimit, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ error: "Enter your current and new password" });
+    }
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: "New password must be at least 8 characters" });
+    }
+    const result = await pool.query("SELECT password_hash FROM users WHERE id = $1", [req.user.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: "Account not found" });
+    const matches = await bcrypt.compare(currentPassword, result.rows[0].password_hash);
+    if (!matches) {
+      return res.status(401).json({ error: "Current password doesn't match" });
+    }
+    const newHash = await bcrypt.hash(newPassword, 10);
+    await pool.query("UPDATE users SET password_hash = $1 WHERE id = $2", [newHash, req.user.id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Submit (or resubmit) a seller application. Sets status back to "pending"
 // so a previously-rejected member can try again after fixing whatever
 // was wrong. bankStatementUrl is optional — a data URL from the frontend's
