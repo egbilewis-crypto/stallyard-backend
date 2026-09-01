@@ -196,6 +196,12 @@ async function checkPhoneNumber(phone) {
 const termiiPinIds = new Map();
 const TERMII_PIN_TTL_MS = 10 * 60 * 1000;
 
+// Records phone numbers that passed /phone-verify/check, so a follow-up
+// authenticated call can attach that verified number to an account —
+// mirrors how verifiedEmails works for email.
+const verifiedPhones = new Map();
+const PHONE_VERIFIED_TTL_MS = 30 * 60 * 1000;
+
 // Sends a real SMS one-time code via Termii — a Nigeria-founded provider with
 // much better deliverability to Nigerian carriers (MTN, Airtel, Glo, 9mobile)
 // than generic international providers, including DND bypass for OTPs.
@@ -264,7 +270,10 @@ app.post("/phone-verify/check", async (req, res) => {
       return res.status(400).json({ error: data.message || "Couldn't check that code" });
     }
     const valid = data.verified === "True" || data.verified === true;
-    if (valid) termiiPinIds.delete(phone);
+    if (valid) {
+      termiiPinIds.delete(phone);
+      verifiedPhones.set(phone, Date.now());
+    }
     res.json({ valid });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -829,6 +838,17 @@ app.get("/migrate/two-factor", requireMigrationKey, async (req, res) => {
   }
 });
 
+app.get("/migrate/phone-verified", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS is_phone_verified BOOLEAN DEFAULT false
+    `);
+    res.send("Migration complete: is_phone_verified column added to users.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/cart-watchlist", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -1050,6 +1070,46 @@ app.patch("/profile/two-factor", authenticate, async (req, res) => {
   }
 });
 
+// Attaches a verified email to the current account. Requires having
+// already passed /email-verify/send + /email-verify/check for that exact
+// address — this endpoint just checks that record and flips the flag.
+app.patch("/profile/verify-email", authenticate, async (req, res) => {
+  try {
+    const check = await pool.query("SELECT email FROM users WHERE id = $1", [req.user.id]);
+    if (!check.rows.length || !check.rows[0].email) {
+      return res.status(400).json({ error: "Add an email to your account first" });
+    }
+    const email = check.rows[0].email.toLowerCase();
+    const verifiedAt = verifiedEmails.get(email);
+    if (!verifiedAt || Date.now() - verifiedAt > EMAIL_VERIFIED_TTL_MS) {
+      return res.status(400).json({ error: "Verify the code we sent first" });
+    }
+    verifiedEmails.delete(email);
+    await pool.query("UPDATE users SET is_email_verified = true WHERE id = $1", [req.user.id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Same idea for phone — requires having passed /phone-verify/send +
+// /phone-verify/check for that exact number first.
+app.patch("/profile/verify-phone", authenticate, async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ error: "Missing phone number" });
+    const verifiedAt = verifiedPhones.get(phone);
+    if (!verifiedAt || Date.now() - verifiedAt > PHONE_VERIFIED_TTL_MS) {
+      return res.status(400).json({ error: "Verify the code we sent first" });
+    }
+    verifiedPhones.delete(phone);
+    await pool.query("UPDATE users SET phone = $1, is_phone_verified = true WHERE id = $2", [phone, req.user.id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Submit (or resubmit) a seller application. Sets status back to "pending"
 // so a previously-rejected member can try again after fixing whatever
 // was wrong. bankStatementUrl is optional — a data URL from the frontend's
@@ -1085,7 +1145,8 @@ const USER_PUBLIC_FIELDS = `id, username, display_name, first_name, last_name, o
 const USER_FULL_FIELDS = `id, username, email, phone, display_name, first_name, last_name, office_location,
   country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
-  bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled`;
+  bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
+  is_email_verified, is_phone_verified`;
 
 app.get("/users", async (req, res) => {
   try {
@@ -1101,7 +1162,8 @@ app.get("/users", async (req, res) => {
 const USER_RETURNING_FIELDS = `id, username, email, phone, display_name, first_name, last_name, office_location,
   country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
-  bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled`;
+  bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
+  is_email_verified, is_phone_verified`;
 
 app.patch("/users/:id/verify", authenticate, requireAdmin, async (req, res) => {
   try {
