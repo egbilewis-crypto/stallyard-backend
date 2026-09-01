@@ -894,6 +894,75 @@ app.get("/migrate/seller-performance", requireMigrationKey, async (req, res) => 
   }
 });
 
+app.get("/migrate/help-support", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS banners (
+        id SERIAL PRIMARY KEY,
+        message TEXT NOT NULL,
+        tone TEXT DEFAULT 'info',
+        is_active BOOLEAN DEFAULT true,
+        media_type TEXT DEFAULT 'none',
+        image_url TEXT DEFAULT '',
+        video_url TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS help_articles (
+        id SERIAL PRIMARY KEY,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS help_faqs (
+        id SERIAL PRIMARY KEY,
+        question TEXT NOT NULL,
+        answer TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS marketplace_policies (
+        category TEXT PRIMARY KEY,
+        body TEXT DEFAULT '',
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      INSERT INTO marketplace_policies (category, body) VALUES
+        ('seller_rules', ''), ('prohibited_items', ''), ('fees', ''),
+        ('payment_rules', ''), ('shipping_rules', ''), ('returns_disputes', '')
+      ON CONFLICT (category) DO NOTHING
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS support_tickets (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        subject TEXT NOT NULL,
+        status TEXT DEFAULT 'open',
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS support_ticket_messages (
+        id SERIAL PRIMARY KEY,
+        ticket_id INTEGER NOT NULL REFERENCES support_tickets(id) ON DELETE CASCADE,
+        sender_id INTEGER NOT NULL REFERENCES users(id),
+        body TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    res.send("Migration complete: banners, help_articles, help_faqs, marketplace_policies, support_tickets, support_ticket_messages tables created.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/cart-watchlist", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -3155,6 +3224,284 @@ app.get("/login-history/mine", authenticate, async (req, res) => {
       [req.user.id]
     );
     res.json({ history: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Public: homepage banners, help articles, and FAQs — read by everyone,
+// written by admins only. This replaces what used to be purely local
+// browser state that never reached the database.
+app.get("/content", async (req, res) => {
+  try {
+    const [banners, articles, faqs] = await Promise.all([
+      pool.query("SELECT * FROM banners ORDER BY created_at DESC"),
+      pool.query("SELECT * FROM help_articles ORDER BY created_at DESC"),
+      pool.query("SELECT * FROM help_faqs ORDER BY created_at ASC"),
+    ]);
+    res.json({ banners: banners.rows, articles: articles.rows, faqs: faqs.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/content/banners", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { message, tone, mediaType, imageUrl, videoUrl } = req.body;
+    if (!message || !message.trim()) return res.status(400).json({ error: "Missing banner message" });
+    const result = await pool.query(
+      `INSERT INTO banners (message, tone, media_type, image_url, video_url)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [message.trim(), tone || "info", mediaType || "none", imageUrl || "", videoUrl || ""]
+    );
+    res.status(201).json({ banner: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/content/banners/:id", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { message, tone, isActive, mediaType, imageUrl, videoUrl } = req.body;
+    const sets = [];
+    const values = [];
+    let i = 1;
+    if (typeof message === "string") { sets.push(`message = $${i++}`); values.push(message); }
+    if (typeof tone === "string") { sets.push(`tone = $${i++}`); values.push(tone); }
+    if (typeof isActive === "boolean") { sets.push(`is_active = $${i++}`); values.push(isActive); }
+    if (typeof mediaType === "string") { sets.push(`media_type = $${i++}`); values.push(mediaType); }
+    if (typeof imageUrl === "string") { sets.push(`image_url = $${i++}`); values.push(imageUrl); }
+    if (typeof videoUrl === "string") { sets.push(`video_url = $${i++}`); values.push(videoUrl); }
+    if (sets.length === 0) return res.status(400).json({ error: "No valid fields to update" });
+    values.push(req.params.id);
+    const result = await pool.query(`UPDATE banners SET ${sets.join(", ")} WHERE id = $${i} RETURNING *`, values);
+    if (result.rows.length === 0) return res.status(404).json({ error: "Banner not found" });
+    res.json({ banner: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/content/banners/:id", authenticate, requireAdmin, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM banners WHERE id = $1", [req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/content/articles", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { title, body } = req.body;
+    if (!title?.trim() || !body?.trim()) return res.status(400).json({ error: "Missing title or body" });
+    const result = await pool.query(
+      "INSERT INTO help_articles (title, body) VALUES ($1, $2) RETURNING *",
+      [title.trim(), body.trim()]
+    );
+    res.status(201).json({ article: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/content/articles/:id", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { title, body } = req.body;
+    const result = await pool.query(
+      `UPDATE help_articles SET title = COALESCE($1, title), body = COALESCE($2, body), updated_at = NOW()
+       WHERE id = $3 RETURNING *`,
+      [title?.trim() || null, body?.trim() || null, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Article not found" });
+    res.json({ article: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/content/articles/:id", authenticate, requireAdmin, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM help_articles WHERE id = $1", [req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/content/faqs", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { question, answer } = req.body;
+    if (!question?.trim() || !answer?.trim()) return res.status(400).json({ error: "Missing question or answer" });
+    const result = await pool.query(
+      "INSERT INTO help_faqs (question, answer) VALUES ($1, $2) RETURNING *",
+      [question.trim(), answer.trim()]
+    );
+    res.status(201).json({ faq: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/content/faqs/:id", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { question, answer } = req.body;
+    const result = await pool.query(
+      `UPDATE help_faqs SET question = COALESCE($1, question), answer = COALESCE($2, answer)
+       WHERE id = $3 RETURNING *`,
+      [question?.trim() || null, answer?.trim() || null, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "FAQ not found" });
+    res.json({ faq: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/content/faqs/:id", authenticate, requireAdmin, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM help_faqs WHERE id = $1", [req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Marketplace policies — six fixed categories, always present (seeded by
+// the migration), each just a free-text body an admin can edit.
+app.get("/policies", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM marketplace_policies");
+    res.json({ policies: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const POLICY_CATEGORIES = new Set([
+  "seller_rules", "prohibited_items", "fees", "payment_rules", "shipping_rules", "returns_disputes",
+]);
+
+app.patch("/policies/:category", authenticate, requireAdmin, async (req, res) => {
+  try {
+    if (!POLICY_CATEGORIES.has(req.params.category)) {
+      return res.status(400).json({ error: "Invalid policy category" });
+    }
+    const { body } = req.body;
+    const result = await pool.query(
+      `INSERT INTO marketplace_policies (category, body, updated_at) VALUES ($1, $2, NOW())
+       ON CONFLICT (category) DO UPDATE SET body = $2, updated_at = NOW()
+       RETURNING *`,
+      [req.params.category, body || ""]
+    );
+    res.json({ policy: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Support tickets — a buyer or seller opens one with an initial message,
+// then it's a simple back-and-forth thread with an admin, tracked by status.
+app.post("/support-tickets", authenticate, async (req, res) => {
+  try {
+    const { subject, message } = req.body;
+    if (!subject?.trim() || !message?.trim()) {
+      return res.status(400).json({ error: "Give it a subject and a message" });
+    }
+    const ticketResult = await pool.query(
+      "INSERT INTO support_tickets (user_id, subject) VALUES ($1, $2) RETURNING *",
+      [req.user.id, subject.trim()]
+    );
+    const ticket = ticketResult.rows[0];
+    const messageResult = await pool.query(
+      "INSERT INTO support_ticket_messages (ticket_id, sender_id, body) VALUES ($1, $2, $3) RETURNING *",
+      [ticket.id, req.user.id, message.trim()]
+    );
+    res.status(201).json({ ticket, message: messageResult.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/support-tickets/mine", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM support_tickets WHERE user_id = $1 ORDER BY updated_at DESC",
+      [req.user.id]
+    );
+    res.json({ tickets: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/support-tickets", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT st.*, u.username, u.display_name
+       FROM support_tickets st JOIN users u ON st.user_id = u.id
+       ORDER BY st.updated_at DESC`
+    );
+    res.json({ tickets: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+async function requireTicketAccess(req, res, next) {
+  try {
+    const result = await pool.query("SELECT user_id FROM support_tickets WHERE id = $1", [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: "Ticket not found" });
+    if (result.rows[0].user_id !== req.user.id && !req.user.isAdmin) {
+      return res.status(403).json({ error: "You can only view your own tickets" });
+    }
+    next();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+app.get("/support-tickets/:id/messages", authenticate, requireTicketAccess, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT stm.*, u.username, u.display_name, u.is_admin
+       FROM support_ticket_messages stm JOIN users u ON stm.sender_id = u.id
+       WHERE stm.ticket_id = $1 ORDER BY stm.created_at ASC`,
+      [req.params.id]
+    );
+    res.json({ messages: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/support-tickets/:id/messages", authenticate, requireTicketAccess, async (req, res) => {
+  try {
+    const { body } = req.body;
+    if (!body?.trim()) return res.status(400).json({ error: "Message can't be empty" });
+    const result = await pool.query(
+      "INSERT INTO support_ticket_messages (ticket_id, sender_id, body) VALUES ($1, $2, $3) RETURNING *",
+      [req.params.id, req.user.id, body.trim()]
+    );
+    await pool.query("UPDATE support_tickets SET updated_at = NOW() WHERE id = $1", [req.params.id]);
+    res.status(201).json({ message: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const TICKET_STATUSES = new Set(["open", "in_progress", "resolved"]);
+
+app.patch("/support-tickets/:id/status", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (!TICKET_STATUSES.has(status)) return res.status(400).json({ error: "Invalid status" });
+    const result = await pool.query(
+      "UPDATE support_tickets SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *",
+      [status, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Ticket not found" });
+    res.json({ ticket: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
