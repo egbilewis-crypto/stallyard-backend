@@ -675,6 +675,31 @@ app.get("/migrate/delivery-token", requireMigrationKey, async (req, res) => {
   }
 });
 
+app.get("/migrate/message-features", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE messages
+        ADD COLUMN IF NOT EXISTS image_url TEXT,
+        ADD COLUMN IF NOT EXISTS order_id INTEGER
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS message_reports (
+        id SERIAL PRIMARY KEY,
+        message_id INTEGER NOT NULL,
+        thread_id INTEGER NOT NULL,
+        reporter_id INTEGER NOT NULL,
+        reason TEXT DEFAULT '',
+        status TEXT DEFAULT 'open',
+        created_at TIMESTAMP DEFAULT NOW(),
+        resolved_at TIMESTAMP
+      )
+    `);
+    res.send("Migration complete: message image/order columns added, message_reports table created.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/cart-watchlist", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -2086,7 +2111,7 @@ app.get("/threads/:userId", authenticate, async (req, res) => {
 
 app.post("/messages", authenticate, async (req, res) => {
   try {
-    const { threadId, body, messageType, offerAmount } = req.body;
+    const { threadId, body, messageType, offerAmount, imageUrl, orderId } = req.body;
     const senderId = req.user.id; // never trust a client-supplied sender
 
     if (!threadId) {
@@ -2099,8 +2124,8 @@ app.post("/messages", authenticate, async (req, res) => {
     }
 
     const result = await pool.query(
-      `INSERT INTO messages (thread_id, sender_id, message_type, body, offer_amount, offer_status)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO messages (thread_id, sender_id, message_type, body, offer_amount, offer_status, image_url, order_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING *`,
       [
         threadId,
@@ -2109,6 +2134,8 @@ app.post("/messages", authenticate, async (req, res) => {
         body || "",
         offerAmount || null,
         messageType === "offer" ? "pending" : null,
+        imageUrl || null,
+        orderId || null,
       ]
     );
 
@@ -2164,6 +2191,69 @@ app.patch("/messages/:id/offer", authenticate, async (req, res) => {
       [status, req.params.id]
     );
     res.json({ message: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// A buyer or seller reports a specific message as inappropriate. Only
+// someone actually in that thread can report it — prevents a stranger
+// from spamming reports on messages they were never party to.
+app.post("/messages/:id/report", authenticate, async (req, res) => {
+  try {
+    const { reason } = req.body;
+    const msgResult = await pool.query("SELECT thread_id FROM messages WHERE id = $1", [req.params.id]);
+    if (msgResult.rows.length === 0) return res.status(404).json({ error: "Message not found" });
+    const threadId = msgResult.rows[0].thread_id;
+    const threadResult = await pool.query("SELECT buyer_id, seller_id FROM threads WHERE id = $1", [threadId]);
+    if (threadResult.rows.length === 0) return res.status(404).json({ error: "Thread not found" });
+    const thread = threadResult.rows[0];
+    if (req.user.id !== thread.buyer_id && req.user.id !== thread.seller_id && !req.user.isAdmin) {
+      return res.status(403).json({ error: "You're not a part of this conversation" });
+    }
+    const result = await pool.query(
+      `INSERT INTO message_reports (message_id, thread_id, reporter_id, reason)
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [req.params.id, threadId, req.user.id, reason || ""]
+    );
+    res.status(201).json({ report: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin queue of reported messages — joined with the message body/image,
+// who sent it, who reported it, and which listing the thread is about.
+app.get("/message-reports", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT mr.*,
+         m.body AS message_body, m.image_url AS message_image_url, m.sender_id AS message_sender_id,
+         sender.username AS sender_username, sender.display_name AS sender_display_name,
+         reporter.username AS reporter_username, reporter.display_name AS reporter_display_name,
+         t.listing_id, l.title AS listing_title
+       FROM message_reports mr
+       JOIN messages m ON mr.message_id = m.id
+       JOIN threads t ON mr.thread_id = t.id
+       LEFT JOIN users sender ON m.sender_id = sender.id
+       LEFT JOIN users reporter ON mr.reporter_id = reporter.id
+       LEFT JOIN listings l ON t.listing_id = l.id
+       ORDER BY mr.created_at DESC`
+    );
+    res.json({ reports: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/message-reports/:id/resolve", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "UPDATE message_reports SET status = 'resolved', resolved_at = NOW() WHERE id = $1 RETURNING *",
+      [req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Report not found" });
+    res.json({ report: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
