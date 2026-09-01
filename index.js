@@ -112,6 +112,19 @@ function rateLimit({ windowMs, max, message }) {
 }
 
 const authRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: "Too many attempts — please wait 15 minutes and try again." });
+
+// Fire-and-forget notification insert — failures are logged, never thrown,
+// so a notification glitch can never break the actual action (a sale,
+// a message, etc.) that triggered it.
+async function createNotification(userId, type, message) {
+  if (!userId) return;
+  try {
+    await pool.query("INSERT INTO notifications (user_id, type, message) VALUES ($1, $2, $3)", [userId, type, message]);
+  } catch (err) {
+    console.error("Failed to create notification:", err.message);
+  }
+}
+
 const codeRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 8, message: "Too many attempts — please wait 15 minutes and try again." });
 
 // Returns true (VPN/proxy/Tor detected), false (clean), or null (couldn't
@@ -755,6 +768,28 @@ app.get("/migrate/store-profile", requireMigrationKey, async (req, res) => {
   }
 });
 
+app.get("/migrate/notifications", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        type TEXT NOT NULL,
+        message TEXT NOT NULL,
+        read BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      ALTER TABLE order_items
+        ADD COLUMN IF NOT EXISTS ship_reminder_sent_at TIMESTAMP
+    `);
+    res.send("Migration complete: notifications table created, ship_reminder_sent_at added to order_items.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/cart-watchlist", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -1045,6 +1080,11 @@ app.patch("/users/:id/reject", authenticate, requireAdmin, async (req, res) => {
       [reason || null, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
+    createNotification(
+      req.params.id,
+      "verification_problem",
+      `Your seller verification needs attention${reason ? ": " + reason : ""}`
+    );
     res.json({ user: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1396,6 +1436,9 @@ app.patch("/listings/:id", authenticate, async (req, res) => {
       values
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Listing not found" });
+    if (req.body.status === "rejected") {
+      createNotification(existing.rows[0].owner_id, "listing_rejected", `Your listing "${result.rows[0].title}" was rejected`);
+    }
     res.json({ listing: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1509,6 +1552,11 @@ app.post("/checkout", authenticate, async (req, res) => {
       );
       insertedItems.push(itemResult.rows[0]);
       await client.query("UPDATE listings SET status = 'sold' WHERE id = $1", [listing.id]);
+      createNotification(
+        listing.owner_id,
+        "sale",
+        `New sale: ${listing.title} (${qty}x) — $${(price * qty).toFixed(2)}. Payment is held until delivery is confirmed.`
+      );
     }
 
     await client.query("COMMIT");
@@ -1579,6 +1627,13 @@ app.patch("/orders/:id/release", authenticate, requireAdmin, async (req, res) =>
       [req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Order not found" });
+    const sellerIds = await pool.query(
+      "SELECT DISTINCT seller_id FROM order_items WHERE order_id = $1",
+      [req.params.id]
+    );
+    for (const row of sellerIds.rows) {
+      createNotification(row.seller_id, "funds_released", "Funds released for order — payment is now in your available balance.");
+    }
     res.json({ order: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1617,6 +1672,15 @@ app.patch("/orders/:id/dispute", authenticate, async (req, res) => {
       [!!isDisputed, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Order not found" });
+    if (isDisputed) {
+      const sellerIds = await pool.query(
+        "SELECT DISTINCT seller_id FROM order_items WHERE order_id = $1",
+        [req.params.id]
+      );
+      for (const row of sellerIds.rows) {
+        createNotification(row.seller_id, "dispute_opened", "A dispute was opened on one of your orders.");
+      }
+    }
     res.json({ order: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1684,6 +1748,7 @@ async function markItemReceivedAndMaybeRelease(itemId) {
     [itemId]
   );
   const item = result.rows[0];
+  createNotification(item.seller_id, "delivery_confirmed", `Buyer confirmed delivery for "${item.title}"`);
   const allItems = await pool.query("SELECT * FROM order_items WHERE order_id = $1", [item.order_id]);
   const relevant = allItems.rows.filter((r) => !["cancelled", "returned"].includes(r.fulfillment_status));
   const allConfirmed = relevant.length > 0 && relevant.every((r) => r.buyer_confirmed_at);
@@ -1694,6 +1759,12 @@ async function markItemReceivedAndMaybeRelease(itemId) {
       [item.order_id]
     );
     order = orderRes.rows[0] || null;
+    if (order) {
+      const sellerIds = [...new Set(relevant.map((r) => r.seller_id))];
+      for (const sellerId of sellerIds) {
+        createNotification(sellerId, "funds_released", `Funds released for order — payment is now in your available balance.`);
+      }
+    }
   }
   return { item, order };
 }
@@ -1755,6 +1826,7 @@ app.post("/order-items/:id/request-return", authenticate, async (req, res) => {
        WHERE id = $4 RETURNING *`,
       [reason, note || "", JSON.stringify(evidenceUrls || []), req.params.id]
     );
+    createNotification(item.seller_id, "return_opened", `Return requested for "${item.title}" — ${reason}`);
     res.json({ item: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2186,6 +2258,7 @@ app.post("/withdrawals", authenticate, async (req, res) => {
           `UPDATE withdrawals SET status = 'paid', processed_at = NOW(), paystack_transfer_code = $1 WHERE id = $2 RETURNING *`,
           [transferData.data?.transfer_code || null, withdrawal.id]
         );
+        createNotification(req.user.id, "payout_completed", `Payout of $${amount.toFixed(2)} completed`);
         return res.status(201).json({ withdrawal: updated.rows[0] });
       }
       const failed = await pool.query(
@@ -2315,6 +2388,14 @@ app.post("/messages", authenticate, async (req, res) => {
     );
 
     res.status(201).json({ message: result.rows[0] });
+
+    try {
+      const recipientId = senderId === thread.rows[0].buyer_id ? thread.rows[0].seller_id : thread.rows[0].buyer_id;
+      const senderInfo = await pool.query("SELECT display_name FROM users WHERE id = $1", [senderId]);
+      createNotification(recipientId, "message", `New message from ${senderInfo.rows[0]?.display_name || "a buyer"}`);
+    } catch (notifyErr) {
+      console.error("Failed to notify about new message:", notifyErr.message);
+    }
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2625,6 +2706,62 @@ app.get("/sellers/:username/completed-sales-count", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+app.get("/notifications/mine", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50",
+      [req.user.id]
+    );
+    res.json({ notifications: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/notifications/:id/read", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "UPDATE notifications SET read = true WHERE id = $1 AND user_id = $2 RETURNING *",
+      [req.params.id, req.user.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Notification not found" });
+    res.json({ notification: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/notifications/mark-all-read", authenticate, async (req, res) => {
+  try {
+    await pool.query("UPDATE notifications SET read = true WHERE user_id = $1 AND read = false", [req.user.id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Reminds sellers about items that have sat unshipped for 24+ hours.
+// Checks hourly; each item is only reminded once (ship_reminder_sent_at
+// gets stamped so it isn't repeated every hour after that).
+async function sendShipReminders() {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM order_items
+       WHERE fulfillment_status = 'new'
+         AND ship_reminder_sent_at IS NULL
+         AND created_at < NOW() - INTERVAL '24 hours'`
+    );
+    for (const item of result.rows) {
+      createNotification(item.seller_id, "ship_reminder", `Reminder: "${item.title}" hasn't shipped yet`);
+      await pool.query("UPDATE order_items SET ship_reminder_sent_at = NOW() WHERE id = $1", [item.id]);
+    }
+  } catch (err) {
+    console.error("Ship reminder check failed:", err.message);
+  }
+}
+setInterval(sendShipReminders, 60 * 60 * 1000).unref();
+sendShipReminders(); // also run once on startup, in case items crossed the threshold while the server was offline
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
