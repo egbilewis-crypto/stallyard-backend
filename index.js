@@ -461,6 +461,19 @@ app.get("/migrate/listings-extra-fields", async (req, res) => {
   }
 });
 
+app.get("/migrate/order-management", async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE order_items
+        ADD COLUMN IF NOT EXISTS carrier TEXT DEFAULT '',
+        ADD COLUMN IF NOT EXISTS buyer_confirmed_at TIMESTAMP
+    `);
+    res.send("Migration complete: carrier and buyer_confirmed_at columns added to order_items.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/cart-watchlist", async (req, res) => {
   try {
     await pool.query(`
@@ -1286,9 +1299,9 @@ app.patch("/orders/:id/dispute", authenticate, async (req, res) => {
   }
 });
 
-const ORDER_ITEM_STATUSES = new Set(["new", "shipped", "delivered", "cancelled", "returned"]);
+const ORDER_ITEM_STATUSES = new Set(["new", "preparing", "shipped", "delivered", "cancelled", "returned"]);
 
-// Update one item's fulfillment status/tracking — only that item's seller or an admin.
+// Update one item's fulfillment status/tracking/carrier — only that item's seller or an admin.
 app.patch("/order-items/:id", authenticate, async (req, res) => {
   try {
     const existing = await pool.query("SELECT seller_id FROM order_items WHERE id = $1", [req.params.id]);
@@ -1296,7 +1309,7 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
     if (!req.user.isAdmin && existing.rows[0].seller_id !== req.user.id) {
       return res.status(403).json({ error: "You can only update your own items" });
     }
-    const { fulfillmentStatus, trackingNumber } = req.body;
+    const { fulfillmentStatus, trackingNumber, carrier } = req.body;
     if (fulfillmentStatus && !ORDER_ITEM_STATUSES.has(fulfillmentStatus)) {
       return res.status(400).json({ error: "Invalid fulfillment status" });
     }
@@ -1311,6 +1324,10 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
       sets.push(`tracking_number = $${i++}`);
       values.push(trackingNumber);
     }
+    if (typeof carrier === "string") {
+      sets.push(`carrier = $${i++}`);
+      values.push(carrier);
+    }
     if (sets.length === 0) return res.status(400).json({ error: "No valid fields to update" });
     values.push(req.params.id);
     const result = await pool.query(
@@ -1318,6 +1335,48 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
       values
     );
     res.json({ item: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Buyer confirms they received an item. Only the order's buyer can do this,
+// and only once the seller has actually marked it shipped or delivered.
+// Once every non-cancelled/non-returned item in the order is confirmed,
+// the order's held payment auto-releases to the seller(s) — the same
+// status flip the "Release payout" admin action performs.
+app.patch("/order-items/:id/confirm-receipt", authenticate, async (req, res) => {
+  try {
+    const existing = await pool.query(
+      `SELECT oi.*, o.buyer_id, o.payment_status
+       FROM order_items oi JOIN orders o ON oi.order_id = o.id
+       WHERE oi.id = $1`,
+      [req.params.id]
+    );
+    if (existing.rows.length === 0) return res.status(404).json({ error: "Order item not found" });
+    const item = existing.rows[0];
+    if (item.buyer_id !== req.user.id) {
+      return res.status(403).json({ error: "Only the buyer can confirm receipt of this item" });
+    }
+    if (!["shipped", "delivered"].includes(item.fulfillment_status)) {
+      return res.status(400).json({ error: "This item hasn't been shipped yet" });
+    }
+    const result = await pool.query(
+      "UPDATE order_items SET buyer_confirmed_at = NOW() WHERE id = $1 RETURNING *",
+      [req.params.id]
+    );
+    const allItems = await pool.query("SELECT * FROM order_items WHERE order_id = $1", [item.order_id]);
+    const relevant = allItems.rows.filter((r) => !["cancelled", "returned"].includes(r.fulfillment_status));
+    const allConfirmed = relevant.length > 0 && relevant.every((r) => r.buyer_confirmed_at);
+    let order = null;
+    if (allConfirmed && item.payment_status === "held") {
+      const orderRes = await pool.query(
+        "UPDATE orders SET payment_status = 'released' WHERE id = $1 RETURNING *",
+        [item.order_id]
+      );
+      order = orderRes.rows[0];
+    }
+    res.json({ item: result.rows[0], order });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
