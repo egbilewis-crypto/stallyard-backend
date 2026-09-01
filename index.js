@@ -22,7 +22,7 @@ if (!JWT_SECRET) {
 
 function signToken(user) {
   return jwt.sign(
-    { id: user.id, username: user.username, isAdmin: !!user.is_admin },
+    { id: user.id, username: user.username, isAdmin: !!user.is_admin, tokenVersion: user.token_version || 0 },
     JWT_SECRET,
     { expiresIn: "30d" }
   );
@@ -50,7 +50,7 @@ async function authenticate(req, res, next) {
   if (!requester) return res.status(401).json({ error: "Sign in required" });
   try {
     const result = await pool.query(
-      "SELECT is_admin, is_suspended FROM users WHERE id = $1",
+      "SELECT is_admin, is_suspended, token_version FROM users WHERE id = $1",
       [requester.id]
     );
     if (result.rows.length === 0) {
@@ -58,6 +58,10 @@ async function authenticate(req, res, next) {
     }
     if (result.rows[0].is_suspended) {
       return res.status(403).json({ error: "This account has been suspended" });
+    }
+    const currentVersion = result.rows[0].token_version || 0;
+    if ((requester.tokenVersion || 0) !== currentVersion) {
+      return res.status(401).json({ error: "Your session was signed out from another device — log in again" });
     }
     req.user = { ...requester, isAdmin: !!result.rows[0].is_admin };
     next();
@@ -849,6 +853,27 @@ app.get("/migrate/phone-verified", requireMigrationKey, async (req, res) => {
   }
 });
 
+app.get("/migrate/sessions", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER DEFAULT 0
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS account_reports (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        message TEXT NOT NULL,
+        status TEXT DEFAULT 'open',
+        created_at TIMESTAMP DEFAULT NOW(),
+        resolved_at TIMESTAMP
+      )
+    `);
+    res.send("Migration complete: token_version added to users, account_reports table created.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/cart-watchlist", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -918,7 +943,7 @@ app.post("/signup", authRateLimit, async (req, res) => {
        RETURNING id, username, email, phone, display_name, first_name, last_name, office_location,
          country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type,
          id_country, license_number, license_photos, id_verification_exempt,
-         is_email_verified, profile_complete, created_at`,
+         is_email_verified, profile_complete, created_at, token_version`,
       [username, email, passwordHash, displayName || username, isFirstUser, isFirstUser]
     );
 
@@ -1040,8 +1065,34 @@ app.patch("/profile/change-password", authenticate, authRateLimit, async (req, r
       return res.status(401).json({ error: "Current password doesn't match" });
     }
     const newHash = await bcrypt.hash(newPassword, 10);
-    await pool.query("UPDATE users SET password_hash = $1 WHERE id = $2", [newHash, req.user.id]);
-    res.json({ success: true });
+    // Bumping token_version here signs out every other device using the old
+    // password — standard practice, since a password change is often a
+    // response to "something felt off." We issue this session a fresh
+    // token immediately after so the person doesn't get logged out too.
+    const updated = await pool.query(
+      `UPDATE users SET password_hash = $1, token_version = COALESCE(token_version, 0) + 1
+       WHERE id = $2 RETURNING ${USER_RETURNING_FIELDS}`,
+      [newHash, req.user.id]
+    );
+    res.json({ success: true, token: signToken(updated.rows[0]) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Signs out every other device/session by bumping the token version —
+// all previously issued tokens instantly fail the version check in
+// authenticate(). Issues a fresh token for this session so the person
+// doing this stays logged in themselves.
+app.post("/profile/sign-out-other-devices", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE users SET token_version = COALESCE(token_version, 0) + 1
+       WHERE id = $1 RETURNING ${USER_RETURNING_FIELDS}`,
+      [req.user.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: "Account not found" });
+    res.json({ token: signToken(result.rows[0]) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1163,7 +1214,7 @@ const USER_RETURNING_FIELDS = `id, username, email, phone, display_name, first_n
   country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
   bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
-  is_email_verified, is_phone_verified`;
+  is_email_verified, is_phone_verified, token_version`;
 
 app.patch("/users/:id/verify", authenticate, requireAdmin, async (req, res) => {
   try {
@@ -1430,7 +1481,7 @@ app.post("/login", authRateLimit, async (req, res) => {
     const result = await pool.query(
       `SELECT id, username, email, phone, password_hash, display_name, first_name, last_name, office_location,
          country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
-         license_number, license_photos, id_verification_exempt, created_at, two_factor_enabled
+         license_number, license_photos, id_verification_exempt, created_at, two_factor_enabled, token_version
        FROM users WHERE username = $1`,
       [username]
     );
@@ -1511,7 +1562,7 @@ app.post("/login/verify-2fa", authRateLimit, async (req, res) => {
     const result = await pool.query(
       `SELECT id, username, email, phone, display_name, first_name, last_name, office_location,
          country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
-         license_number, license_photos, id_verification_exempt, created_at
+         license_number, license_photos, id_verification_exempt, created_at, token_version
        FROM users WHERE id = $1`,
       [userId]
     );
@@ -2957,6 +3008,52 @@ app.patch("/review-reports/:id/resolve", authenticate, requireAdmin, async (req,
   try {
     const result = await pool.query(
       "UPDATE review_reports SET status = 'resolved', resolved_at = NOW() WHERE id = $1 RETURNING *",
+      [req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Report not found" });
+    res.json({ report: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// A user reports something suspicious about their own account — an
+// unrecognized login, a bank change they didn't make, anything that
+// doesn't fit a more specific report flow.
+app.post("/account-reports", authenticate, async (req, res) => {
+  try {
+    const { message } = req.body;
+    if (!message || !message.trim()) {
+      return res.status(400).json({ error: "Describe what happened first" });
+    }
+    const result = await pool.query(
+      "INSERT INTO account_reports (user_id, message) VALUES ($1, $2) RETURNING *",
+      [req.user.id, message.trim()]
+    );
+    res.status(201).json({ report: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/account-reports", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT ar.*, u.username, u.display_name
+       FROM account_reports ar
+       JOIN users u ON ar.user_id = u.id
+       ORDER BY ar.created_at DESC`
+    );
+    res.json({ reports: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/account-reports/:id/resolve", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "UPDATE account_reports SET status = 'resolved', resolved_at = NOW() WHERE id = $1 RETURNING *",
       [req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Report not found" });
