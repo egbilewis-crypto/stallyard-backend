@@ -741,6 +741,20 @@ app.get("/migrate/review-features", requireMigrationKey, async (req, res) => {
   }
 });
 
+app.get("/migrate/store-profile", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS avatar_url TEXT,
+        ADD COLUMN IF NOT EXISTS store_bio TEXT,
+        ADD COLUMN IF NOT EXISTS store_policies TEXT
+    `);
+    res.send("Migration complete: avatar_url, store_bio, store_policies columns added to users.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/cart-watchlist", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -891,6 +905,29 @@ app.patch("/profile/complete", authenticate, async (req, res) => {
   }
 });
 
+// Updates the storefront-facing profile bits: photo, bio, and store
+// policies. Deliberately separate from /profile/complete, which carries
+// unrelated signup-completion and ID-verification logic — this endpoint
+// is just simple, always-editable fields.
+app.patch("/profile/store", authenticate, async (req, res) => {
+  try {
+    const { avatarUrl, storeBio, storePolicies } = req.body;
+    const result = await pool.query(
+      `UPDATE users SET
+         avatar_url = COALESCE($1, avatar_url),
+         store_bio = COALESCE($2, store_bio),
+         store_policies = COALESCE($3, store_policies)
+       WHERE id = $4
+       RETURNING ${USER_RETURNING_FIELDS}`,
+      [avatarUrl ?? null, storeBio ?? null, storePolicies ?? null, req.user.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: "User not found" });
+    res.json({ user: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Submit (or resubmit) a seller application. Sets status back to "pending"
 // so a previously-rejected member can try again after fixing whatever
 // was wrong. bankStatementUrl is optional — a data URL from the frontend's
@@ -918,14 +955,15 @@ app.post("/profile/apply-to-sell", authenticate, async (req, res) => {
 // Fields visible to everyone — used for storefronts, follower lists, etc.
 // Deliberately excludes email, phone, and ID/document fields.
 const USER_PUBLIC_FIELDS = `id, username, display_name, first_name, last_name, office_location,
-  country, is_admin, is_approved, is_verified, is_suspended, account_type, verification_status, created_at`;
+  country, is_admin, is_approved, is_verified, is_suspended, account_type, verification_status, created_at,
+  avatar_url, store_bio, store_policies`;
 
 // Full fields — only returned to a signed-in admin. bank_statement_url and
 // rejection_reason are sensitive/internal, so they stay out of USER_PUBLIC_FIELDS.
 const USER_FULL_FIELDS = `id, username, email, phone, display_name, first_name, last_name, office_location,
   country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
-  bank_statement_url, rejection_reason, created_at`;
+  bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies`;
 
 app.get("/users", async (req, res) => {
   try {
@@ -941,7 +979,7 @@ app.get("/users", async (req, res) => {
 const USER_RETURNING_FIELDS = `id, username, email, phone, display_name, first_name, last_name, office_location,
   country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
-  bank_statement_url, rejection_reason, created_at`;
+  bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies`;
 
 app.patch("/users/:id/verify", authenticate, requireAdmin, async (req, res) => {
   try {
