@@ -8,7 +8,7 @@ const jwt = require("jsonwebtoken");
 const app = express();
 app.set("trust proxy", true);
 app.use(cors());
-app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
+app.use(express.json({ limit: "15mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -41,12 +41,29 @@ function getRequester(req) {
   }
 }
 
-// Requires a valid token. Attaches the decoded payload as req.user.
-function authenticate(req, res, next) {
+// Requires a valid token, AND re-checks the account against the database —
+// not just the token's baked-in claims. Tokens last 30 days, so without
+// this, suspending a user or revoking someone's admin access wouldn't
+// actually take effect until their existing token expired on its own.
+async function authenticate(req, res, next) {
   const requester = getRequester(req);
   if (!requester) return res.status(401).json({ error: "Sign in required" });
-  req.user = requester;
-  next();
+  try {
+    const result = await pool.query(
+      "SELECT is_admin, is_suspended FROM users WHERE id = $1",
+      [requester.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: "Account no longer exists" });
+    }
+    if (result.rows[0].is_suspended) {
+      return res.status(403).json({ error: "This account has been suspended" });
+    }
+    req.user = { ...requester, isAdmin: !!result.rows[0].is_admin };
+    next();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 }
 
 // Must follow authenticate(). Requires the token to belong to an admin.
@@ -65,6 +82,37 @@ function getClientIp(req) {
   if (forwarded) return forwarded.split(",")[0].trim();
   return req.ip;
 }
+
+// Lightweight in-memory rate limiter — no external package needed. Tracks
+// hits per IP within a rolling window; resets on redeploy, which is fine
+// for this app's scale. Applied to auth-adjacent endpoints that would
+// otherwise be brute-forceable (login, verification codes, signup).
+function rateLimit({ windowMs, max, message }) {
+  const hits = new Map();
+  setInterval(() => {
+    const cutoff = Date.now() - windowMs;
+    for (const [key, entry] of hits) {
+      if (entry.start < cutoff) hits.delete(key);
+    }
+  }, Math.max(windowMs, 60000)).unref();
+  return (req, res, next) => {
+    const key = getClientIp(req) || "unknown";
+    const now = Date.now();
+    const entry = hits.get(key);
+    if (!entry || now - entry.start > windowMs) {
+      hits.set(key, { start: now, count: 1 });
+      return next();
+    }
+    entry.count++;
+    if (entry.count > max) {
+      return res.status(429).json({ error: message || "Too many attempts — please wait a bit and try again." });
+    }
+    next();
+  };
+}
+
+const authRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: "Too many attempts — please wait 15 minutes and try again." });
+const codeRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 8, message: "Too many attempts — please wait 15 minutes and try again." });
 
 // Returns true (VPN/proxy/Tor detected), false (clean), or null (couldn't
 // check — caller should fail open rather than lock everyone out over a
@@ -216,10 +264,17 @@ app.post("/phone-verify/check", async (req, res) => {
 const emailCodes = new Map();
 const EMAIL_CODE_TTL_MS = 15 * 60 * 1000;
 
+// Records emails that have actually passed /email-verify/check, so /signup
+// can trust this instead of a client-supplied "emailVerified" flag — which
+// could otherwise be sent as true directly via the API without ever
+// checking a code. Entries are consumed (deleted) once used for a signup.
+const verifiedEmails = new Map();
+const EMAIL_VERIFIED_TTL_MS = 30 * 60 * 1000;
+
 // Sends a real verification email via Resend. Phone/SMS verification is
 // paused for now (Termii country-activation issues) — email is the primary
 // verification channel while Stallyard focuses on Nigeria.
-app.post("/email-verify/send", async (req, res) => {
+app.post("/email-verify/send", codeRateLimit, async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: "Missing email address" });
@@ -255,7 +310,7 @@ app.post("/email-verify/send", async (req, res) => {
 });
 
 // Checks the code the user typed in against our record for that email.
-app.post("/email-verify/check", async (req, res) => {
+app.post("/email-verify/check", codeRateLimit, async (req, res) => {
   try {
     const { email, code } = req.body;
     if (!email || !code) return res.status(400).json({ error: "Missing email or code" });
@@ -265,8 +320,115 @@ app.post("/email-verify/check", async (req, res) => {
       return res.status(400).json({ error: "That code has expired — request a new one" });
     }
     const valid = stored.code === String(code).trim();
-    if (valid) emailCodes.delete(email.toLowerCase());
+    if (valid) {
+      emailCodes.delete(email.toLowerCase());
+      verifiedEmails.set(email.toLowerCase(), Date.now());
+    }
     res.json({ valid });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// In-memory store for password reset codes, mirroring the email-verify
+// pattern above. Keyed by lowercased username.
+const passwordResetCodes = new Map();
+const PASSWORD_RESET_CODE_TTL_MS = 15 * 60 * 1000;
+
+// Step 1: look up the account by username, email the code to the address
+// on file. Deliberately doesn't reveal the email address itself in the
+// response beyond a masked preview, and doesn't let the frontend supply
+// its own code — everything here is server-generated and server-checked.
+app.post("/password-reset/send", authRateLimit, async (req, res) => {
+  try {
+    const { username } = req.body;
+    if (!username) return res.status(400).json({ error: "Enter your username" });
+    if (!process.env.RESEND_API_KEY) {
+      return res.status(500).json({ error: "Password reset isn't configured yet" });
+    }
+    const key = username.trim().toLowerCase();
+    const result = await pool.query("SELECT email FROM users WHERE username = $1", [key]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "We couldn't find an account with that username" });
+    }
+    const email = result.rows[0].email;
+    if (!email) {
+      return res.status(400).json({ error: "This account has no email on file — contact support to recover it" });
+    }
+
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
+    const resendRes = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
+      body: JSON.stringify({
+        from: fromAddress,
+        to: [email],
+        subject: `Your Stallyard password reset code is ${code}`,
+        html: `<p>Your Stallyard password reset code is <strong>${code}</strong>.</p><p>This code expires in 15 minutes. If you didn't request this, you can ignore this email — your password won't change.</p>`,
+      }),
+    });
+    const data = await resendRes.json();
+    if (!resendRes.ok) {
+      return res.status(400).json({ error: data.message || "Couldn't send that email — try again" });
+    }
+    passwordResetCodes.set(key, { code, sentAt: Date.now() });
+    const maskedEmail = email.replace(/^(.{1,2}).*(@.*)$/, (m, a, b) => `${a}***${b}`);
+    res.json({ success: true, maskedEmail });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Step 2: check the code. On success, issues a short-lived reset token
+// (10 min) rather than letting the frontend hold onto the raw code — the
+// code itself is single-use and deleted here either way.
+app.post("/password-reset/verify-code", codeRateLimit, async (req, res) => {
+  try {
+    const { username, code } = req.body;
+    if (!username || !code) return res.status(400).json({ error: "Missing username or code" });
+    const key = username.trim().toLowerCase();
+    const stored = passwordResetCodes.get(key);
+    if (!stored || Date.now() - stored.sentAt > PASSWORD_RESET_CODE_TTL_MS) {
+      return res.status(400).json({ error: "That code has expired — request a new one" });
+    }
+    if (stored.code !== String(code).trim()) {
+      return res.status(400).json({ error: "That code doesn't match — check and try again" });
+    }
+    passwordResetCodes.delete(key);
+    const userResult = await pool.query("SELECT id FROM users WHERE username = $1", [key]);
+    if (userResult.rows.length === 0) return res.status(404).json({ error: "Account not found" });
+    const resetToken = jwt.sign({ type: "password_reset", userId: userResult.rows[0].id }, JWT_SECRET, { expiresIn: "10m" });
+    res.json({ resetToken });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Step 3: the actual password change. Requires the short-lived reset token
+// from step 2, not just a username — this is what makes the flow real,
+// versus the old version which never touched the database at all.
+app.post("/password-reset/confirm", authRateLimit, async (req, res) => {
+  try {
+    const { resetToken, newPassword } = req.body;
+    if (!resetToken || !newPassword) return res.status(400).json({ error: "Missing reset token or new password" });
+    if (newPassword.length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
+    let decoded;
+    try {
+      decoded = jwt.verify(resetToken, JWT_SECRET);
+    } catch {
+      return res.status(401).json({ error: "That reset session has expired — start over" });
+    }
+    if (decoded.type !== "password_reset") {
+      return res.status(401).json({ error: "Invalid reset token" });
+    }
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    const result = await pool.query(
+      "UPDATE users SET password_hash = $1 WHERE id = $2 RETURNING id",
+      [passwordHash, decoded.userId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Account not found" });
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -285,10 +447,24 @@ app.get("/db-check", async (req, res) => {
   }
 });
 
+// Migration endpoints are visited directly in the browser (no way to send
+// an Authorization header that way), so they're protected by a shared key
+// in the URL instead of the normal Bearer-token auth. Set MIGRATION_KEY in
+// Railway's Variables tab, then visit /migrate/whatever?key=that-value.
+function requireMigrationKey(req, res, next) {
+  if (!process.env.MIGRATION_KEY) {
+    return res.status(500).send("MIGRATION_KEY isn't set in Railway — add it under Variables before running migrations.");
+  }
+  if (req.query.key !== process.env.MIGRATION_KEY) {
+    return res.status(403).send("Missing or incorrect ?key= — check MIGRATION_KEY in Railway's Variables tab.");
+  }
+  next();
+}
+
 // One-time migration: adds the columns needed for account type, ID
 // verification documents, and admin-facing member data. Safe to visit
 // more than once — IF NOT EXISTS means it won't duplicate anything.
-app.get("/migrate/members-extra", async (req, res) => {
+app.get("/migrate/members-extra", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
       ALTER TABLE users
@@ -307,7 +483,7 @@ app.get("/migrate/members-extra", async (req, res) => {
 });
 
 // One-time migration: creates the follows table (seller storefront follow/unfollow).
-app.get("/migrate/follows", async (req, res) => {
+app.get("/migrate/follows", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS follows (
@@ -327,7 +503,7 @@ app.get("/migrate/follows", async (req, res) => {
 // One-time migration: adds every field a real listing needs (images, auctions,
 // currency, fitment, status, featured flag) that the original listings table
 // didn't have.
-app.get("/migrate/listings-extra", async (req, res) => {
+app.get("/migrate/listings-extra", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
       ALTER TABLE listings
@@ -352,7 +528,7 @@ app.get("/migrate/listings-extra", async (req, res) => {
 
 // One-time migration: real multi-seller cart orders, per-item payout tracking,
 // and a withdrawals ledger with server-computed balances.
-app.get("/migrate/orders-wallet", async (req, res) => {
+app.get("/migrate/orders-wallet", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
       ALTER TABLE orders
@@ -404,7 +580,7 @@ app.get("/migrate/orders-wallet", async (req, res) => {
 
 // One-time migration: cart and watchlist tables, so they follow the user
 // across devices instead of living only in one browser's local storage.
-app.get("/migrate/signup-stages", async (req, res) => {
+app.get("/migrate/signup-stages", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
       ALTER TABLE users
@@ -420,7 +596,7 @@ app.get("/migrate/signup-stages", async (req, res) => {
   }
 });
 
-app.get("/migrate/seller-verification", async (req, res) => {
+app.get("/migrate/seller-verification", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
       ALTER TABLE users
@@ -443,7 +619,7 @@ app.get("/migrate/seller-verification", async (req, res) => {
   }
 });
 
-app.get("/migrate/listings-extra-fields", async (req, res) => {
+app.get("/migrate/listings-extra-fields", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
       ALTER TABLE listings
@@ -461,7 +637,7 @@ app.get("/migrate/listings-extra-fields", async (req, res) => {
   }
 });
 
-app.get("/migrate/order-management", async (req, res) => {
+app.get("/migrate/order-management", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
       ALTER TABLE order_items
@@ -474,7 +650,7 @@ app.get("/migrate/order-management", async (req, res) => {
   }
 });
 
-app.get("/migrate/cart-watchlist", async (req, res) => {
+app.get("/migrate/cart-watchlist", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS cart_items (
@@ -507,14 +683,21 @@ app.get("/migrate/cart-watchlist", async (req, res) => {
 // the user can log in and resume that at any time since profile_complete
 // starts false. Email must already be verified (via /email-verify/send +
 // /email-verify/check) before this is called.
-app.post("/signup", async (req, res) => {
+app.post("/signup", authRateLimit, async (req, res) => {
   try {
-    const { username, email, password, emailVerified, displayName } = req.body;
+    const { username, email, password, displayName } = req.body;
 
     if (!username || !email || !password) {
       return res.status(400).json({ error: "Missing required fields" });
     }
-    if (!emailVerified) {
+    if (password.length < 8) {
+      return res.status(400).json({ error: "Password must be at least 8 characters" });
+    }
+    // Trust our own record of a passed /email-verify/check, not a
+    // client-supplied "emailVerified" flag — that could be sent as true
+    // directly via the API without ever checking a code.
+    const verifiedAt = verifiedEmails.get(email.toLowerCase());
+    if (!verifiedAt || Date.now() - verifiedAt > EMAIL_VERIFIED_TTL_MS) {
       return res.status(400).json({ error: "Verify your email before creating an account" });
     }
 
@@ -540,6 +723,7 @@ app.post("/signup", async (req, res) => {
       [username, email, passwordHash, displayName || username, isFirstUser, isFirstUser]
     );
 
+    verifiedEmails.delete(email.toLowerCase());
     res.status(201).json({ user: result.rows[0], token: signToken(result.rows[0]) });
   } catch (err) {
     if (err.code === "23505") {
@@ -917,7 +1101,7 @@ app.put("/watchlist", authenticate, async (req, res) => {
   }
 });
 
-app.post("/login", async (req, res) => {
+app.post("/login", authRateLimit, async (req, res) => {
   try {
     const { username, password } = req.body;
 
@@ -1288,6 +1472,17 @@ app.patch("/orders/:id/refund", authenticate, requireAdmin, async (req, res) => 
 app.patch("/orders/:id/dispute", authenticate, async (req, res) => {
   try {
     const { isDisputed } = req.body;
+    const orderCheck = await pool.query("SELECT buyer_id FROM orders WHERE id = $1", [req.params.id]);
+    if (orderCheck.rows.length === 0) return res.status(404).json({ error: "Order not found" });
+    if (!req.user.isAdmin && orderCheck.rows[0].buyer_id !== req.user.id) {
+      const sellerCheck = await pool.query(
+        "SELECT 1 FROM order_items WHERE order_id = $1 AND seller_id = $2 LIMIT 1",
+        [req.params.id, req.user.id]
+      );
+      if (sellerCheck.rows.length === 0) {
+        return res.status(403).json({ error: "You can only dispute orders you're part of" });
+      }
+    }
     const result = await pool.query(
       "UPDATE orders SET is_disputed = $1 WHERE id = $2 RETURNING *",
       [!!isDisputed, req.params.id]
@@ -1436,13 +1631,17 @@ const crypto = require("crypto");
 
 app.post("/webhook/paystack", async (req, res) => {
   try {
-    const signature = req.headers["x-paystack-signature"];
+    const signature = req.headers["x-paystack-signature"] || "";
     const expectedSignature = crypto
       .createHmac("sha512", process.env.PAYSTACK_SECRET_KEY)
       .update(req.rawBody)
       .digest("hex");
 
-    if (signature !== expectedSignature) {
+    const signatureBuf = Buffer.from(signature);
+    const expectedBuf = Buffer.from(expectedSignature);
+    const validSignature =
+      signatureBuf.length === expectedBuf.length && crypto.timingSafeEqual(signatureBuf, expectedBuf);
+    if (!validSignature) {
       return res.status(401).send("Invalid signature");
     }
 
