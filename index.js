@@ -790,6 +790,23 @@ app.get("/migrate/notifications", requireMigrationKey, async (req, res) => {
   }
 });
 
+app.get("/migrate/login-history", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS login_history (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        ip TEXT,
+        user_agent TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    res.send("Migration complete: login_history table created.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/cart-watchlist", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -1332,6 +1349,11 @@ app.post("/login", authRateLimit, async (req, res) => {
     }
 
     delete user.password_hash;
+    const ip = getClientIp(req);
+    const userAgent = req.headers["user-agent"] || "";
+    pool
+      .query("INSERT INTO login_history (user_id, ip, user_agent) VALUES ($1, $2, $3)", [user.id, ip, userAgent])
+      .catch((err) => console.error("Failed to record login history:", err.message));
     res.json({ user, token: signToken(user) });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2727,6 +2749,18 @@ app.get("/sellers/:username/completed-sales-count", async (req, res) => {
       [req.params.username]
     );
     res.json({ count: Number(result.rows[0].count) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/login-history/mine", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM login_history WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20",
+      [req.user.id]
+    );
+    res.json({ history: result.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
