@@ -435,6 +435,77 @@ const PASSWORD_RESET_CODE_TTL_MS = 15 * 60 * 1000;
 const twoFactorCodes = new Map();
 const TWO_FACTOR_CODE_TTL_MS = 10 * 60 * 1000;
 
+// Codes for the "turn two-factor ON" flow specifically — kept separate from
+// twoFactorCodes above so an in-progress enable doesn't collide with an
+// in-progress login or admin-reauth code for the same account.
+const twoFactorEnableCodes = new Map();
+
+// --- TOTP (RFC 6238) helpers for admin Google Authenticator 2FA ---
+// This is the same 6-digit, 30-second-step algorithm Google Authenticator,
+// Authy, and 1Password all implement. Written directly on Node's built-in
+// crypto module so no extra npm dependency is needed.
+const crypto = require("crypto");
+const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+function base32Encode(buffer) {
+  let bits = "";
+  for (const byte of buffer) bits += byte.toString(2).padStart(8, "0");
+  let output = "";
+  for (let i = 0; i + 5 <= bits.length; i += 5) {
+    output += BASE32_ALPHABET[parseInt(bits.slice(i, i + 5), 2)];
+  }
+  const remainder = bits.length % 5;
+  if (remainder) {
+    output += BASE32_ALPHABET[parseInt(bits.slice(bits.length - remainder).padEnd(5, "0"), 2)];
+  }
+  return output;
+}
+
+function base32Decode(input) {
+  const clean = String(input || "").toUpperCase().replace(/[^A-Z2-7]/g, "");
+  let bits = "";
+  for (const char of clean) {
+    const val = BASE32_ALPHABET.indexOf(char);
+    if (val === -1) continue;
+    bits += val.toString(2).padStart(5, "0");
+  }
+  const bytes = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) {
+    bytes.push(parseInt(bits.slice(i, i + 8), 2));
+  }
+  return Buffer.from(bytes);
+}
+
+function generateTotpSecret() {
+  return base32Encode(crypto.randomBytes(20));
+}
+
+function totpCodeForCounter(secretBuffer, counter) {
+  const counterBuffer = Buffer.alloc(8);
+  counterBuffer.writeBigUInt64BE(BigInt(counter));
+  const hmac = crypto.createHmac("sha1", secretBuffer).update(counterBuffer).digest();
+  const offset = hmac[hmac.length - 1] & 0xf;
+  const binCode =
+    ((hmac[offset] & 0x7f) << 24) |
+    ((hmac[offset + 1] & 0xff) << 16) |
+    ((hmac[offset + 2] & 0xff) << 8) |
+    (hmac[offset + 3] & 0xff);
+  return String(binCode % 1000000).padStart(6, "0");
+}
+
+// Allows one 30-second step of drift either way, which is standard practice
+// for TOTP since phone clocks and server clocks are never perfectly synced.
+function verifyTotpCode(base32Secret, code) {
+  const cleanCode = String(code || "").trim();
+  if (!/^\d{6}$/.test(cleanCode)) return false;
+  const secretBuffer = base32Decode(base32Secret);
+  const counter = Math.floor(Date.now() / 1000 / 30);
+  for (let drift = -1; drift <= 1; drift++) {
+    if (totpCodeForCounter(secretBuffer, counter + drift) === cleanCode) return true;
+  }
+  return false;
+}
+
 // Pending bank-account changes awaiting email confirmation — only required
 // when *changing* an existing account on file, not the first-time setup.
 // Keyed by user id; holds the new details until the code is confirmed.
@@ -911,6 +982,17 @@ app.get("/migrate/two-factor", requireMigrationKey, async (req, res) => {
   }
 });
 
+app.get("/migrate/totp", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret TEXT
+    `);
+    res.send("Migration complete: totp_secret column added to users.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/phone-verified", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -1295,24 +1377,22 @@ app.post("/profile/sign-out-other-devices", authenticate, async (req, res) => {
   }
 });
 
-// Turning it on requires the account to have a verified email on file —
-// that's where codes go. Turning it off just requires being logged in
-// (already a meaningful bar, since you're authenticated to call this).
+// Turning it OFF just requires being logged in (already a meaningful bar,
+// since you're authenticated to call this) and isn't available to admins.
+// Turning it ON is handled by the two endpoints below instead — this one
+// rejects enable attempts so nothing can flip it on without a verified code.
 app.patch("/profile/two-factor", authenticate, async (req, res) => {
   try {
     const { enabled } = req.body;
     if (enabled) {
-      const check = await pool.query("SELECT email FROM users WHERE id = $1", [req.user.id]);
-      if (!check.rows.length || !check.rows[0].email) {
-        return res.status(400).json({ error: "Add a verified email to your account before turning this on" });
-      }
+      return res.status(400).json({ error: "Use /profile/two-factor/enable/send to turn this on" });
     }
-    if (!enabled && req.user.isAdmin) {
+    if (req.user.isAdmin) {
       return res.status(403).json({ error: "Admin accounts can't turn off two-factor authentication" });
     }
     const result = await pool.query(
-      "UPDATE users SET two_factor_enabled = $1 WHERE id = $2 RETURNING two_factor_enabled",
-      [!!enabled, req.user.id]
+      "UPDATE users SET two_factor_enabled = false WHERE id = $1 RETURNING two_factor_enabled",
+      [req.user.id]
     );
     if (!result.rows.length) return res.status(404).json({ error: "Account not found" });
     res.json({ twoFactorEnabled: result.rows[0].two_factor_enabled });
@@ -1321,25 +1401,21 @@ app.patch("/profile/two-factor", authenticate, async (req, res) => {
   }
 });
 
-// Re-authentication gate for entering the admin panel. Being logged in
-// normally isn't enough — opening Admin requires proving it's really you,
-// right then, even with a valid 30-day session. Step 1: password.
-app.post("/admin/reauth", authenticate, authRateLimit, async (req, res) => {
+// Step 1 of turning two-factor ON: email a code to the address on file.
+// Doesn't touch two_factor_enabled yet — that only flips once the code
+// below is verified, so "on" always means a code was actually confirmed.
+// Admin accounts don't use this — they set up an authenticator app instead,
+// via /admin/totp/setup below.
+app.post("/profile/two-factor/enable/send", authenticate, async (req, res) => {
   try {
-    if (!req.user.isAdmin) return res.status(403).json({ error: "Admin access required" });
-    const { password } = req.body;
-    if (!password) return res.status(400).json({ error: "Enter your password" });
-    const result = await pool.query("SELECT password_hash, email, two_factor_enabled FROM users WHERE id = $1", [req.user.id]);
-    if (!result.rows.length) return res.status(404).json({ error: "Account not found" });
-    const matches = await bcrypt.compare(password, result.rows[0].password_hash);
-    if (!matches) return res.status(401).json({ error: "Password doesn't match" });
-
-    if (!result.rows[0].two_factor_enabled) {
-      // Shouldn't normally happen since 2FA is required for admin actions,
-      // but handle it rather than leaving a dead end.
-      return res.json({ success: true });
+    if (req.user.isAdmin) {
+      return res.status(400).json({ error: "Admin accounts use an authenticator app — see /admin/totp/setup" });
     }
-    if (!result.rows[0].email || !process.env.RESEND_API_KEY) {
+    const check = await pool.query("SELECT email FROM users WHERE id = $1", [req.user.id]);
+    if (!check.rows.length || !check.rows[0].email) {
+      return res.status(400).json({ error: "Add a verified email to your account before turning this on" });
+    }
+    if (!process.env.RESEND_API_KEY) {
       return res.status(500).json({ error: "Two-factor isn't configured — contact support" });
     }
     const code = Math.floor(100000 + Math.random() * 900000).toString();
@@ -1349,34 +1425,131 @@ app.post("/admin/reauth", authenticate, authRateLimit, async (req, res) => {
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
       body: JSON.stringify({
         from: fromAddress,
-        to: [result.rows[0].email],
-        subject: `Your Stallyard admin access code is ${code}`,
-        html: `<p>Your code to unlock the admin panel is <strong>${code}</strong>.</p><p>Expires in 10 minutes. If this wasn't you, change your password immediately.</p>`,
+        to: [check.rows[0].email],
+        subject: `Your Stallyard two-factor code is ${code}`,
+        html: `<p>Your code to turn on two-factor authentication is <strong>${code}</strong>.</p><p>Expires in 10 minutes. If this wasn't you, change your password immediately.</p>`,
       }),
     });
     if (!resendRes.ok) {
       return res.status(400).json({ error: "Couldn't send your code — try again" });
     }
-    twoFactorCodes.set(req.user.id, { code, sentAt: Date.now() });
-    res.json({ twoFactorRequired: true });
+    twoFactorEnableCodes.set(req.user.id, { code, sentAt: Date.now() });
+    res.json({ sent: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Step 2: the code from that email actually unlocks the panel.
-app.post("/admin/reauth/verify", authenticate, authRateLimit, async (req, res) => {
+// Step 2: the emailed code actually turns two-factor on.
+app.post("/profile/two-factor/enable/verify", authenticate, async (req, res) => {
   try {
-    if (!req.user.isAdmin) return res.status(403).json({ error: "Admin access required" });
+    if (req.user.isAdmin) {
+      return res.status(400).json({ error: "Admin accounts use an authenticator app — see /admin/totp/setup" });
+    }
     const { code } = req.body;
-    const stored = twoFactorCodes.get(req.user.id);
+    const stored = twoFactorEnableCodes.get(req.user.id);
     if (!stored || Date.now() - stored.sentAt > TWO_FACTOR_CODE_TTL_MS) {
-      return res.status(400).json({ error: "That code has expired — start over" });
+      return res.status(400).json({ error: "That code has expired — request a new one" });
     }
     if (stored.code !== String(code || "").trim()) {
       return res.status(400).json({ error: "That code doesn't match" });
     }
-    twoFactorCodes.delete(req.user.id);
+    twoFactorEnableCodes.delete(req.user.id);
+    const result = await pool.query(
+      "UPDATE users SET two_factor_enabled = true WHERE id = $1 RETURNING two_factor_enabled",
+      [req.user.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: "Account not found" });
+    res.json({ twoFactorEnabled: result.rows[0].two_factor_enabled });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin-only: step 1 of setting up an authenticator app (Google Authenticator,
+// Authy, 1Password, etc). Generates a fresh secret and stores it unconfirmed —
+// two_factor_enabled only flips once the code from the app is verified below,
+// so a half-finished setup never silently counts as "on."
+app.post("/admin/totp/setup", authenticate, async (req, res) => {
+  try {
+    if (!req.user.isAdmin) return res.status(403).json({ error: "Admin access required" });
+    const secret = generateTotpSecret();
+    await pool.query("UPDATE users SET totp_secret = $1 WHERE id = $2", [secret, req.user.id]);
+    const label = encodeURIComponent(`Stallyard:${req.user.username}`);
+    const issuer = encodeURIComponent("Stallyard");
+    const otpauthUrl = `otpauth://totp/${label}?secret=${secret}&issuer=${issuer}&algorithm=SHA1&digits=6&period=30`;
+    const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(otpauthUrl)}`;
+    res.json({ secret, otpauthUrl, qrCodeUrl });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin-only: step 2 — the 6-digit code the app is now generating confirms
+// setup and actually turns two-factor on for this admin account.
+app.post("/admin/totp/confirm", authenticate, async (req, res) => {
+  try {
+    if (!req.user.isAdmin) return res.status(403).json({ error: "Admin access required" });
+    const { code } = req.body;
+    const result = await pool.query("SELECT totp_secret FROM users WHERE id = $1", [req.user.id]);
+    if (!result.rows.length || !result.rows[0].totp_secret) {
+      return res.status(400).json({ error: "Start setup again — no pending authenticator secret found" });
+    }
+    if (!verifyTotpCode(result.rows[0].totp_secret, code)) {
+      return res.status(400).json({ error: "That code doesn't match — check your authenticator app and try again" });
+    }
+    const updated = await pool.query(
+      "UPDATE users SET two_factor_enabled = true WHERE id = $1 RETURNING two_factor_enabled",
+      [req.user.id]
+    );
+    res.json({ twoFactorEnabled: updated.rows[0].two_factor_enabled });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// Re-authentication gate for entering the admin panel. Being logged in
+// normally isn't enough — opening Admin requires proving it's really you,
+// right then, even with a valid 30-day session. Step 1: password.
+app.post("/admin/reauth", authenticate, authRateLimit, async (req, res) => {
+  try {
+    if (!req.user.isAdmin) return res.status(403).json({ error: "Admin access required" });
+    const { password } = req.body;
+    if (!password) return res.status(400).json({ error: "Enter your password" });
+    const result = await pool.query("SELECT password_hash, two_factor_enabled, totp_secret FROM users WHERE id = $1", [req.user.id]);
+    if (!result.rows.length) return res.status(404).json({ error: "Account not found" });
+    const matches = await bcrypt.compare(password, result.rows[0].password_hash);
+    if (!matches) return res.status(401).json({ error: "Password doesn't match" });
+
+    if (!result.rows[0].two_factor_enabled) {
+      // Shouldn't normally happen since 2FA is required for admin actions,
+      // but handle it rather than leaving a dead end.
+      return res.json({ success: true });
+    }
+    if (!result.rows[0].totp_secret) {
+      return res.status(500).json({ error: "Two-factor isn't configured — contact support" });
+    }
+    // Nothing to send — the code already exists on the admin's authenticator
+    // app. Just tell the frontend to show the code-entry step.
+    res.json({ twoFactorRequired: true, method: "totp" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Step 2: the code from the authenticator app actually unlocks the panel.
+app.post("/admin/reauth/verify", authenticate, authRateLimit, async (req, res) => {
+  try {
+    if (!req.user.isAdmin) return res.status(403).json({ error: "Admin access required" });
+    const { code } = req.body;
+    const result = await pool.query("SELECT totp_secret FROM users WHERE id = $1", [req.user.id]);
+    if (!result.rows.length || !result.rows[0].totp_secret) {
+      return res.status(400).json({ error: "No authenticator set up — contact support" });
+    }
+    if (!verifyTotpCode(result.rows[0].totp_secret, code)) {
+      return res.status(400).json({ error: "That code doesn't match" });
+    }
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1773,7 +1946,8 @@ app.post("/login", authRateLimit, async (req, res) => {
     const result = await pool.query(
       `SELECT id, username, email, phone, password_hash, display_name, first_name, last_name, office_location,
          country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
-         license_number, license_photos, id_verification_exempt, created_at, two_factor_enabled, token_version
+         license_number, license_photos, id_verification_exempt, created_at, two_factor_enabled, token_version,
+         totp_secret
        FROM users WHERE username = $1`,
       [username]
     );
@@ -1799,6 +1973,15 @@ app.post("/login", authRateLimit, async (req, res) => {
     }
 
     if (user.two_factor_enabled) {
+      if (user.is_admin) {
+        // Admin accounts use an authenticator app — nothing to send, the
+        // code already exists on their phone. Just tell the frontend to
+        // show the code-entry step.
+        if (!user.totp_secret) {
+          return res.status(500).json({ error: "Two-factor is on but no authenticator is set up — contact support" });
+        }
+        return res.json({ twoFactorRequired: true, userId: user.id, method: "totp" });
+      }
       if (!user.email) {
         return res.status(400).json({ error: "Two-factor is on but this account has no email on file — contact support." });
       }
@@ -1821,7 +2004,7 @@ app.post("/login", authRateLimit, async (req, res) => {
         return res.status(400).json({ error: "Couldn't send your login code — try again" });
       }
       twoFactorCodes.set(user.id, { code, sentAt: Date.now() });
-      return res.json({ twoFactorRequired: true, userId: user.id });
+      return res.json({ twoFactorRequired: true, userId: user.id, method: "email" });
     }
 
     delete user.password_hash;
@@ -1836,30 +2019,41 @@ app.post("/login", authRateLimit, async (req, res) => {
   }
 });
 
-// Step 2 of a two-factor login: check the emailed code, then actually
-// issue the session token — mirrors what /login does for accounts without
-// two-factor turned on, including recording login history.
+// Step 2 of a two-factor login: check the code (authenticator app for
+// admins, emailed code for everyone else), then actually issue the session
+// token — mirrors what /login does for accounts without two-factor on,
+// including recording login history.
 app.post("/login/verify-2fa", authRateLimit, async (req, res) => {
   try {
     const { userId, code } = req.body;
     if (!userId || !code) return res.status(400).json({ error: "Missing userId or code" });
-    const stored = twoFactorCodes.get(Number(userId));
-    if (!stored || Date.now() - stored.sentAt > TWO_FACTOR_CODE_TTL_MS) {
-      return res.status(400).json({ error: "That code has expired — log in again to get a new one" });
-    }
-    if (stored.code !== String(code).trim()) {
-      return res.status(400).json({ error: "That code doesn't match — check and try again" });
-    }
-    twoFactorCodes.delete(Number(userId));
+
     const result = await pool.query(
       `SELECT id, username, email, phone, display_name, first_name, last_name, office_location,
          country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
-         license_number, license_photos, id_verification_exempt, created_at, token_version
+         license_number, license_photos, id_verification_exempt, created_at, token_version, totp_secret
        FROM users WHERE id = $1`,
       [userId]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Account not found" });
     const user = result.rows[0];
+
+    if (user.is_admin) {
+      if (!user.totp_secret || !verifyTotpCode(user.totp_secret, code)) {
+        return res.status(400).json({ error: "That code doesn't match — check your authenticator app and try again" });
+      }
+    } else {
+      const stored = twoFactorCodes.get(Number(userId));
+      if (!stored || Date.now() - stored.sentAt > TWO_FACTOR_CODE_TTL_MS) {
+        return res.status(400).json({ error: "That code has expired — log in again to get a new one" });
+      }
+      if (stored.code !== String(code).trim()) {
+        return res.status(400).json({ error: "That code doesn't match — check and try again" });
+      }
+      twoFactorCodes.delete(Number(userId));
+    }
+
+    delete user.totp_secret;
     const ip = getClientIp(req);
     const userAgent = req.headers["user-agent"] || "";
     pool
@@ -2642,7 +2836,6 @@ app.post("/checkout/single-item-payment", authenticate, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-const crypto = require("crypto");
 
 app.post("/webhook/paystack", async (req, res) => {
   try {
