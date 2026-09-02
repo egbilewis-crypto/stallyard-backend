@@ -440,6 +440,12 @@ const TWO_FACTOR_CODE_TTL_MS = 10 * 60 * 1000;
 // in-progress login or admin-reauth code for the same account.
 const twoFactorEnableCodes = new Map();
 
+// Marks that an admin has passed the authenticator-app step during login or
+// admin-reauth, so the mandatory email step can't be reached by calling it
+// directly — both factors are required, in order.
+const totpVerifiedMarkers = new Map();
+const TOTP_VERIFIED_MARKER_TTL_MS = 10 * 60 * 1000;
+
 // --- TOTP (RFC 6238) helpers for admin Google Authenticator 2FA ---
 // This is the same 6-digit, 30-second-step algorithm Google Authenticator,
 // Authy, and 1Password all implement. Written directly on Node's built-in
@@ -1538,18 +1544,67 @@ app.post("/admin/reauth", authenticate, authRateLimit, async (req, res) => {
   }
 });
 
-// Step 2: the code from the authenticator app actually unlocks the panel.
+// Step 2: the authenticator app code. On success this does NOT unlock the
+// panel yet — it auto-sends an email code and requires that too, via
+// /admin/reauth/verify-email below. Both factors are mandatory.
 app.post("/admin/reauth/verify", authenticate, authRateLimit, async (req, res) => {
   try {
     if (!req.user.isAdmin) return res.status(403).json({ error: "Admin access required" });
     const { code } = req.body;
-    const result = await pool.query("SELECT totp_secret FROM users WHERE id = $1", [req.user.id]);
-    if (!result.rows.length || !result.rows[0].totp_secret) {
-      return res.status(400).json({ error: "No authenticator set up — contact support" });
+    const result = await pool.query("SELECT email, totp_secret FROM users WHERE id = $1", [req.user.id]);
+    if (!result.rows.length) return res.status(404).json({ error: "Account not found" });
+
+    if (!result.rows[0].totp_secret || !verifyTotpCode(result.rows[0].totp_secret, code)) {
+      return res.status(400).json({ error: "That code doesn't match — check your authenticator app and try again" });
     }
-    if (!verifyTotpCode(result.rows[0].totp_secret, code)) {
+    if (!result.rows[0].email) {
+      return res.status(400).json({ error: "This account has no email on file — contact support" });
+    }
+    if (!process.env.RESEND_API_KEY) {
+      return res.status(500).json({ error: "Email step isn't configured — contact support" });
+    }
+    const emailCode = Math.floor(100000 + Math.random() * 900000).toString();
+    const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
+    const resendRes = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
+      body: JSON.stringify({
+        from: fromAddress,
+        to: [result.rows[0].email],
+        subject: `Your Stallyard admin access code is ${emailCode}`,
+        html: `<p>Your code to unlock the admin panel is <strong>${emailCode}</strong>.</p><p>Expires in 10 minutes. If this wasn't you, change your password immediately.</p>`,
+      }),
+    });
+    if (!resendRes.ok) {
+      return res.status(400).json({ error: "Couldn't send the email step's code — try again" });
+    }
+    twoFactorCodes.set(req.user.id, { code: emailCode, sentAt: Date.now() });
+    totpVerifiedMarkers.set(req.user.id, Date.now());
+    res.json({ emailStepRequired: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Step 3: the emailed code. Only reachable after the authenticator step
+// above set a fresh marker — can't be called on its own to skip it.
+app.post("/admin/reauth/verify-email", authenticate, authRateLimit, async (req, res) => {
+  try {
+    if (!req.user.isAdmin) return res.status(403).json({ error: "Admin access required" });
+    const { code } = req.body;
+    const marker = totpVerifiedMarkers.get(req.user.id);
+    if (!marker || Date.now() - marker > TOTP_VERIFIED_MARKER_TTL_MS) {
+      return res.status(400).json({ error: "Your authenticator step expired — start over" });
+    }
+    const stored = twoFactorCodes.get(req.user.id);
+    if (!stored || Date.now() - stored.sentAt > TWO_FACTOR_CODE_TTL_MS) {
+      return res.status(400).json({ error: "That email code has expired — start over" });
+    }
+    if (stored.code !== String(code || "").trim()) {
       return res.status(400).json({ error: "That code doesn't match" });
     }
+    twoFactorCodes.delete(req.user.id);
+    totpVerifiedMarkers.delete(req.user.id);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2023,6 +2078,9 @@ app.post("/login", authRateLimit, async (req, res) => {
 // admins, emailed code for everyone else), then actually issue the session
 // token — mirrors what /login does for accounts without two-factor on,
 // including recording login history.
+// Step 2 of admin login: check the authenticator app code. On success this
+// does NOT log the admin in yet — it auto-sends an email code and requires
+// that too, via /login/verify-2fa-email below. Both factors are mandatory.
 app.post("/login/verify-2fa", authRateLimit, async (req, res) => {
   try {
     const { userId, code } = req.body;
@@ -2042,18 +2100,84 @@ app.post("/login/verify-2fa", authRateLimit, async (req, res) => {
       if (!user.totp_secret || !verifyTotpCode(user.totp_secret, code)) {
         return res.status(400).json({ error: "That code doesn't match — check your authenticator app and try again" });
       }
-    } else {
-      const stored = twoFactorCodes.get(Number(userId));
-      if (!stored || Date.now() - stored.sentAt > TWO_FACTOR_CODE_TTL_MS) {
-        return res.status(400).json({ error: "That code has expired — log in again to get a new one" });
+      if (!user.email) {
+        return res.status(400).json({ error: "Two-factor is on but this account has no email on file — contact support." });
       }
-      if (stored.code !== String(code).trim()) {
-        return res.status(400).json({ error: "That code doesn't match — check and try again" });
+      if (!process.env.RESEND_API_KEY) {
+        return res.status(500).json({ error: "Email step isn't configured — contact support" });
       }
-      twoFactorCodes.delete(Number(userId));
+      const emailCode = Math.floor(100000 + Math.random() * 900000).toString();
+      const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
+      const resendRes = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
+        body: JSON.stringify({
+          from: fromAddress,
+          to: [user.email],
+          subject: `Your Stallyard login code is ${emailCode}`,
+          html: `<p>Your Stallyard login code is <strong>${emailCode}</strong>.</p><p>This code expires in 10 minutes. If this wasn't you, change your password right away.</p>`,
+        }),
+      });
+      if (!resendRes.ok) {
+        return res.status(400).json({ error: "Couldn't send the email step's code — try again" });
+      }
+      twoFactorCodes.set(Number(userId), { code: emailCode, sentAt: Date.now() });
+      totpVerifiedMarkers.set(Number(userId), Date.now());
+      return res.json({ emailStepRequired: true, userId: user.id });
     }
 
+    const stored = twoFactorCodes.get(Number(userId));
+    if (!stored || Date.now() - stored.sentAt > TWO_FACTOR_CODE_TTL_MS) {
+      return res.status(400).json({ error: "That code has expired — log in again to get a new one" });
+    }
+    if (stored.code !== String(code).trim()) {
+      return res.status(400).json({ error: "That code doesn't match — check and try again" });
+    }
+    twoFactorCodes.delete(Number(userId));
+
     delete user.totp_secret;
+    const ip = getClientIp(req);
+    const userAgent = req.headers["user-agent"] || "";
+    pool
+      .query("INSERT INTO login_history (user_id, ip, user_agent) VALUES ($1, $2, $3)", [user.id, ip, userAgent])
+      .catch((err) => console.error("Failed to record login history:", err.message));
+    res.json({ user, token: signToken(user) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Step 3 of admin login: the emailed code. Only reachable after the
+// authenticator step above set a fresh marker — this can't be called on its
+// own to skip the authenticator-app requirement.
+app.post("/login/verify-2fa-email", authRateLimit, async (req, res) => {
+  try {
+    const { userId, code } = req.body;
+    if (!userId || !code) return res.status(400).json({ error: "Missing userId or code" });
+
+    const marker = totpVerifiedMarkers.get(Number(userId));
+    if (!marker || Date.now() - marker > TOTP_VERIFIED_MARKER_TTL_MS) {
+      return res.status(400).json({ error: "Your authenticator step expired — log in again from the start" });
+    }
+    const stored = twoFactorCodes.get(Number(userId));
+    if (!stored || Date.now() - stored.sentAt > TWO_FACTOR_CODE_TTL_MS) {
+      return res.status(400).json({ error: "That email code has expired — log in again to get a new one" });
+    }
+    if (stored.code !== String(code).trim()) {
+      return res.status(400).json({ error: "That code doesn't match — check and try again" });
+    }
+    twoFactorCodes.delete(Number(userId));
+    totpVerifiedMarkers.delete(Number(userId));
+
+    const result = await pool.query(
+      `SELECT id, username, email, phone, display_name, first_name, last_name, office_location,
+         country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
+         license_number, license_photos, id_verification_exempt, created_at, token_version
+       FROM users WHERE id = $1`,
+      [userId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Account not found" });
+    const user = result.rows[0];
     const ip = getClientIp(req);
     const userAgent = req.headers["user-agent"] || "";
     pool
