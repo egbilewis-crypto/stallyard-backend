@@ -21,10 +21,14 @@ if (!JWT_SECRET) {
 }
 
 function signToken(user) {
+  // Admin sessions expire fast — 24 hours instead of the usual 30 days —
+  // since a leaked or stolen admin token is a much bigger deal than a
+  // regular shopper's. Everyone else keeps the longer, more convenient
+  // session length.
   return jwt.sign(
     { id: user.id, username: user.username, isAdmin: !!user.is_admin, tokenVersion: user.token_version || 0 },
     JWT_SECRET,
-    { expiresIn: "30d" }
+    { expiresIn: user.is_admin ? "24h" : "30d" }
   );
 }
 
