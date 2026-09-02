@@ -2223,7 +2223,7 @@ app.post("/listings", authenticate, async (req, res) => {
       [
         ownerId, title, description || "", price, category || "Other", condition || "New", shippingFee || 0,
         emoji || "📦", fitMake || "", fitModel || "", fitYear || "", JSON.stringify(images || []),
-        listingType || "fixed", currency || "USD", status || "pending",
+        listingType || "fixed", currency || "NGN", status || "pending",
         auctionEndTime ? new Date(auctionEndTime) : null,
         quantity === "" || quantity === undefined || quantity === null ? null : Number(quantity),
         sku || "", brand || "", state || "", JSON.stringify(shippingMethods || []),
@@ -2464,7 +2464,7 @@ app.post("/checkout", authenticate, async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'held')
        RETURNING *`,
       [
-        req.user.id, req.user.username, total, currency || "USD",
+        req.user.id, req.user.username, total, currency || "NGN",
         JSON.stringify(shippingAddress || {}), subtotal, shippingTotal,
         commissionRate, commissionAmount,
       ]
