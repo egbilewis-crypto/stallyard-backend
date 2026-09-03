@@ -512,6 +512,59 @@ function verifyTotpCode(base32Secret, code) {
   return false;
 }
 
+// --- Column-level encryption for sensitive stored fields ---
+// Covers Paystack authorization tokens (saved cards) and seller bank
+// details — AES-256-GCM with a key that lives only in Railway's
+// environment variables, never in the database or the code. Values are
+// tagged with an "enc:v1:" prefix so decryptFieldSafe can tell an
+// already-encrypted value apart from older plaintext rows written before
+// this existed, and handle both without needing a one-time data migration.
+function getFieldEncryptionKey() {
+  const raw = process.env.FIELD_ENCRYPTION_KEY;
+  if (!raw) return null;
+  const key = Buffer.from(raw, "base64");
+  return key.length === 32 ? key : null;
+}
+
+function encryptField(plaintext) {
+  const key = getFieldEncryptionKey();
+  if (!key || plaintext === null || plaintext === undefined) return plaintext;
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const ciphertext = Buffer.concat([cipher.update(String(plaintext), "utf8"), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+  return `enc:v1:${iv.toString("base64")}:${authTag.toString("base64")}:${ciphertext.toString("base64")}`;
+}
+
+// Decrypts a value written by encryptField. Values that don't carry the
+// "enc:v1:" prefix are assumed to be legacy plaintext (written before
+// encryption was added) and are returned as-is rather than failing —
+// existing bank details and cards keep working without needing to be
+// re-saved, and naturally become encrypted the next time they're updated.
+function decryptFieldSafe(value) {
+  if (!value || !String(value).startsWith("enc:v1:")) return value;
+  const key = getFieldEncryptionKey();
+  if (!key) {
+    throw new Error("FIELD_ENCRYPTION_KEY isn't set — can't decrypt a stored value that was encrypted with it");
+  }
+  const [, , ivB64, authTagB64, ciphertextB64] = String(value).split(":");
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(ivB64, "base64"));
+  decipher.setAuthTag(Buffer.from(authTagB64, "base64"));
+  const plaintext = Buffer.concat([
+    decipher.update(Buffer.from(ciphertextB64, "base64")),
+    decipher.final(),
+  ]);
+  return plaintext.toString("utf8");
+}
+
+// A plain, deterministic fingerprint of a value that's stored encrypted —
+// used only to detect duplicates (e.g. "this card is already saved"),
+// never to recover the original value. SHA-256 can't be reversed, so this
+// is safe to index even though the encrypted column next to it can't be.
+function hashField(value) {
+  return crypto.createHash("sha256").update(String(value)).digest("hex");
+}
+
 // Pending bank-account changes awaiting email confirmation — only required
 // when *changing* an existing account on file, not the first-time setup.
 // Keyed by user id; holds the new details until the code is confirmed.
@@ -1061,6 +1114,7 @@ app.get("/migrate/saved-cards", requireMigrationKey, async (req, res) => {
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         authorization_code TEXT NOT NULL,
+        authorization_code_hash TEXT,
         card_type TEXT,
         last4 TEXT,
         bank TEXT,
@@ -1070,9 +1124,16 @@ app.get("/migrate/saved-cards", requireMigrationKey, async (req, res) => {
         created_at TIMESTAMP DEFAULT NOW()
       )
     `);
+    // authorization_code itself is encrypted (a different value every time,
+    // by design) so it can't be used to detect "this card is already
+    // saved" — authorization_code_hash is a plain, deterministic
+    // fingerprint of the same value, safe to index on since it can't be
+    // reversed back into the original code.
+    await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS authorization_code_hash TEXT`);
+    await pool.query(`DROP INDEX IF EXISTS idx_saved_cards_user_auth`);
     await pool.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_cards_user_auth
-      ON saved_cards(user_id, authorization_code)
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_cards_user_auth_hash
+      ON saved_cards(user_id, authorization_code_hash) WHERE authorization_code_hash IS NOT NULL
     `);
     res.send("Migration complete: saved_cards table created.");
   } catch (err) {
@@ -2859,13 +2920,13 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
     if (meta.saveCard && authorization.reusable && authorization.authorization_code) {
       try {
         await pool.query(
-          `INSERT INTO saved_cards (user_id, authorization_code, card_type, last4, bank, exp_month, exp_year, is_default)
-           VALUES ($1, $2, $3, $4, $5, $6, $7,
+          `INSERT INTO saved_cards (user_id, authorization_code, authorization_code_hash, card_type, last4, bank, exp_month, exp_year, is_default)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
              NOT EXISTS (SELECT 1 FROM saved_cards WHERE user_id = $1))
-           ON CONFLICT (user_id, authorization_code) DO NOTHING`,
+           ON CONFLICT (user_id, authorization_code_hash) DO NOTHING`,
           [
-            meta.buyerId, authorization.authorization_code, authorization.card_type || null,
-            authorization.last4 || null, authorization.bank || null,
+            meta.buyerId, encryptField(authorization.authorization_code), hashField(authorization.authorization_code),
+            authorization.card_type || null, authorization.last4 || null, authorization.bank || null,
             authorization.exp_month || null, authorization.exp_year || null,
           ]
         );
@@ -2996,7 +3057,7 @@ app.post("/checkout/pay-with-saved-card", authenticate, async (req, res) => {
     if (!cardResult.rows.length || cardResult.rows[0].user_id !== req.user.id) {
       return res.status(404).json({ error: "Saved card not found" });
     }
-    const authorizationCode = cardResult.rows[0].authorization_code;
+    const authorizationCode = decryptFieldSafe(cardResult.rows[0].authorization_code);
 
     let subtotal = 0;
     let shippingTotal = 0;
@@ -3591,7 +3652,7 @@ async function verifyAndSaveBankDetails(userId, bankCode, accountNumber) {
   }
   await pool.query(
     "UPDATE users SET bank_code = $1, account_number = $2, paystack_recipient_code = $3 WHERE id = $4",
-    [bankCode, accountNumber, recipientData.data.recipient_code, userId]
+    [encryptField(bankCode), encryptField(accountNumber), encryptField(recipientData.data.recipient_code), userId]
   );
   return { recipientCode: recipientData.data.recipient_code };
 }
@@ -3708,7 +3769,7 @@ app.post("/sellers/payout", authenticate, requirePermission("finance"), async (r
       return res.status(400).json({ error: "This seller hasn't added bank details yet" });
     }
 
-    const recipientCode = userResult.rows[0].paystack_recipient_code;
+    const recipientCode = decryptFieldSafe(userResult.rows[0].paystack_recipient_code);
     const amountInKobo = Math.round(Number(amount) * 100);
     const transferData = await sendPaystackTransfer(recipientCode, amountInKobo, reason);
 
@@ -3771,7 +3832,9 @@ app.post("/withdrawals", authenticate, async (req, res) => {
     }
 
     const userResult = await client.query("SELECT paystack_recipient_code FROM users WHERE id = $1", [req.user.id]);
-    const recipientCode = userResult.rows[0]?.paystack_recipient_code;
+    const recipientCode = userResult.rows[0]?.paystack_recipient_code
+      ? decryptFieldSafe(userResult.rows[0].paystack_recipient_code)
+      : null;
     if (!recipientCode) {
       await client.query("ROLLBACK");
       return res.status(400).json({ error: "Add your bank details before requesting a withdrawal" });
