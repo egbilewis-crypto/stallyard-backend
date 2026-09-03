@@ -999,6 +999,31 @@ app.get("/migrate/totp", requireMigrationKey, async (req, res) => {
   }
 });
 
+app.get("/migrate/addresses", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_addresses (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        label TEXT DEFAULT '',
+        street TEXT DEFAULT '',
+        city TEXT DEFAULT '',
+        state TEXT DEFAULT '',
+        zip TEXT DEFAULT '',
+        country TEXT DEFAULT '',
+        is_default BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_user_addresses_user_id ON user_addresses(user_id)
+    `);
+    res.send("Migration complete: user_addresses table created.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/phone-verified", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -1378,6 +1403,117 @@ app.post("/profile/sign-out-other-devices", authenticate, async (req, res) => {
     );
     if (!result.rows.length) return res.status(404).json({ error: "Account not found" });
     res.json({ token: signToken(result.rows[0]) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- Saved addresses (multiple, unlike the single legacy shipping_address
+// field on users) ---
+
+app.get("/addresses", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM user_addresses WHERE user_id = $1 ORDER BY is_default DESC, created_at DESC",
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/addresses", authenticate, async (req, res) => {
+  try {
+    const { label, street, city, state, zip, country, isDefault } = req.body;
+    if (!street || !city || !country) {
+      return res.status(400).json({ error: "Street, city, and country are required" });
+    }
+    // First address a person saves becomes their default automatically,
+    // even if they didn't check the box for it.
+    const existingCount = await pool.query("SELECT COUNT(*) FROM user_addresses WHERE user_id = $1", [req.user.id]);
+    const shouldBeDefault = !!isDefault || Number(existingCount.rows[0].count) === 0;
+    if (shouldBeDefault) {
+      await pool.query("UPDATE user_addresses SET is_default = false WHERE user_id = $1", [req.user.id]);
+    }
+    const result = await pool.query(
+      `INSERT INTO user_addresses (user_id, label, street, city, state, zip, country, is_default)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [req.user.id, label || "", street, city, state || "", zip || "", country, shouldBeDefault]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/addresses/:id", authenticate, async (req, res) => {
+  try {
+    const existing = await pool.query("SELECT * FROM user_addresses WHERE id = $1", [req.params.id]);
+    if (!existing.rows.length) return res.status(404).json({ error: "Address not found" });
+    if (existing.rows[0].user_id !== req.user.id) {
+      return res.status(403).json({ error: "You can only edit your own addresses" });
+    }
+    const { label, street, city, state, zip, country } = req.body;
+    const current = existing.rows[0];
+    const result = await pool.query(
+      `UPDATE user_addresses SET label = $1, street = $2, city = $3, state = $4, zip = $5, country = $6
+       WHERE id = $7 RETURNING *`,
+      [
+        label ?? current.label,
+        street ?? current.street,
+        city ?? current.city,
+        state ?? current.state,
+        zip ?? current.zip,
+        country ?? current.country,
+        req.params.id,
+      ]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/addresses/:id/default", authenticate, async (req, res) => {
+  try {
+    const existing = await pool.query("SELECT * FROM user_addresses WHERE id = $1", [req.params.id]);
+    if (!existing.rows.length) return res.status(404).json({ error: "Address not found" });
+    if (existing.rows[0].user_id !== req.user.id) {
+      return res.status(403).json({ error: "You can only edit your own addresses" });
+    }
+    await pool.query("UPDATE user_addresses SET is_default = false WHERE user_id = $1", [req.user.id]);
+    const result = await pool.query(
+      "UPDATE user_addresses SET is_default = true WHERE id = $1 RETURNING *",
+      [req.params.id]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/addresses/:id", authenticate, async (req, res) => {
+  try {
+    const existing = await pool.query("SELECT * FROM user_addresses WHERE id = $1", [req.params.id]);
+    if (!existing.rows.length) return res.status(404).json({ error: "Address not found" });
+    if (existing.rows[0].user_id !== req.user.id) {
+      return res.status(403).json({ error: "You can only delete your own addresses" });
+    }
+    await pool.query("DELETE FROM user_addresses WHERE id = $1", [req.params.id]);
+    // If the deleted one was the default, hand default status to whichever
+    // address was saved most recently, so there's always a clear default
+    // as long as at least one address remains.
+    if (existing.rows[0].is_default) {
+      const remaining = await pool.query(
+        "SELECT id FROM user_addresses WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
+        [req.user.id]
+      );
+      if (remaining.rows.length) {
+        await pool.query("UPDATE user_addresses SET is_default = true WHERE id = $1", [remaining.rows[0].id]);
+      }
+    }
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
