@@ -1024,6 +1024,31 @@ app.get("/migrate/addresses", requireMigrationKey, async (req, res) => {
   }
 });
 
+// Real Paystack charging on checkout: tracks which Paystack transaction
+// paid for each order, plus enough about how they paid (channel, card
+// type, bank) to show a buyer their past payment methods. The unique
+// index on paystack_reference is what makes the webhook safe to receive
+// more than once for the same payment without creating a duplicate order.
+app.get("/migrate/paystack-checkout", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE orders
+        ADD COLUMN IF NOT EXISTS paystack_reference TEXT,
+        ADD COLUMN IF NOT EXISTS payment_channel TEXT,
+        ADD COLUMN IF NOT EXISTS payment_card_type TEXT,
+        ADD COLUMN IF NOT EXISTS payment_bank TEXT,
+        ADD COLUMN IF NOT EXISTS payment_last4 TEXT
+    `);
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_paystack_reference
+      ON orders(paystack_reference) WHERE paystack_reference IS NOT NULL
+    `);
+    res.send("Migration complete: Paystack payment-tracking columns added to orders.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/phone-verified", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -2636,6 +2661,216 @@ app.post("/checkout", authenticate, async (req, res) => {
   }
 });
 
+// --- Real Paystack checkout ---
+// The /checkout endpoint above creates an order immediately with no actual
+// charge — kept as-is so nothing currently live breaks. These new endpoints
+// are the real flow: initialize validates the cart and sends the buyer to
+// Paystack; the order itself is only created once payment is confirmed,
+// either by the webhook or by this fallback verify endpoint (whichever
+// happens first — both are safe to call more than once for the same
+// payment thanks to the unique index on orders.paystack_reference).
+
+function formatMoneyServer(amount, currency) {
+  const symbol = currency === "NGN" ? "₦" : "$";
+  return `${symbol}${Number(amount || 0).toFixed(2)}`;
+}
+
+// Turns a validated cart into the actual order + order_items rows, marks
+// listings sold, and notifies sellers. Shared by the webhook and the
+// verify-fallback endpoint so an order is only ever created once per
+// Paystack reference, however the confirmation arrives.
+async function finalizeOrderFromPaystackCharge(reference, paystackData) {
+  const existing = await pool.query("SELECT * FROM orders WHERE paystack_reference = $1", [reference]);
+  if (existing.rows.length) {
+    const itemsResult = await pool.query("SELECT * FROM order_items WHERE order_id = $1 ORDER BY id ASC", [existing.rows[0].id]);
+    return { order: existing.rows[0], items: itemsResult.rows, alreadyFinalized: true };
+  }
+
+  const meta = paystackData.metadata || {};
+  const cartItems = Array.isArray(meta.items) ? meta.items : [];
+  if (!cartItems.length) throw new Error("No cart items found in payment metadata");
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    let subtotal = 0;
+    let shippingTotal = 0;
+    const resolvedItems = [];
+    for (const cartItem of cartItems) {
+      const qty = Number(cartItem.qty);
+      const listingResult = await client.query(
+        "SELECT * FROM listings WHERE id = $1 AND status = 'approved' FOR UPDATE",
+        [cartItem.listingId]
+      );
+      if (listingResult.rows.length === 0) {
+        // Someone else bought it in the time the buyer spent on Paystack's
+        // page. Skip this item rather than failing the whole paid-for
+        // order — it'll need a manual look from support/admin either way
+        // since the buyer already paid for it.
+        continue;
+      }
+      const listing = listingResult.rows[0];
+      const price = Number(listing.price);
+      const shippingFee = Number(listing.shipping_fee) || 0;
+      subtotal += price * qty;
+      shippingTotal += shippingFee * qty;
+      resolvedItems.push({ listing, qty, price, shippingFee });
+    }
+
+    const commissionRate = await getCommissionRate();
+    const commissionAmount = Math.round(subtotal * commissionRate * 100) / 100;
+    const total = Math.round((subtotal + shippingTotal) * 100) / 100;
+    const authorization = paystackData.authorization || {};
+
+    const orderResult = await client.query(
+      `INSERT INTO orders (
+         buyer_id, buyer_username, total, currency, shipping_address, subtotal,
+         shipping_total, commission_rate, commission_amount, payment_status,
+         paystack_reference, payment_channel, payment_card_type, payment_bank, payment_last4
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'held', $10, $11, $12, $13, $14)
+       RETURNING *`,
+      [
+        meta.buyerId, meta.buyerUsername, total, meta.currency || "NGN",
+        JSON.stringify(meta.shippingAddress || {}), subtotal, shippingTotal,
+        commissionRate, commissionAmount,
+        reference, paystackData.channel || null, authorization.card_type || null,
+        authorization.bank || null, authorization.last4 || null,
+      ]
+    );
+    const order = orderResult.rows[0];
+
+    const insertedItems = [];
+    for (const { listing, qty, price, shippingFee } of resolvedItems) {
+      const sellerResult = await client.query("SELECT username, display_name FROM users WHERE id = $1", [listing.owner_id]);
+      const seller = sellerResult.rows[0];
+      const itemResult = await client.query(
+        `INSERT INTO order_items (
+           order_id, listing_id, title, emoji, price, qty, shipping_fee,
+           seller_id, seller_username, seller_name, fulfillment_status
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'new')
+         RETURNING *`,
+        [
+          order.id, listing.id, listing.title, listing.emoji, price, qty, shippingFee,
+          listing.owner_id, seller?.username, seller?.display_name,
+        ]
+      );
+      insertedItems.push(itemResult.rows[0]);
+      await client.query("UPDATE listings SET status = 'sold' WHERE id = $1", [listing.id]);
+      createNotification(
+        listing.owner_id,
+        "sale",
+        `New sale: ${listing.title} (${qty}x) — ${formatMoneyServer(price * qty, order.currency)}. Payment is held until delivery is confirmed.`
+      );
+    }
+
+    await client.query("COMMIT");
+    return { order: { ...order, items: insertedItems }, items: insertedItems, alreadyFinalized: false };
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// Step 1: validate the cart (same checks as /checkout) and send the buyer
+// to Paystack. Nothing is created in the database yet — that only happens
+// once the payment actually succeeds.
+app.post("/checkout/initialize", authenticate, async (req, res) => {
+  try {
+    const { items, shippingAddress, currency } = req.body;
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Cart is empty" });
+    }
+    if (!process.env.PAYSTACK_SECRET_KEY) {
+      return res.status(500).json({ error: "Payments aren't configured — contact support" });
+    }
+
+    let subtotal = 0;
+    let shippingTotal = 0;
+    for (const cartItem of items) {
+      const qty = Number(cartItem.qty);
+      if (!cartItem.listingId || !Number.isInteger(qty) || qty <= 0) {
+        return res.status(400).json({ error: "Each cart item needs a valid listingId and a positive quantity" });
+      }
+      const listingResult = await pool.query(
+        "SELECT * FROM listings WHERE id = $1 AND status = 'approved'",
+        [cartItem.listingId]
+      );
+      if (listingResult.rows.length === 0) {
+        return res.status(404).json({ error: `Listing ${cartItem.listingId} isn't available` });
+      }
+      const listing = listingResult.rows[0];
+      const price = Number(listing.price);
+      if (!(price > 0)) return res.status(400).json({ error: "Listing has an invalid price" });
+      subtotal += price * qty;
+      shippingTotal += (Number(listing.shipping_fee) || 0) * qty;
+    }
+
+    const commissionRate = await getCommissionRate();
+    const total = Math.round((subtotal + shippingTotal) * 100) / 100;
+
+    const userResult = await pool.query("SELECT email FROM users WHERE id = $1", [req.user.id]);
+    const email = userResult.rows[0]?.email;
+    if (!email) return res.status(400).json({ error: "Add an email to your account before checking out" });
+
+    const paystackRes = await fetch("https://api.paystack.co/transaction/initialize", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        email,
+        amount: Math.round(total * 100), // kobo
+        currency: currency || "NGN",
+        callback_url: "https://stallyard.com/order-confirmation",
+        metadata: {
+          buyerId: req.user.id,
+          buyerUsername: req.user.username,
+          items: items.map((i) => ({ listingId: i.listingId, qty: Number(i.qty) })),
+          shippingAddress: shippingAddress || {},
+          currency: currency || "NGN",
+        },
+      }),
+    });
+    const paystackData = await paystackRes.json();
+    if (!paystackData.status) {
+      return res.status(500).json({ error: paystackData.message || "Paystack error" });
+    }
+    res.json({ authorizationUrl: paystackData.data.authorization_url, reference: paystackData.data.reference });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Step 2 (fallback): once Paystack redirects the buyer back, the frontend
+// calls this to confirm payment immediately rather than waiting on the
+// webhook, which is reliable but not instant. Safe to call even if the
+// webhook already finalized the order — finalizeOrderFromPaystackCharge
+// returns the existing order instead of creating a second one.
+app.get("/checkout/verify/:reference", authenticate, async (req, res) => {
+  try {
+    if (!process.env.PAYSTACK_SECRET_KEY) {
+      return res.status(500).json({ error: "Payments aren't configured — contact support" });
+    }
+    const verifyRes = await fetch(`https://api.paystack.co/transaction/verify/${req.params.reference}`, {
+      headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` },
+    });
+    const verifyData = await verifyRes.json();
+    if (!verifyData.status || verifyData.data.status !== "success") {
+      return res.status(400).json({ error: "Payment hasn't succeeded yet" });
+    }
+    const { order } = await finalizeOrderFromPaystackCharge(req.params.reference, verifyData.data);
+    res.json({ order });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 async function fetchOrdersWithItems(whereClause, params) {
   const ordersResult = await pool.query(
     `SELECT * FROM orders WHERE ${whereClause} ORDER BY created_at DESC`,
@@ -3110,38 +3345,14 @@ app.post("/webhook/paystack", async (req, res) => {
     const event = req.body;
 
     if (event.event === "charge.success") {
-      const { buyerId, listingId } = event.data.metadata;
-      const client = await pool.connect();
-
       try {
-        await client.query("BEGIN");
-
-        const listingResult = await client.query(
-          "SELECT * FROM listings WHERE id = $1 AND status != 'sold'",
-          [listingId]
-        );
-
-        if (listingResult.rows.length > 0) {
-          const listing = listingResult.rows[0];
-
-          await client.query(
-            `INSERT INTO orders (buyer_id, total, currency, payment_status)
-             VALUES ($1, $2, $3, 'released')`,
-            [buyerId, listing.price, listing.currency]
-          );
-
-          await client.query(
-            "UPDATE listings SET status = 'sold' WHERE id = $1",
-            [listingId]
-          );
-        }
-
-        await client.query("COMMIT");
+        await finalizeOrderFromPaystackCharge(event.data.reference, event.data);
       } catch (err) {
-        await client.query("ROLLBACK");
-        console.error("Webhook processing error:", err.message);
-      } finally {
-        client.release();
+        // Logged, not thrown — Paystack retries webhooks on non-200
+        // responses, and /checkout/verify is a working fallback if this
+        // keeps failing, so a 200 here avoids Paystack hammering retries
+        // for something a human needs to look at anyway.
+        console.error("Webhook order finalization error:", err.message);
       }
     }
 
