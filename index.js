@@ -1049,6 +1049,37 @@ app.get("/migrate/paystack-checkout", requireMigrationKey, async (req, res) => {
   }
 });
 
+// Saved cards for one-tap repeat checkout. Only ever stores Paystack's
+// reusable "authorization_code" token — never a card number, CVV, or
+// anything else that would need PCI compliance on our end. The token is
+// useless outside our own Paystack secret key, so it's safe to hold even
+// though it lets us charge the card again.
+app.get("/migrate/saved-cards", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS saved_cards (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        authorization_code TEXT NOT NULL,
+        card_type TEXT,
+        last4 TEXT,
+        bank TEXT,
+        exp_month TEXT,
+        exp_year TEXT,
+        is_default BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_cards_user_auth
+      ON saved_cards(user_id, authorization_code)
+    `);
+    res.send("Migration complete: saved_cards table created.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/phone-verified", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -1544,7 +1575,60 @@ app.delete("/addresses/:id", authenticate, async (req, res) => {
   }
 });
 
-// Turning it OFF just requires being logged in (already a meaningful bar,
+// --- Saved cards (view/manage the reusable Paystack authorization tokens
+// saved during checkout — never a raw card number) ---
+
+app.get("/saved-cards", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT id, card_type, last4, bank, exp_month, exp_year, is_default, created_at FROM saved_cards WHERE user_id = $1 ORDER BY is_default DESC, created_at DESC",
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/saved-cards/:id/default", authenticate, async (req, res) => {
+  try {
+    const existing = await pool.query("SELECT * FROM saved_cards WHERE id = $1", [req.params.id]);
+    if (!existing.rows.length) return res.status(404).json({ error: "Saved card not found" });
+    if (existing.rows[0].user_id !== req.user.id) {
+      return res.status(403).json({ error: "You can only edit your own saved cards" });
+    }
+    await pool.query("UPDATE saved_cards SET is_default = false WHERE user_id = $1", [req.user.id]);
+    const result = await pool.query("UPDATE saved_cards SET is_default = true WHERE id = $1 RETURNING *", [req.params.id]);
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/saved-cards/:id", authenticate, async (req, res) => {
+  try {
+    const existing = await pool.query("SELECT * FROM saved_cards WHERE id = $1", [req.params.id]);
+    if (!existing.rows.length) return res.status(404).json({ error: "Saved card not found" });
+    if (existing.rows[0].user_id !== req.user.id) {
+      return res.status(403).json({ error: "You can only remove your own saved cards" });
+    }
+    await pool.query("DELETE FROM saved_cards WHERE id = $1", [req.params.id]);
+    if (existing.rows[0].is_default) {
+      const remaining = await pool.query(
+        "SELECT id FROM saved_cards WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
+        [req.user.id]
+      );
+      if (remaining.rows.length) {
+        await pool.query("UPDATE saved_cards SET is_default = true WHERE id = $1", [remaining.rows[0].id]);
+      }
+    }
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 // since you're authenticated to call this) and isn't available to admins.
 // Turning it ON is handled by the two endpoints below instead — this one
 // rejects enable attempts so nothing can flip it on without a verified code.
@@ -2767,6 +2851,28 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
     }
 
     await client.query("COMMIT");
+
+    // Save the card for one-tap future checkout, but only if the buyer
+    // actually opted in at checkout AND Paystack confirms this specific
+    // authorization can be charged again — some banks/cards issue
+    // one-time-only authorizations that can't be reused even if asked.
+    if (meta.saveCard && authorization.reusable && authorization.authorization_code) {
+      try {
+        await pool.query(
+          `INSERT INTO saved_cards (user_id, authorization_code, card_type, last4, bank, exp_month, exp_year, is_default)
+           VALUES ($1, $2, $3, $4, $5, $6, $7,
+             NOT EXISTS (SELECT 1 FROM saved_cards WHERE user_id = $1))
+           ON CONFLICT (user_id, authorization_code) DO NOTHING`,
+          [
+            meta.buyerId, authorization.authorization_code, authorization.card_type || null,
+            authorization.last4 || null, authorization.bank || null,
+            authorization.exp_month || null, authorization.exp_year || null,
+          ]
+        );
+      } catch (err) {
+        console.error("Couldn't save card for future checkout:", err.message);
+      }
+    }
     return { order: { ...order, items: insertedItems }, items: insertedItems, alreadyFinalized: false };
   } catch (err) {
     await client.query("ROLLBACK");
@@ -2781,7 +2887,7 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
 // once the payment actually succeeds.
 app.post("/checkout/initialize", authenticate, async (req, res) => {
   try {
-    const { items, shippingAddress, currency } = req.body;
+    const { items, shippingAddress, currency, saveCard } = req.body;
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "Cart is empty" });
     }
@@ -2834,6 +2940,7 @@ app.post("/checkout/initialize", authenticate, async (req, res) => {
           items: items.map((i) => ({ listingId: i.listingId, qty: Number(i.qty) })),
           shippingAddress: shippingAddress || {},
           currency: currency || "NGN",
+          saveCard: !!saveCard,
         },
       }),
     });
@@ -2865,6 +2972,83 @@ app.get("/checkout/verify/:reference", authenticate, async (req, res) => {
       return res.status(400).json({ error: "Payment hasn't succeeded yet" });
     }
     const { order } = await finalizeOrderFromPaystackCharge(req.params.reference, verifyData.data);
+    res.json({ order });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// One-tap checkout with a previously saved card — charges directly via
+// Paystack's charge_authorization API, no redirect needed. Same cart
+// validation as /checkout/initialize, just a different way of paying.
+app.post("/checkout/pay-with-saved-card", authenticate, async (req, res) => {
+  try {
+    const { items, shippingAddress, currency, cardId } = req.body;
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Cart is empty" });
+    }
+    if (!cardId) return res.status(400).json({ error: "Pick a saved card" });
+    if (!process.env.PAYSTACK_SECRET_KEY) {
+      return res.status(500).json({ error: "Payments aren't configured — contact support" });
+    }
+
+    const cardResult = await pool.query("SELECT * FROM saved_cards WHERE id = $1", [cardId]);
+    if (!cardResult.rows.length || cardResult.rows[0].user_id !== req.user.id) {
+      return res.status(404).json({ error: "Saved card not found" });
+    }
+    const authorizationCode = cardResult.rows[0].authorization_code;
+
+    let subtotal = 0;
+    let shippingTotal = 0;
+    for (const cartItem of items) {
+      const qty = Number(cartItem.qty);
+      if (!cartItem.listingId || !Number.isInteger(qty) || qty <= 0) {
+        return res.status(400).json({ error: "Each cart item needs a valid listingId and a positive quantity" });
+      }
+      const listingResult = await pool.query(
+        "SELECT * FROM listings WHERE id = $1 AND status = 'approved'",
+        [cartItem.listingId]
+      );
+      if (listingResult.rows.length === 0) {
+        return res.status(404).json({ error: `Listing ${cartItem.listingId} isn't available` });
+      }
+      const listing = listingResult.rows[0];
+      const price = Number(listing.price);
+      if (!(price > 0)) return res.status(400).json({ error: "Listing has an invalid price" });
+      subtotal += price * qty;
+      shippingTotal += (Number(listing.shipping_fee) || 0) * qty;
+    }
+    const total = Math.round((subtotal + shippingTotal) * 100) / 100;
+
+    const userResult = await pool.query("SELECT email FROM users WHERE id = $1", [req.user.id]);
+    const email = userResult.rows[0]?.email;
+    if (!email) return res.status(400).json({ error: "Add an email to your account before checking out" });
+
+    const chargeRes = await fetch("https://api.paystack.co/transaction/charge_authorization", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        email,
+        amount: Math.round(total * 100),
+        currency: currency || "NGN",
+        authorization_code: authorizationCode,
+        metadata: {
+          buyerId: req.user.id,
+          buyerUsername: req.user.username,
+          items: items.map((i) => ({ listingId: i.listingId, qty: Number(i.qty) })),
+          shippingAddress: shippingAddress || {},
+          currency: currency || "NGN",
+        },
+      }),
+    });
+    const chargeData = await chargeRes.json();
+    if (!chargeData.status || chargeData.data.status !== "success") {
+      return res.status(400).json({ error: chargeData.data?.gateway_response || chargeData.message || "Payment failed" });
+    }
+    const { order } = await finalizeOrderFromPaystackCharge(chargeData.data.reference, chargeData.data);
     res.json({ order });
   } catch (err) {
     res.status(500).json({ error: err.message });
