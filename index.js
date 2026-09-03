@@ -1999,10 +1999,7 @@ app.post("/login", authRateLimit, async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT id, username, email, phone, password_hash, display_name, first_name, last_name, office_location,
-         country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
-         license_number, license_photos, id_verification_exempt, created_at, two_factor_enabled, token_version,
-         totp_secret
+      `SELECT ${USER_RETURNING_FIELDS}, password_hash, totp_secret
        FROM users WHERE username = $1`,
       [username]
     );
@@ -2063,6 +2060,7 @@ app.post("/login", authRateLimit, async (req, res) => {
     }
 
     delete user.password_hash;
+    delete user.totp_secret;
     const ip = getClientIp(req);
     const userAgent = req.headers["user-agent"] || "";
     pool
@@ -2087,9 +2085,7 @@ app.post("/login/verify-2fa", authRateLimit, async (req, res) => {
     if (!userId || !code) return res.status(400).json({ error: "Missing userId or code" });
 
     const result = await pool.query(
-      `SELECT id, username, email, phone, display_name, first_name, last_name, office_location,
-         country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
-         license_number, license_photos, id_verification_exempt, created_at, token_version, totp_secret
+      `SELECT ${USER_RETURNING_FIELDS}, totp_secret
        FROM users WHERE id = $1`,
       [userId]
     );
@@ -2170,9 +2166,7 @@ app.post("/login/verify-2fa-email", authRateLimit, async (req, res) => {
     totpVerifiedMarkers.delete(Number(userId));
 
     const result = await pool.query(
-      `SELECT id, username, email, phone, display_name, first_name, last_name, office_location,
-         country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
-         license_number, license_photos, id_verification_exempt, created_at, token_version
+      `SELECT ${USER_RETURNING_FIELDS}
        FROM users WHERE id = $1`,
       [userId]
     );
