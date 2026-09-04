@@ -2004,7 +2004,7 @@ app.post("/profile/apply-to-sell", authenticate, async (req, res) => {
 // Deliberately excludes email, phone, and ID/document fields.
 const USER_PUBLIC_FIELDS = `id, username, display_name, first_name, last_name, office_location,
   country, is_admin, is_approved, is_verified, is_suspended, account_type, verification_status, created_at,
-  avatar_url, store_bio, store_policies`;
+  avatar_url, store_bio, store_policies, is_email_verified, is_phone_verified`;
 
 // Full fields — only returned to a signed-in admin. bank_statement_url and
 // rejection_reason are sensitive/internal, so they stay out of USER_PUBLIC_FIELDS.
