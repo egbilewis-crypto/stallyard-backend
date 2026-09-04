@@ -1150,6 +1150,16 @@ app.get("/migrate/ships-to-usa", requireMigrationKey, async (req, res) => {
   }
 });
 
+app.get("/migrate/tax-rate", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`ALTER TABLE site_settings ADD COLUMN IF NOT EXISTS tax_rate NUMERIC DEFAULT 0`);
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS tax_amount NUMERIC DEFAULT 0`);
+    res.send("Migration complete: tax_rate added to site_settings, tax_amount added to orders.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/phone-verified", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -2667,9 +2677,13 @@ app.delete("/listings/by-owner/:ownerId", authenticate, requirePermission("user_
 // hardcoded 5% regardless of what the admin panel showed. Both are real now.
 app.get("/settings", async (req, res) => {
   try {
-    const result = await pool.query("SELECT commission_rate, auth_image FROM site_settings WHERE id = 1");
-    const row = result.rows[0] || { commission_rate: 0.05, auth_image: "" };
-    res.json({ commissionRate: Number(row.commission_rate), authImage: row.auth_image || "" });
+    const result = await pool.query("SELECT commission_rate, tax_rate, auth_image FROM site_settings WHERE id = 1");
+    const row = result.rows[0] || { commission_rate: 0.05, tax_rate: 0, auth_image: "" };
+    res.json({
+      commissionRate: Number(row.commission_rate),
+      taxRate: Number(row.tax_rate || 0),
+      authImage: row.auth_image || "",
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2677,7 +2691,7 @@ app.get("/settings", async (req, res) => {
 
 app.patch("/settings", authenticate, async (req, res) => {
   try {
-    const { commissionRate, authImage } = req.body;
+    const { commissionRate, taxRate, authImage } = req.body;
     if (commissionRate !== undefined) {
       if (!hasPermission(req.user, "finance")) {
         return res.status(403).json({ error: "You don't have permission to change the commission rate" });
@@ -2692,6 +2706,20 @@ app.patch("/settings", authenticate, async (req, res) => {
       );
       logAdminAction(req.user.id, "commission_rate_changed", `Set commission rate to ${(rate * 100).toFixed(1)}%`);
     }
+    if (taxRate !== undefined) {
+      if (!hasPermission(req.user, "finance")) {
+        return res.status(403).json({ error: "You don't have permission to change the tax rate" });
+      }
+      const rate = Number(taxRate);
+      if (!(rate >= 0 && rate <= 1)) {
+        return res.status(400).json({ error: "Tax rate must be between 0 and 1 (e.g. 0.075 for 7.5%)" });
+      }
+      await pool.query(
+        "INSERT INTO site_settings (id, tax_rate) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET tax_rate = $1",
+        [rate]
+      );
+      logAdminAction(req.user.id, "tax_rate_changed", `Set tax rate to ${(rate * 100).toFixed(2)}%`);
+    }
     if (authImage !== undefined) {
       if (!hasPermission(req.user, "content_management")) {
         return res.status(403).json({ error: "You don't have permission to change site branding" });
@@ -2701,8 +2729,12 @@ app.patch("/settings", authenticate, async (req, res) => {
         [authImage]
       );
     }
-    const result = await pool.query("SELECT commission_rate, auth_image FROM site_settings WHERE id = 1");
-    res.json({ commissionRate: Number(result.rows[0].commission_rate), authImage: result.rows[0].auth_image || "" });
+    const result = await pool.query("SELECT commission_rate, tax_rate, auth_image FROM site_settings WHERE id = 1");
+    res.json({
+      commissionRate: Number(result.rows[0].commission_rate),
+      taxRate: Number(result.rows[0].tax_rate || 0),
+      authImage: result.rows[0].auth_image || "",
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2714,6 +2746,15 @@ async function getCommissionRate() {
     return result.rows.length ? Number(result.rows[0].commission_rate) : 0.05;
   } catch {
     return 0.05; // safe fallback if the settings row is ever missing
+  }
+}
+
+async function getTaxRate() {
+  try {
+    const result = await pool.query("SELECT tax_rate FROM site_settings WHERE id = 1");
+    return result.rows.length ? Number(result.rows[0].tax_rate || 0) : 0;
+  } catch {
+    return 0; // safe fallback if the settings row is ever missing
   }
 }
 
@@ -2875,21 +2916,23 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
 
     const commissionRate = await getCommissionRate();
     const commissionAmount = Math.round(subtotal * commissionRate * 100) / 100;
-    const total = Math.round((subtotal + shippingTotal) * 100) / 100;
+    const taxRate = await getTaxRate();
+    const taxAmount = Math.round(subtotal * taxRate * 100) / 100;
+    const total = Math.round((subtotal + shippingTotal + taxAmount) * 100) / 100;
     const authorization = paystackData.authorization || {};
 
     const orderResult = await client.query(
       `INSERT INTO orders (
          buyer_id, buyer_username, total, currency, shipping_address, subtotal,
-         shipping_total, commission_rate, commission_amount, payment_status,
+         shipping_total, commission_rate, commission_amount, tax_amount, payment_status,
          paystack_reference, payment_channel, payment_card_type, payment_bank, payment_last4
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'held', $10, $11, $12, $13, $14)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'held', $11, $12, $13, $14, $15)
        RETURNING *`,
       [
         meta.buyerId, meta.buyerUsername, total, meta.currency || "NGN",
         JSON.stringify(meta.shippingAddress || {}), subtotal, shippingTotal,
-        commissionRate, commissionAmount,
+        commissionRate, commissionAmount, taxAmount,
         reference, paystackData.channel || null, authorization.card_type || null,
         authorization.bank || null, authorization.last4 || null,
       ]
@@ -2988,7 +3031,9 @@ app.post("/checkout/initialize", authenticate, async (req, res) => {
     }
 
     const commissionRate = await getCommissionRate();
-    const total = Math.round((subtotal + shippingTotal) * 100) / 100;
+    const taxRate = await getTaxRate();
+    const taxAmount = Math.round(subtotal * taxRate * 100) / 100;
+    const total = Math.round((subtotal + shippingTotal + taxAmount) * 100) / 100;
 
     const userResult = await pool.query("SELECT email FROM users WHERE id = $1", [req.user.id]);
     const email = userResult.rows[0]?.email;
@@ -3089,7 +3134,9 @@ app.post("/checkout/pay-with-saved-card", authenticate, async (req, res) => {
       subtotal += price * qty;
       shippingTotal += (Number(listing.shipping_fee) || 0) * qty;
     }
-    const total = Math.round((subtotal + shippingTotal) * 100) / 100;
+    const taxRate = await getTaxRate();
+    const taxAmount = Math.round(subtotal * taxRate * 100) / 100;
+    const total = Math.round((subtotal + shippingTotal + taxAmount) * 100) / 100;
 
     const userResult = await pool.query("SELECT email FROM users WHERE id = $1", [req.user.id]);
     const email = userResult.rows[0]?.email;
