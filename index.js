@@ -1160,6 +1160,18 @@ app.get("/migrate/tax-rate", requireMigrationKey, async (req, res) => {
   }
 });
 
+// Auto-moderation results live here, separate from hidden_image_urls —
+// flagging is just a signal for admin review, never an automatic takedown.
+// Each entry is { url, reasons: string[] }.
+app.get("/migrate/flagged-images", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`ALTER TABLE listings ADD COLUMN IF NOT EXISTS flagged_images JSONB DEFAULT '[]'::jsonb`);
+    res.send("Migration complete: flagged_images column added to listings.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 // Lets an admin temporarily hide one photo from a listing (e.g. it's
 // blurry, or looks like a screenshot) without touching the rest of the
 // listing or forcing the seller to redo the whole thing.
@@ -2520,6 +2532,60 @@ app.post("/login/verify-2fa-email", authRateLimit, async (req, res) => {
   }
 });
 
+// Runs an uploaded photo through Sightengine's moderation API and returns a
+// list of plain-English reasons it might need a human look — never used to
+// auto-reject or auto-hide anything, purely a signal for admin review, per
+// the same "uncertain isn't automatically punished" principle used
+// throughout the rest of moderation on this platform. Skips silently (no
+// flags, no error) if Sightengine isn't configured, so this is fully
+// optional infrastructure — nothing breaks if the keys aren't set yet.
+async function moderateImageUrl(url) {
+  const { SIGHTENGINE_API_USER, SIGHTENGINE_API_SECRET } = process.env;
+  if (!SIGHTENGINE_API_USER || !SIGHTENGINE_API_SECRET) return [];
+  try {
+    const params = new URLSearchParams({
+      url,
+      models: "nudity-2.1,offensive,scam,text-content,type",
+      api_user: SIGHTENGINE_API_USER,
+      api_secret: SIGHTENGINE_API_SECRET,
+    });
+    const res = await fetch(`https://api.sightengine.com/1.0/check.json?${params}`);
+    const data = await res.json();
+    if (data.status !== "success") return [];
+    const reasons = [];
+    if (data.nudity && (data.nudity.raw > 0.5 || data.nudity.partial > 0.5)) {
+      reasons.push("Possible nudity detected");
+    }
+    if (data.offensive?.prob > 0.5) reasons.push("Possibly offensive content");
+    if (data.scam?.prob > 0.5) reasons.push("Looks like it may be scam-related imagery");
+    if (data.type?.illustration > 0.7) reasons.push("Looks like a graphic/illustration, not a real photo");
+    if (data.text?.personal?.length) reasons.push("May contain a phone number or personal contact info");
+    if (data.text?.link?.length) reasons.push("May contain a link or promotional text");
+    if (data.text?.profanity?.length) reasons.push("May contain inappropriate text");
+    return reasons;
+  } catch (err) {
+    console.error("Sightengine moderation check failed:", err.message);
+    return [];
+  }
+}
+
+// Fire-and-forget: checks each photo on a listing and records any flags
+// without delaying the listing's own create/update response — moderation
+// happening a few seconds late is fine, a slow "Save" button isn't.
+async function moderateListingImagesAsync(listingId, imageUrls) {
+  if (!Array.isArray(imageUrls) || !imageUrls.length) return;
+  const flagged = [];
+  for (const url of imageUrls) {
+    const reasons = await moderateImageUrl(url);
+    if (reasons.length) flagged.push({ url, reasons });
+  }
+  if (flagged.length) {
+    pool
+      .query("UPDATE listings SET flagged_images = $1 WHERE id = $2", [JSON.stringify(flagged), listingId])
+      .catch((err) => console.error("Couldn't save flagged images:", err.message));
+  }
+}
+
 // Uploads one image to Cloudinary on the seller's behalf. The API secret
 // never reaches the browser — it's only ever used here, server-side, to
 // compute a signature Cloudinary requires for authenticated (non-public)
@@ -2620,6 +2686,7 @@ app.post("/listings", authenticate, async (req, res) => {
     );
 
     res.status(201).json({ listing: result.rows[0] });
+    moderateListingImagesAsync(result.rows[0].id, images);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2707,6 +2774,31 @@ app.patch("/listings/:id", authenticate, async (req, res) => {
     if (req.body.status === "rejected") {
       createNotification(existing.rows[0].owner_id, "listing_rejected", `Your listing "${result.rows[0].title}" was rejected`);
     }
+    res.json({ listing: result.rows[0] });
+    if (Object.prototype.hasOwnProperty.call(req.body, "images")) {
+      moderateListingImagesAsync(result.rows[0].id, req.body.images);
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin-only: clears a flag once it's been reviewed and judged fine —
+// doesn't touch the photo itself, just removes the "needs review" marker.
+app.patch("/listings/:id/dismiss-flag", authenticate, async (req, res) => {
+  try {
+    if (!hasPermission(req.user, "listing_moderation")) {
+      return res.status(403).json({ error: "You don't have permission to moderate listing images" });
+    }
+    const { url } = req.body;
+    if (!url) return res.status(400).json({ error: "Missing image url" });
+    const existing = await pool.query("SELECT flagged_images FROM listings WHERE id = $1", [req.params.id]);
+    if (!existing.rows.length) return res.status(404).json({ error: "Listing not found" });
+    const remaining = (existing.rows[0].flagged_images || []).filter((f) => f.url !== url);
+    const result = await pool.query(
+      "UPDATE listings SET flagged_images = $1 WHERE id = $2 RETURNING *",
+      [JSON.stringify(remaining), req.params.id]
+    );
     res.json({ listing: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
