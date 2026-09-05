@@ -2568,7 +2568,7 @@ app.post("/listings", authenticate, async (req, res) => {
       title, description, price, category, condition, shippingFee,
       emoji, fitMake, fitModel, fitYear, images, listingType, currency,
       status, auctionEndTime, quantity, sku, brand, state, shippingMethods,
-      returnPolicy, vin, shipsToUsa,
+      returnPolicy, vin,
     } = req.body;
     const ownerId = req.user.id; // always the signed-in user — never trust a client-supplied owner
 
@@ -2592,9 +2592,9 @@ app.post("/listings", authenticate, async (req, res) => {
          owner_id, title, description, price, category, condition, shipping_fee,
          emoji, fit_make, fit_model, fit_year, images, listing_type, currency,
          status, auction_end_time, quantity, sku, brand, state, shipping_methods,
-         return_policy, vin, ships_to_usa
+         return_policy, vin
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
        RETURNING *`,
       [
         ownerId, title, description || "", price, category || "Other", condition || "New", shippingFee || 0,
@@ -2603,7 +2603,7 @@ app.post("/listings", authenticate, async (req, res) => {
         auctionEndTime ? new Date(auctionEndTime) : null,
         quantity === "" || quantity === undefined || quantity === null ? null : Number(quantity),
         sku || "", brand || "", state || "", JSON.stringify(shippingMethods || []),
-        returnPolicy || "", vin || "", !!shipsToUsa,
+        returnPolicy || "", vin || "",
       ]
     );
 
@@ -2655,7 +2655,6 @@ const LISTING_FIELD_MAP = {
   shippingMethods: "shipping_methods",
   returnPolicy: "return_policy",
   vin: "vin",
-  shipsToUsa: "ships_to_usa",
 };
 const LISTING_JSON_FIELDS = new Set(["images", "bidHistory", "shippingMethods"]);
 
