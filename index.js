@@ -1160,6 +1160,18 @@ app.get("/migrate/tax-rate", requireMigrationKey, async (req, res) => {
   }
 });
 
+// Lets an admin temporarily hide one photo from a listing (e.g. it's
+// blurry, or looks like a screenshot) without touching the rest of the
+// listing or forcing the seller to redo the whole thing.
+app.get("/migrate/hidden-images", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`ALTER TABLE listings ADD COLUMN IF NOT EXISTS hidden_image_urls JSONB DEFAULT '[]'::jsonb`);
+    res.send("Migration complete: hidden_image_urls column added to listings.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/phone-verified", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -2694,6 +2706,54 @@ app.patch("/listings/:id", authenticate, async (req, res) => {
     }
     if (req.body.status === "rejected") {
       createNotification(existing.rows[0].owner_id, "listing_rejected", `Your listing "${result.rows[0].title}" was rejected`);
+    }
+    res.json({ listing: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin-only: hide or unhide one specific photo on a listing, without
+// touching the listing itself or its other photos. Hidden photos stay in
+// the listing's real image list (nothing is deleted) — they're just kept
+// out of what buyers see.
+app.patch("/listings/:id/image-visibility", authenticate, async (req, res) => {
+  try {
+    if (!hasPermission(req.user, "listing_moderation")) {
+      return res.status(403).json({ error: "You don't have permission to moderate listing images" });
+    }
+    const { url, hidden, reason } = req.body;
+    if (!url) return res.status(400).json({ error: "Missing image url" });
+
+    const existing = await pool.query("SELECT owner_id, title, images, hidden_image_urls FROM listings WHERE id = $1", [req.params.id]);
+    if (!existing.rows.length) return res.status(404).json({ error: "Listing not found" });
+    const listing = existing.rows[0];
+    if (!(listing.images || []).includes(url)) {
+      return res.status(400).json({ error: "That photo doesn't belong to this listing" });
+    }
+
+    const currentHidden = listing.hidden_image_urls || [];
+    const nextHidden = hidden
+      ? [...new Set([...currentHidden, url])]
+      : currentHidden.filter((u) => u !== url);
+
+    const result = await pool.query(
+      "UPDATE listings SET hidden_image_urls = $1 WHERE id = $2 RETURNING *",
+      [JSON.stringify(nextHidden), req.params.id]
+    );
+    logAdminAction(
+      req.user.id,
+      "listing_image_visibility_changed",
+      `${hidden ? "Hid" : "Unhid"} a photo on listing "${listing.title}"${reason ? ` — reason: ${reason}` : ""}`
+    );
+    // The seller needs to actually find out — otherwise a hidden photo is
+    // invisible to them too, and they have no idea a replacement is needed.
+    if (hidden) {
+      createNotification(
+        listing.owner_id,
+        "listing_image_hidden",
+        `An admin hid a photo on your listing "${listing.title}"${reason ? `: ${reason}` : "."} Upload a replacement when you can.`
+      );
     }
     res.json({ listing: result.rows[0] });
   } catch (err) {
