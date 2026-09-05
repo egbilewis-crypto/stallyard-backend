@@ -2572,8 +2572,11 @@ app.post("/listings", authenticate, async (req, res) => {
     } = req.body;
     const ownerId = req.user.id; // always the signed-in user — never trust a client-supplied owner
 
-    if (!title || !price) {
+    if (!title) {
       return res.status(400).json({ error: "Missing required fields" });
+    }
+    if (status !== "draft" && !price) {
+      return res.status(400).json({ error: "Give it a price before publishing" });
     }
 
     // The frontend already hides the listing form until a seller is
