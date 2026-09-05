@@ -2508,6 +2508,60 @@ app.post("/login/verify-2fa-email", authRateLimit, async (req, res) => {
   }
 });
 
+// Uploads one image to Cloudinary on the seller's behalf. The API secret
+// never reaches the browser — it's only ever used here, server-side, to
+// compute a signature Cloudinary requires for authenticated (non-public)
+// uploads. The frontend sends a data URL; Cloudinary does the actual
+// storage, CDN delivery, and on-the-fly resizing from here on.
+app.post("/uploads/image", authenticate, async (req, res) => {
+  try {
+    const { dataUrl, folder } = req.body;
+    if (!dataUrl) return res.status(400).json({ error: "Missing image data" });
+    const { CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET } = process.env;
+    if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
+      return res.status(500).json({ error: "Image uploads aren't configured — contact support" });
+    }
+
+    const timestamp = Math.floor(Date.now() / 1000);
+    const uploadFolder = folder || "stallyard/listings";
+    // Cloudinary's signature: every param EXCEPT file/cloud_name/api_key/
+    // signature/resource_type, sorted alphabetically, joined as
+    // key=value&key=value, with the API secret appended (no separator),
+    // then SHA1-hashed. This is Cloudinary's documented algorithm, not
+    // something invented here.
+    const paramsToSign = `folder=${uploadFolder}&timestamp=${timestamp}`;
+    const signature = crypto
+      .createHash("sha1")
+      .update(paramsToSign + CLOUDINARY_API_SECRET)
+      .digest("hex");
+
+    const form = new URLSearchParams();
+    form.append("file", dataUrl);
+    form.append("folder", uploadFolder);
+    form.append("timestamp", String(timestamp));
+    form.append("api_key", CLOUDINARY_API_KEY);
+    form.append("signature", signature);
+
+    const cloudRes = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: form,
+    });
+    const cloudData = await cloudRes.json();
+    if (!cloudRes.ok) {
+      return res.status(400).json({ error: cloudData.error?.message || "Upload to Cloudinary failed" });
+    }
+    res.json({
+      url: cloudData.secure_url,
+      width: cloudData.width,
+      height: cloudData.height,
+      publicId: cloudData.public_id,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/listings", authenticate, async (req, res) => {
   try {
     const {
