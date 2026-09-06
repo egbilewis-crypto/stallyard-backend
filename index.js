@@ -967,6 +967,23 @@ app.get("/migrate/paystack-checkout", requireMigrationKey, async (req, res) => {
   }
 });
 
+app.get("/migrate/refunds", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE orders
+        ADD COLUMN IF NOT EXISTS refund_status TEXT,
+        ADD COLUMN IF NOT EXISTS paystack_refund_id BIGINT,
+        ADD COLUMN IF NOT EXISTS refund_previous_payment_status TEXT,
+        ADD COLUMN IF NOT EXISTS refund_requested_at TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS refund_failure_reason TEXT
+    `);
+    res.send("Migration complete: refund tracking columns added to orders.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/saved-cards", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -2319,40 +2336,71 @@ app.post("/uploads/image", authenticate, async (req, res) => {
   try {
     const { dataUrl, folder } = req.body;
     if (!dataUrl) return res.status(400).json({ error: "Missing image data" });
-    const { CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET } = process.env;
-    if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
+
+    const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
+    // Supports the variable name already added in Railway as well as Supabase's newer naming.
+    const SUPABASE_SECRET_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY;
+    const SUPABASE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "stallyard-media";
+    if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
       return res.status(500).json({ error: "Image uploads aren't configured — contact support" });
     }
 
-    const timestamp = Math.floor(Date.now() / 1000);
-    const uploadFolder = folder || "stallyard/listings";
-    const paramsToSign = `folder=${uploadFolder}&timestamp=${timestamp}`;
-    const signature = crypto
-      .createHash("sha1")
-      .update(paramsToSign + CLOUDINARY_API_SECRET)
-      .digest("hex");
-
-    const form = new URLSearchParams();
-    form.append("file", dataUrl);
-    form.append("folder", uploadFolder);
-    form.append("timestamp", String(timestamp));
-    form.append("api_key", CLOUDINARY_API_KEY);
-    form.append("signature", signature);
-
-    const cloudRes = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: form,
-    });
-    const cloudData = await cloudRes.json();
-    if (!cloudRes.ok) {
-      return res.status(400).json({ error: cloudData.error?.message || "Upload to Cloudinary failed" });
+    const match = String(dataUrl).match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/s);
+    if (!match) {
+      return res.status(400).json({ error: "Invalid image data" });
     }
+
+    const mimeType = match[1].toLowerCase();
+    const allowedTypes = new Set(["image/jpeg", "image/jpg", "image/png", "image/webp", "image/avif"]);
+    if (!allowedTypes.has(mimeType)) {
+      return res.status(400).json({ error: "Unsupported image type" });
+    }
+
+    let imageBuffer;
+    try {
+      imageBuffer = Buffer.from(match[2], "base64");
+    } catch {
+      return res.status(400).json({ error: "Couldn't decode image" });
+    }
+    if (!imageBuffer.length) {
+      return res.status(400).json({ error: "Image is empty" });
+    }
+
+    const extension = mimeType === "image/png" ? "png" : mimeType === "image/webp" ? "webp" : mimeType === "image/avif" ? "avif" : "jpg";
+    const safeFolder = String(folder || "listings")
+      .replace(/^\/+|\/+$/g, "")
+      .replace(/[^a-zA-Z0-9/_-]/g, "-") || "listings";
+    const objectPath = `${safeFolder}/${req.user.id}/${Date.now()}-${crypto.randomBytes(8).toString("hex")}.${extension}`;
+
+    const uploadUrl = `${SUPABASE_URL}/storage/v1/object/${encodeURIComponent(SUPABASE_BUCKET)}/${objectPath.split("/").map(encodeURIComponent).join("/")}`;
+    const storageRes = await fetch(uploadUrl, {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_SECRET_KEY,
+        "Content-Type": mimeType,
+        "x-upsert": "false",
+        "Cache-Control": "public, max-age=31536000, immutable",
+      },
+      body: imageBuffer,
+    });
+
+    let storageData = {};
+    try {
+      storageData = await storageRes.json();
+    } catch {
+      // Supabase may return a non-JSON error body; the generic message below is enough for the client.
+    }
+    if (!storageRes.ok) {
+      console.error("Supabase Storage upload failed:", storageRes.status, storageData);
+      return res.status(400).json({ error: storageData.message || storageData.error || "Upload to Supabase Storage failed" });
+    }
+
+    const encodedPath = objectPath.split("/").map(encodeURIComponent).join("/");
+    const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/${encodeURIComponent(SUPABASE_BUCKET)}/${encodedPath}`;
     res.json({
-      url: cloudData.secure_url,
-      width: cloudData.width,
-      height: cloudData.height,
-      publicId: cloudData.public_id,
+      url: publicUrl,
+      path: objectPath,
+      publicId: objectPath, // compatibility with the existing frontend response shape
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2753,13 +2801,14 @@ app.post("/checkout", authenticate, async (req, res) => {
       const itemResult = await client.query(
         `INSERT INTO order_items (
            order_id, listing_id, title, emoji, price, qty, shipping_fee,
-           seller_id, seller_username, seller_name, fulfillment_status
+           seller_id, seller_username, seller_name, fulfillment_status,
+           delivery_token, delivery_token_generated_at
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'new')
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'new', $11, NOW())
          RETURNING *`,
         [
           order.id, listing.id, listing.title, listing.emoji, price, qty, shippingFee,
-          listing.owner_id, seller?.username, seller?.display_name,
+          listing.owner_id, seller?.username, seller?.display_name, generateDeliveryTokenValue(),
         ]
       );
       insertedItems.push(itemResult.rows[0]);
@@ -2784,6 +2833,11 @@ app.post("/checkout", authenticate, async (req, res) => {
 function formatMoneyServer(amount, currency) {
   const symbol = currency === "NGN" ? "₦" : "$";
   return `${symbol}${Number(amount || 0).toFixed(2)}`;
+}
+
+function generateDeliveryTokenValue() {
+  // Cryptographically strong 10-digit delivery code generated once payment succeeds.
+  return crypto.randomInt(1000000000, 10000000000).toString();
 }
 
 async function finalizeOrderFromPaystackCharge(reference, paystackData) {
@@ -3065,7 +3119,7 @@ app.post("/checkout/pay-with-saved-card", authenticate, async (req, res) => {
   }
 });
 
-async function fetchOrdersWithItems(whereClause, params) {
+async function fetchOrdersWithItems(whereClause, params, { includeDeliveryTokens = false } = {}) {
   const ordersResult = await pool.query(
     `SELECT * FROM orders WHERE ${whereClause} ORDER BY created_at DESC`,
     params
@@ -3077,15 +3131,21 @@ async function fetchOrdersWithItems(whereClause, params) {
     `SELECT * FROM order_items WHERE order_id = ANY($1) ORDER BY id ASC`,
     [orderIds]
   );
+  const safeItems = itemsResult.rows.map((item) => {
+    if (includeDeliveryTokens) return item;
+    const { delivery_token, ...safe } = item;
+    return safe;
+  });
   return orders.map((o) => ({
     ...o,
-    items: itemsResult.rows.filter((i) => i.order_id === o.id),
+    items: safeItems.filter((i) => i.order_id === o.id),
   }));
 }
 
 app.get("/orders/mine", authenticate, async (req, res) => {
   try {
-    const orders = await fetchOrdersWithItems("buyer_id = $1", [req.user.id]);
+    // Only the buyer may receive the secret delivery token.
+    const orders = await fetchOrdersWithItems("buyer_id = $1", [req.user.id], { includeDeliveryTokens: true });
     res.json({ orders });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -3135,16 +3195,122 @@ app.patch("/orders/:id/release", authenticate, requirePermission("finance"), asy
 });
 
 app.patch("/orders/:id/refund", authenticate, requirePermission("finance"), async (req, res) => {
+  const client = await pool.connect();
+  let order;
   try {
-    const result = await pool.query(
-      "UPDATE orders SET payment_status = 'refunded' WHERE id = $1 RETURNING *",
+    if (!process.env.PAYSTACK_SECRET_KEY) {
+      return res.status(500).json({ error: "Paystack refunds aren't configured — contact support" });
+    }
+
+    await client.query("BEGIN");
+    const orderResult = await client.query(
+      "SELECT * FROM orders WHERE id = $1 FOR UPDATE",
       [req.params.id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: "Order not found" });
-    logAdminAction(req.user.id, "order_refunded", `Refunded order #${result.rows[0].id} ($${result.rows[0].total})`);
-    res.json({ order: result.rows[0] });
+    if (orderResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Order not found" });
+    }
+    order = orderResult.rows[0];
+
+    if (!order.paystack_reference) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "This order has no Paystack transaction reference, so it can't be refunded automatically." });
+    }
+    if (order.payment_status === "refunded") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "This order has already been refunded" });
+    }
+    if (order.payment_status === "refund_pending") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "A refund is already in progress for this order" });
+    }
+
+    const previousStatus = order.payment_status || "held";
+    const locked = await client.query(
+      `UPDATE orders SET
+         payment_status = 'refund_pending',
+         refund_status = 'requesting',
+         refund_previous_payment_status = $1,
+         refund_requested_at = NOW(),
+         refund_failure_reason = NULL
+       WHERE id = $2
+       RETURNING *`,
+      [previousStatus, req.params.id]
+    );
+    order = locked.rows[0];
+    await client.query("COMMIT");
+
+    let paystackRes;
+    let paystackData;
+    try {
+      paystackRes = await fetch("https://api.paystack.co/refund", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          transaction: order.paystack_reference,
+          amount: Math.round(Number(order.total) * 100),
+          currency: order.currency || "NGN",
+          customer_note: `Refund for Stallyard order #${order.id}`,
+          merchant_note: `Admin ${req.user.username} initiated refund for Stallyard order #${order.id}`,
+        }),
+      });
+      paystackData = await paystackRes.json();
+    } catch (err) {
+      await pool.query(
+        `UPDATE orders SET refund_status = 'request_unknown', refund_failure_reason = $1 WHERE id = $2`,
+        ["Could not confirm whether Paystack received the refund request. Check Paystack before retrying.", req.params.id]
+      );
+      return res.status(502).json({
+        error: "Couldn't confirm the refund request with Paystack. The order is locked as refund pending so it isn't paid out twice. Check Paystack before retrying.",
+      });
+    }
+
+    if (!paystackRes.ok || !paystackData.status) {
+      const message = paystackData.message || "Paystack rejected the refund request";
+      const restored = await pool.query(
+        `UPDATE orders SET
+           payment_status = COALESCE(refund_previous_payment_status, 'held'),
+           refund_status = 'failed',
+           refund_failure_reason = $1
+         WHERE id = $2
+         RETURNING *`,
+        [message, req.params.id]
+      );
+      return res.status(400).json({ error: message, order: restored.rows[0] });
+    }
+
+    const refund = paystackData.data || {};
+    const updated = await pool.query(
+      `UPDATE orders SET
+         payment_status = 'refund_pending',
+         refund_status = $1,
+         paystack_refund_id = $2,
+         refund_failure_reason = NULL
+       WHERE id = $3
+       RETURNING *`,
+      [refund.status || "pending", refund.id || null, req.params.id]
+    );
+
+    logAdminAction(
+      req.user.id,
+      "refund_requested",
+      `Requested Paystack refund for order #${order.id} (${formatMoneyServer(order.total, order.currency)})`
+    );
+    createNotification(
+      order.buyer_id,
+      "refund_started",
+      `Your refund for order #${order.id} has been submitted for processing.`
+    );
+    res.json({ order: updated.rows[0], paystackMessage: paystackData.message || "Refund queued" });
   } catch (err) {
+    try { await client.query("ROLLBACK"); } catch {}
     res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -3243,11 +3409,15 @@ async function markItemReceivedAndMaybeRelease(itemId) {
   createNotification(item.seller_id, "delivery_confirmed", `Buyer confirmed delivery for "${item.title}"`);
   const allItems = await pool.query("SELECT * FROM order_items WHERE order_id = $1", [item.order_id]);
   const relevant = allItems.rows.filter((r) => !["cancelled", "returned"].includes(r.fulfillment_status));
-  const allConfirmed = relevant.length > 0 && relevant.every((r) => r.buyer_confirmed_at);
+  const allConfirmed = relevant.length > 0 && relevant.every(
+    (r) => r.buyer_confirmed_at && r.proof_of_delivery_url && !["requested", "approved"].includes(r.return_status)
+  );
   let order = null;
   if (allConfirmed) {
     const orderRes = await pool.query(
-      "UPDATE orders SET payment_status = 'released' WHERE id = $1 AND payment_status = 'held' RETURNING *",
+      `UPDATE orders SET payment_status = 'released'
+       WHERE id = $1 AND payment_status = 'held' AND COALESCE(is_disputed, false) = false
+       RETURNING *`,
       [item.order_id]
     );
     order = orderRes.rows[0] || null;
@@ -3262,26 +3432,12 @@ async function markItemReceivedAndMaybeRelease(itemId) {
 }
 
 app.patch("/order-items/:id/confirm-receipt", authenticate, async (req, res) => {
-  try {
-    const existing = await pool.query(
-      `SELECT oi.*, o.buyer_id, o.payment_status
-       FROM order_items oi JOIN orders o ON oi.order_id = o.id
-       WHERE oi.id = $1`,
-      [req.params.id]
-    );
-    if (existing.rows.length === 0) return res.status(404).json({ error: "Order item not found" });
-    const item = existing.rows[0];
-    if (item.buyer_id !== req.user.id) {
-      return res.status(403).json({ error: "Only the buyer can confirm receipt of this item" });
-    }
-    if (!["shipped", "delivered"].includes(item.fulfillment_status)) {
-      return res.status(400).json({ error: "This item hasn't been shipped yet" });
-    }
-    const { item: updatedItem, order } = await markItemReceivedAndMaybeRelease(req.params.id);
-    res.json({ item: updatedItem, order });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  // Stallyard's release flow requires the seller to submit BOTH the buyer's
+  // delivery token and proof-of-delivery photo. A buyer-side confirmation
+  // must not bypass those safeguards.
+  return res.status(400).json({
+    error: "Delivery is confirmed when the seller submits your delivery code together with proof of delivery."
+  });
 });
 
 app.post("/order-items/:id/request-return", authenticate, async (req, res) => {
@@ -3379,8 +3535,6 @@ app.patch("/order-items/:id/return-tracking", authenticate, async (req, res) => 
   }
 });
 
-const DELIVERY_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-
 app.post("/order-items/:id/generate-delivery-token", authenticate, async (req, res) => {
   try {
     const existing = await pool.query(
@@ -3392,15 +3546,15 @@ app.post("/order-items/:id/generate-delivery-token", authenticate, async (req, r
     if (existing.rows.length === 0) return res.status(404).json({ error: "Order item not found" });
     const item = existing.rows[0];
     if (item.buyer_id !== req.user.id) {
-      return res.status(403).json({ error: "Only the buyer can generate a delivery code for this item" });
-    }
-    if (!["shipped", "delivered"].includes(item.fulfillment_status)) {
-      return res.status(400).json({ error: "This item hasn't been shipped yet" });
+      return res.status(403).json({ error: "Only the buyer can access a delivery code for this item" });
     }
     if (item.buyer_confirmed_at) {
       return res.status(400).json({ error: "This item has already been confirmed as received" });
     }
-    const token = Math.floor(1000000000 + Math.random() * 9000000000).toString();
+    // Tokens are normally generated automatically when payment succeeds.
+    // This endpoint only recovers/creates one for older orders or migrations.
+    if (item.delivery_token) return res.json({ token: item.delivery_token });
+    const token = generateDeliveryTokenValue();
     await pool.query(
       "UPDATE order_items SET delivery_token = $1, delivery_token_generated_at = NOW() WHERE id = $2",
       [token, req.params.id]
@@ -3415,18 +3569,32 @@ app.post("/order-items/:id/redeem-delivery-token", authenticate, codeRateLimit, 
   try {
     const { token } = req.body;
     if (!token) return res.status(400).json({ error: "Enter the code the buyer gave you" });
-    const existing = await pool.query("SELECT * FROM order_items WHERE id = $1", [req.params.id]);
+    const existing = await pool.query(
+      `SELECT oi.*, o.payment_status, o.is_disputed
+       FROM order_items oi
+       JOIN orders o ON oi.order_id = o.id
+       WHERE oi.id = $1`,
+      [req.params.id]
+    );
     if (existing.rows.length === 0) return res.status(404).json({ error: "Order item not found" });
     const item = existing.rows[0];
     if (!req.user.isAdmin && item.seller_id !== req.user.id) {
       return res.status(403).json({ error: "You can only redeem codes for your own items" });
     }
-    if (
-      !item.delivery_token ||
-      !item.delivery_token_generated_at ||
-      Date.now() - new Date(item.delivery_token_generated_at).getTime() > DELIVERY_TOKEN_TTL_MS
-    ) {
-      return res.status(400).json({ error: "No active code for this item — ask the buyer to generate a new one" });
+    if (item.payment_status !== "held") {
+      return res.status(400).json({ error: "This order's payment is not currently being held" });
+    }
+    if (item.is_disputed) {
+      return res.status(409).json({ error: "Payment is locked because this order has an active dispute" });
+    }
+    if (["requested", "approved"].includes(item.return_status)) {
+      return res.status(409).json({ error: "Payment is locked because a return is in progress" });
+    }
+    if (!item.proof_of_delivery_url) {
+      return res.status(400).json({ error: "Upload a delivery picture before entering the buyer's code" });
+    }
+    if (!item.delivery_token) {
+      return res.status(400).json({ error: "No active delivery code exists for this item" });
     }
     if (item.delivery_token !== String(token).trim()) {
       return res.status(400).json({ error: "That code doesn't match — check and try again" });
@@ -3509,6 +3677,60 @@ app.post("/webhook/paystack", async (req, res) => {
         await finalizeOrderFromPaystackCharge(event.data.reference, event.data);
       } catch (err) {
         console.error("Webhook order finalization error:", err.message);
+      }
+    }
+
+    if (event.event && event.event.startsWith("refund.")) {
+      const data = event.data || {};
+      const transactionReference = data.transaction_reference || data.transaction?.reference || null;
+      if (transactionReference) {
+        try {
+          const orderResult = await pool.query(
+            "SELECT id, buyer_id, payment_status, refund_previous_payment_status FROM orders WHERE paystack_reference = $1",
+            [transactionReference]
+          );
+          if (orderResult.rows.length) {
+            const order = orderResult.rows[0];
+            const refundStatus = data.status || event.event.replace("refund.", "");
+
+            if (event.event === "refund.processed") {
+              await pool.query(
+                `UPDATE orders SET
+                   payment_status = 'refunded',
+                   refund_status = 'processed',
+                   paystack_refund_id = COALESCE($1, paystack_refund_id),
+                   refunded_at = NOW(),
+                   refund_failure_reason = NULL
+                 WHERE id = $2`,
+                [data.id || null, order.id]
+              );
+              createNotification(order.buyer_id, "refund_processed", `Your refund for order #${order.id} has been processed.`);
+            } else if (event.event === "refund.failed") {
+              await pool.query(
+                `UPDATE orders SET
+                   payment_status = COALESCE(refund_previous_payment_status, 'held'),
+                   refund_status = 'failed',
+                   paystack_refund_id = COALESCE($1, paystack_refund_id),
+                   refund_failure_reason = $2
+                 WHERE id = $3`,
+                [data.id || null, data.reason || "Paystack reported that the refund failed", order.id]
+              );
+              createNotification(order.buyer_id, "refund_failed", `The refund for order #${order.id} could not be completed. Stallyard support will review it.`);
+            } else {
+              await pool.query(
+                `UPDATE orders SET
+                   payment_status = 'refund_pending',
+                   refund_status = $1,
+                   paystack_refund_id = COALESCE($2, paystack_refund_id),
+                   refund_failure_reason = $3
+                 WHERE id = $4`,
+                [refundStatus, data.id || null, event.event === "refund.needs-attention" ? (data.reason || "Customer bank details are required") : null, order.id]
+              );
+            }
+          }
+        } catch (err) {
+          console.error("Refund webhook handling error:", err.message);
+        }
       }
     }
 
