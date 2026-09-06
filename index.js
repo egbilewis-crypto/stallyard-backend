@@ -6,8 +6,53 @@ const cors = require("cors");
 const jwt = require("jsonwebtoken");
 
 const app = express();
-app.set("trust proxy", true);
-app.use(cors());
+
+// Railway sits behind a reverse proxy. Trust the first proxy hop so req.ip
+// reflects the visitor rather than Railway's internal proxy address, without
+// blindly trusting an arbitrary chain of forwarded IPs.
+app.set("trust proxy", 1);
+app.disable("x-powered-by");
+
+// Browser access is limited to the real Stallyard domains. Additional origins
+// (for example a temporary preview deployment) can be supplied in Railway as
+// a comma-separated ALLOWED_ORIGINS environment variable. Requests without an
+// Origin header are still allowed because server-to-server calls and webhooks
+// normally do not send one.
+const DEFAULT_ALLOWED_ORIGINS = [
+  "https://stallyard.com",
+  "https://www.stallyard.com",
+];
+const EXTRA_ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const ALLOWED_ORIGINS = new Set([...DEFAULT_ALLOWED_ORIGINS, ...EXTRA_ALLOWED_ORIGINS]);
+
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin || ALLOWED_ORIGINS.has(origin)) return callback(null, true);
+    return callback(new Error("Origin not allowed by CORS"));
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Paystack-Signature"],
+  maxAge: 86400,
+};
+app.use(cors(corsOptions));
+
+// Lightweight production security headers. These protect the API without
+// introducing another dependency such as helmet.
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'");
+  if (process.env.NODE_ENV === "production") {
+    res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  }
+  next();
+});
+
 app.use(express.json({ limit: "15mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 
 const pool = new Pool({
