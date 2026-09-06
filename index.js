@@ -21,10 +21,6 @@ if (!JWT_SECRET) {
 }
 
 function signToken(user) {
-  // Admin sessions expire fast — 24 hours instead of the usual 30 days —
-  // since a leaked or stolen admin token is a much bigger deal than a
-  // regular shopper's. Everyone else keeps the longer, more convenient
-  // session length.
   return jwt.sign(
     { id: user.id, username: user.username, isAdmin: !!user.is_admin, tokenVersion: user.token_version || 0 },
     JWT_SECRET,
@@ -32,8 +28,6 @@ function signToken(user) {
   );
 }
 
-// Reads and verifies a bearer token if present. Returns the decoded payload,
-// or null if there's no token or it's invalid/expired — never throws.
 function getRequester(req) {
   const authHeader = req.headers.authorization || "";
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
@@ -45,10 +39,6 @@ function getRequester(req) {
   }
 }
 
-// Requires a valid token, AND re-checks the account against the database —
-// not just the token's baked-in claims. Tokens last 30 days, so without
-// this, suspending a user or revoking someone's admin access wouldn't
-// actually take effect until their existing token expired on its own.
 async function authenticate(req, res, next) {
   const requester = getRequester(req);
   if (!requester) return res.status(401).json({ error: "Sign in required" });
@@ -79,10 +69,6 @@ async function authenticate(req, res, next) {
   }
 }
 
-// Must follow authenticate(). Requires the token to belong to an admin —
-// and, since two-factor is mandatory for admins, that they've actually
-// turned it on. (The /profile/two-factor endpoint itself doesn't use this
-// gate, so an admin can always reach it to turn 2FA on in the first place.)
 function requireAdmin(req, res, next) {
   if (!req.user?.isAdmin) return res.status(403).json({ error: "Admin access required" });
   if (!req.user.twoFactorEnabled) {
@@ -91,11 +77,6 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// Six admin roles, matching Stallyard's actual moderation/finance/support
-// workflows. super_admin has every permission implicitly (checked as a
-// special case below, rather than listed out) — everyone else only gets
-// exactly what their role needs, on the principle that most staff should
-// never be able to touch money or user accounts.
 const ADMIN_ROLES = new Set([
   "super_admin", "seller_verification", "listing_moderator",
   "order_dispute", "finance", "customer_support",
@@ -109,9 +90,6 @@ const ROLE_PERMISSIONS = {
   customer_support: new Set(["support_tickets"]),
 };
 
-// A missing admin_role (legacy admins from before roles existed, or any
-// edge case) is treated as super_admin — that's simply what is_admin has
-// always meant, preserved exactly as it worked before this feature.
 function hasPermission(user, permission) {
   if (!user?.isAdmin) return false;
   if (!user.twoFactorEnabled) return false;
@@ -120,11 +98,6 @@ function hasPermission(user, permission) {
   return allowed ? allowed.has(permission) : false;
 }
 
-// Must follow authenticate(). Use for actions scoped to one specific role's
-// job — approving sellers, moderating listings, resolving disputes, moving
-// money, or replying to support tickets. Every admin can still view
-// accounts/orders (that's just requireAdmin) — this is for the narrower,
-// higher-stakes actions.
 function requirePermission(permission) {
   return (req, res, next) => {
     if (req.user?.isAdmin && !req.user.twoFactorEnabled) {
@@ -137,8 +110,6 @@ function requirePermission(permission) {
   };
 }
 
-// Simple in-memory cache so repeat requests from the same network within 24h
-// don't burn through the IPQualityScore free-tier quota (1,000/month).
 const vpnCheckCache = new Map();
 const VPN_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -148,10 +119,6 @@ function getClientIp(req) {
   return req.ip;
 }
 
-// Lightweight in-memory rate limiter — no external package needed. Tracks
-// hits per IP within a rolling window; resets on redeploy, which is fine
-// for this app's scale. Applied to auth-adjacent endpoints that would
-// otherwise be brute-forceable (login, verification codes, signup).
 function rateLimit({ windowMs, max, message }) {
   const hits = new Map();
   setInterval(() => {
@@ -178,9 +145,6 @@ function rateLimit({ windowMs, max, message }) {
 
 const authRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: "Too many attempts — please wait 15 minutes and try again." });
 
-// Fire-and-forget notification insert — failures are logged, never thrown,
-// so a notification glitch can never break the actual action (a sale,
-// a message, etc.) that triggered it.
 async function createNotification(userId, type, message) {
   if (!userId) return;
   try {
@@ -190,8 +154,6 @@ async function createNotification(userId, type, message) {
   }
 }
 
-// Same fire-and-forget pattern, for the admin audit log — records who did
-// what, without ever letting a logging failure break the actual action.
 function logAdminAction(adminId, action, details) {
   pool
     .query("INSERT INTO admin_audit_log (admin_id, action, details) VALUES ($1, $2, $3)", [adminId, action, details])
@@ -200,11 +162,8 @@ function logAdminAction(adminId, action, details) {
 
 const codeRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 8, message: "Too many attempts — please wait 15 minutes and try again." });
 
-// Returns true (VPN/proxy/Tor detected), false (clean), or null (couldn't
-// check — caller should fail open rather than lock everyone out over a
-// third-party outage or missing API key).
 async function isVpnOrProxy(ip) {
-  if (!ip || ip === "::1" || ip === "127.0.0.1") return false; // local/dev testing
+  if (!ip || ip === "::1" || ip === "127.0.0.1") return false;
   const cached = vpnCheckCache.get(ip);
   if (cached && Date.now() - cached.checkedAt < VPN_CACHE_TTL_MS) return cached.result;
 
@@ -226,13 +185,9 @@ async function isVpnOrProxy(ip) {
   }
 }
 
-// Phone numbers are far more stable than IP/VPN status, so this cache lasts
-// much longer (7 days) — same key as the VPN check, no extra setup needed.
 const phoneCheckCache = new Map();
 const PHONE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
-// Returns { blocked: boolean, reason: string } or null if the check couldn't
-// run (missing key or API error) — callers should fail open in that case.
 async function checkPhoneNumber(phone) {
   const cached = phoneCheckCache.get(phone);
   if (cached && Date.now() - cached.checkedAt < PHONE_CACHE_TTL_MS) return cached.result;
@@ -263,21 +218,12 @@ async function checkPhoneNumber(phone) {
   }
 }
 
-// In-memory store mapping phone -> Termii's pinId, so the frontend only ever
-// has to deal with phone + code, same as before. Short TTL matching the OTP
-// lifetime itself.
 const termiiPinIds = new Map();
 const TERMII_PIN_TTL_MS = 10 * 60 * 1000;
 
-// Records phone numbers that passed /phone-verify/check, so a follow-up
-// authenticated call can attach that verified number to an account —
-// mirrors how verifiedEmails works for email.
 const verifiedPhones = new Map();
 const PHONE_VERIFIED_TTL_MS = 30 * 60 * 1000;
 
-// Sends a real SMS one-time code via Termii — a Nigeria-founded provider with
-// much better deliverability to Nigerian carriers (MTN, Airtel, Glo, 9mobile)
-// than generic international providers, including DND bypass for OTPs.
 app.post("/phone-verify/send", async (req, res) => {
   try {
     const { phone } = req.body;
@@ -286,7 +232,7 @@ app.post("/phone-verify/send", async (req, res) => {
       return res.status(500).json({ error: "SMS verification isn't configured yet" });
     }
 
-    const to = phone.replace(/[^0-9]/g, ""); // Termii wants digits only, no leading +
+    const to = phone.replace(/[^0-9]/g, "");
     const termiiRes = await fetch("https://api.ng.termii.com/api/sms/otp/send", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -315,7 +261,6 @@ app.post("/phone-verify/send", async (req, res) => {
   }
 });
 
-// Checks the code the user typed in against Termii's record for that number.
 app.post("/phone-verify/check", async (req, res) => {
   try {
     const { phone, code } = req.body;
@@ -353,22 +298,12 @@ app.post("/phone-verify/check", async (req, res) => {
   }
 });
 
-// In-memory store mapping email -> {code, sentAt}. Mirrors the Termii pinId
-// bridge pattern used for phone, but simpler since we generate the code
-// ourselves rather than relying on the provider to hold state for us.
 const emailCodes = new Map();
 const EMAIL_CODE_TTL_MS = 15 * 60 * 1000;
 
-// Records emails that have actually passed /email-verify/check, so /signup
-// can trust this instead of a client-supplied "emailVerified" flag — which
-// could otherwise be sent as true directly via the API without ever
-// checking a code. Entries are consumed (deleted) once used for a signup.
 const verifiedEmails = new Map();
 const EMAIL_VERIFIED_TTL_MS = 30 * 60 * 1000;
 
-// Sends a real verification email via Resend. Phone/SMS verification is
-// paused for now (Termii country-activation issues) — email is the primary
-// verification channel while Stallyard focuses on Nigeria.
 app.post("/email-verify/send", codeRateLimit, async (req, res) => {
   try {
     const { email } = req.body;
@@ -404,7 +339,6 @@ app.post("/email-verify/send", codeRateLimit, async (req, res) => {
   }
 });
 
-// Checks the code the user typed in against our record for that email.
 app.post("/email-verify/check", codeRateLimit, async (req, res) => {
   try {
     const { email, code } = req.body;
@@ -425,31 +359,17 @@ app.post("/email-verify/check", codeRateLimit, async (req, res) => {
   }
 });
 
-// In-memory store for password reset codes, mirroring the email-verify
-// pattern above. Keyed by lowercased username.
 const passwordResetCodes = new Map();
 const PASSWORD_RESET_CODE_TTL_MS = 15 * 60 * 1000;
 
-// Two-factor login codes — keyed by user id, since by this point in the
-// login flow the account is already resolved.
 const twoFactorCodes = new Map();
 const TWO_FACTOR_CODE_TTL_MS = 10 * 60 * 1000;
 
-// Codes for the "turn two-factor ON" flow specifically — kept separate from
-// twoFactorCodes above so an in-progress enable doesn't collide with an
-// in-progress login or admin-reauth code for the same account.
 const twoFactorEnableCodes = new Map();
 
-// Marks that an admin has passed the authenticator-app step during login or
-// admin-reauth, so the mandatory email step can't be reached by calling it
-// directly — both factors are required, in order.
 const totpVerifiedMarkers = new Map();
 const TOTP_VERIFIED_MARKER_TTL_MS = 10 * 60 * 1000;
 
-// --- TOTP (RFC 6238) helpers for admin Google Authenticator 2FA ---
-// This is the same 6-digit, 30-second-step algorithm Google Authenticator,
-// Authy, and 1Password all implement. Written directly on Node's built-in
-// crypto module so no extra npm dependency is needed.
 const crypto = require("crypto");
 const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
@@ -499,8 +419,6 @@ function totpCodeForCounter(secretBuffer, counter) {
   return String(binCode % 1000000).padStart(6, "0");
 }
 
-// Allows one 30-second step of drift either way, which is standard practice
-// for TOTP since phone clocks and server clocks are never perfectly synced.
 function verifyTotpCode(base32Secret, code) {
   const cleanCode = String(code || "").trim();
   if (!/^\d{6}$/.test(cleanCode)) return false;
@@ -512,13 +430,6 @@ function verifyTotpCode(base32Secret, code) {
   return false;
 }
 
-// --- Column-level encryption for sensitive stored fields ---
-// Covers Paystack authorization tokens (saved cards) and seller bank
-// details — AES-256-GCM with a key that lives only in Railway's
-// environment variables, never in the database or the code. Values are
-// tagged with an "enc:v1:" prefix so decryptFieldSafe can tell an
-// already-encrypted value apart from older plaintext rows written before
-// this existed, and handle both without needing a one-time data migration.
 function getFieldEncryptionKey() {
   const raw = process.env.FIELD_ENCRYPTION_KEY;
   if (!raw) return null;
@@ -536,11 +447,6 @@ function encryptField(plaintext) {
   return `enc:v1:${iv.toString("base64")}:${authTag.toString("base64")}:${ciphertext.toString("base64")}`;
 }
 
-// Decrypts a value written by encryptField. Values that don't carry the
-// "enc:v1:" prefix are assumed to be legacy plaintext (written before
-// encryption was added) and are returned as-is rather than failing —
-// existing bank details and cards keep working without needing to be
-// re-saved, and naturally become encrypted the next time they're updated.
 function decryptFieldSafe(value) {
   if (!value || !String(value).startsWith("enc:v1:")) return value;
   const key = getFieldEncryptionKey();
@@ -557,24 +463,13 @@ function decryptFieldSafe(value) {
   return plaintext.toString("utf8");
 }
 
-// A plain, deterministic fingerprint of a value that's stored encrypted —
-// used only to detect duplicates (e.g. "this card is already saved"),
-// never to recover the original value. SHA-256 can't be reversed, so this
-// is safe to index even though the encrypted column next to it can't be.
 function hashField(value) {
   return crypto.createHash("sha256").update(String(value)).digest("hex");
 }
 
-// Pending bank-account changes awaiting email confirmation — only required
-// when *changing* an existing account on file, not the first-time setup.
-// Keyed by user id; holds the new details until the code is confirmed.
 const pendingBankChanges = new Map();
 const BANK_CHANGE_CODE_TTL_MS = 15 * 60 * 1000;
 
-// Step 1: look up the account by username, email the code to the address
-// on file. Deliberately doesn't reveal the email address itself in the
-// response beyond a masked preview, and doesn't let the frontend supply
-// its own code — everything here is server-generated and server-checked.
 app.post("/password-reset/send", authRateLimit, async (req, res) => {
   try {
     const { username } = req.body;
@@ -616,9 +511,6 @@ app.post("/password-reset/send", authRateLimit, async (req, res) => {
   }
 });
 
-// Step 2: check the code. On success, issues a short-lived reset token
-// (10 min) rather than letting the frontend hold onto the raw code — the
-// code itself is single-use and deleted here either way.
 app.post("/password-reset/verify-code", codeRateLimit, async (req, res) => {
   try {
     const { username, code } = req.body;
@@ -641,9 +533,6 @@ app.post("/password-reset/verify-code", codeRateLimit, async (req, res) => {
   }
 });
 
-// Step 3: the actual password change. Requires the short-lived reset token
-// from step 2, not just a username — this is what makes the flow real,
-// versus the old version which never touched the database at all.
 app.post("/password-reset/confirm", authRateLimit, async (req, res) => {
   try {
     const { resetToken, newPassword } = req.body;
@@ -683,10 +572,6 @@ app.get("/db-check", async (req, res) => {
   }
 });
 
-// Migration endpoints are visited directly in the browser (no way to send
-// an Authorization header that way), so they're protected by a shared key
-// in the URL instead of the normal Bearer-token auth. Set MIGRATION_KEY in
-// Railway's Variables tab, then visit /migrate/whatever?key=that-value.
 function requireMigrationKey(req, res, next) {
   if (!process.env.MIGRATION_KEY) {
     return res.status(500).send("MIGRATION_KEY isn't set in Railway — add it under Variables before running migrations.");
@@ -697,9 +582,6 @@ function requireMigrationKey(req, res, next) {
   next();
 }
 
-// One-time migration: adds the columns needed for account type, ID
-// verification documents, and admin-facing member data. Safe to visit
-// more than once — IF NOT EXISTS means it won't duplicate anything.
 app.get("/migrate/members-extra", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -718,7 +600,6 @@ app.get("/migrate/members-extra", requireMigrationKey, async (req, res) => {
   }
 });
 
-// One-time migration: creates the follows table (seller storefront follow/unfollow).
 app.get("/migrate/follows", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -736,9 +617,6 @@ app.get("/migrate/follows", requireMigrationKey, async (req, res) => {
   }
 });
 
-// One-time migration: adds every field a real listing needs (images, auctions,
-// currency, fitment, status, featured flag) that the original listings table
-// didn't have.
 app.get("/migrate/listings-extra", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -762,8 +640,6 @@ app.get("/migrate/listings-extra", requireMigrationKey, async (req, res) => {
   }
 });
 
-// One-time migration: real multi-seller cart orders, per-item payout tracking,
-// and a withdrawals ledger with server-computed balances.
 app.get("/migrate/orders-wallet", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -814,8 +690,6 @@ app.get("/migrate/orders-wallet", requireMigrationKey, async (req, res) => {
   }
 });
 
-// One-time migration: cart and watchlist tables, so they follow the user
-// across devices instead of living only in one browser's local storage.
 app.get("/migrate/signup-stages", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -823,8 +697,6 @@ app.get("/migrate/signup-stages", requireMigrationKey, async (req, res) => {
         ADD COLUMN IF NOT EXISTS is_email_verified BOOLEAN DEFAULT false,
         ADD COLUMN IF NOT EXISTS profile_complete BOOLEAN DEFAULT false
     `);
-    // Phone is no longer required at stage one — SMS verification is
-    // paused, and email is now the primary verification channel.
     await pool.query(`ALTER TABLE users ALTER COLUMN phone DROP NOT NULL`);
     res.send("Migration complete: signup-stages columns added, phone made optional.");
   } catch (err) {
@@ -840,8 +712,6 @@ app.get("/migrate/seller-verification", requireMigrationKey, async (req, res) =>
         ADD COLUMN IF NOT EXISTS bank_statement_url TEXT,
         ADD COLUMN IF NOT EXISTS rejection_reason TEXT
     `);
-    // Backfill verification_status from the existing is_approved /
-    // has_applied_to_sell booleans so nobody's current state changes.
     await pool.query(`
       UPDATE users SET verification_status =
         CASE WHEN is_approved THEN 'approved'
@@ -1077,11 +947,6 @@ app.get("/migrate/addresses", requireMigrationKey, async (req, res) => {
   }
 });
 
-// Real Paystack charging on checkout: tracks which Paystack transaction
-// paid for each order, plus enough about how they paid (channel, card
-// type, bank) to show a buyer their past payment methods. The unique
-// index on paystack_reference is what makes the webhook safe to receive
-// more than once for the same payment without creating a duplicate order.
 app.get("/migrate/paystack-checkout", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -1102,11 +967,6 @@ app.get("/migrate/paystack-checkout", requireMigrationKey, async (req, res) => {
   }
 });
 
-// Saved cards for one-tap repeat checkout. Only ever stores Paystack's
-// reusable "authorization_code" token — never a card number, CVV, or
-// anything else that would need PCI compliance on our end. The token is
-// useless outside our own Paystack secret key, so it's safe to hold even
-// though it lets us charge the card again.
 app.get("/migrate/saved-cards", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -1124,11 +984,6 @@ app.get("/migrate/saved-cards", requireMigrationKey, async (req, res) => {
         created_at TIMESTAMP DEFAULT NOW()
       )
     `);
-    // authorization_code itself is encrypted (a different value every time,
-    // by design) so it can't be used to detect "this card is already
-    // saved" — authorization_code_hash is a plain, deterministic
-    // fingerprint of the same value, safe to index on since it can't be
-    // reversed back into the original code.
     await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS authorization_code_hash TEXT`);
     await pool.query(`DROP INDEX IF EXISTS idx_saved_cards_user_auth`);
     await pool.query(`
@@ -1160,9 +1015,6 @@ app.get("/migrate/tax-rate", requireMigrationKey, async (req, res) => {
   }
 });
 
-// Auto-moderation results live here, separate from hidden_image_urls —
-// flagging is just a signal for admin review, never an automatic takedown.
-// Each entry is { url, reasons: string[] }.
 app.get("/migrate/flagged-images", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`ALTER TABLE listings ADD COLUMN IF NOT EXISTS flagged_images JSONB DEFAULT '[]'::jsonb`);
@@ -1172,9 +1024,6 @@ app.get("/migrate/flagged-images", requireMigrationKey, async (req, res) => {
   }
 });
 
-// Lets an admin temporarily hide one photo from a listing (e.g. it's
-// blurry, or looks like a screenshot) without touching the rest of the
-// listing or forcing the seller to redo the whole thing.
 app.get("/migrate/hidden-images", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`ALTER TABLE listings ADD COLUMN IF NOT EXISTS hidden_image_urls JSONB DEFAULT '[]'::jsonb`);
@@ -1239,9 +1088,6 @@ app.get("/migrate/seller-performance", requireMigrationKey, async (req, res) => 
 app.get("/migrate/admin-roles", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_role TEXT`);
-    // Every existing admin becomes super_admin — preserves exactly the
-    // access they already had. Going forward, new admins need an explicit
-    // role assigned.
     await pool.query(`UPDATE users SET admin_role = 'super_admin' WHERE is_admin = true AND admin_role IS NULL`);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS admin_audit_log (
@@ -1371,12 +1217,6 @@ app.get("/migrate/cart-watchlist", requireMigrationKey, async (req, res) => {
   }
 });
 
-// Stage one: the fast, minimal sign-up. Just enough to create an account
-// and log in — username, email, password. Everything else (name, country,
-// account type, ID documents) is filled in later via /profile/complete, and
-// the user can log in and resume that at any time since profile_complete
-// starts false. Email must already be verified (via /email-verify/send +
-// /email-verify/check) before this is called.
 app.post("/signup", authRateLimit, async (req, res) => {
   try {
     const { username, email, password, displayName } = req.body;
@@ -1387,9 +1227,6 @@ app.post("/signup", authRateLimit, async (req, res) => {
     if (password.length < 8) {
       return res.status(400).json({ error: "Password must be at least 8 characters" });
     }
-    // Trust our own record of a passed /email-verify/check, not a
-    // client-supplied "emailVerified" flag — that could be sent as true
-    // directly via the API without ever checking a code.
     const verifiedAt = verifiedEmails.get(email.toLowerCase());
     if (!verifiedAt || Date.now() - verifiedAt > EMAIL_VERIFIED_TTL_MS) {
       return res.status(400).json({ error: "Verify your email before creating an account" });
@@ -1427,11 +1264,6 @@ app.post("/signup", authRateLimit, async (req, res) => {
   }
 });
 
-// Stage two: fill in the rest of the profile (name, phone, country, account
-// type, ID documents). Can be called as many times as needed — a user can
-// stop partway through and resume later, since nothing here is required to
-// log in. Country/US-block and seller approval rules are evaluated here,
-// once we actually know the country.
 app.patch("/profile/complete", authenticate, async (req, res) => {
   try {
     const {
@@ -1494,10 +1326,6 @@ app.patch("/profile/complete", authenticate, async (req, res) => {
   }
 });
 
-// Updates the storefront-facing profile bits: photo, bio, and store
-// policies. Deliberately separate from /profile/complete, which carries
-// unrelated signup-completion and ID-verification logic — this endpoint
-// is just simple, always-editable fields.
 app.patch("/profile/store", authenticate, async (req, res) => {
   try {
     const { avatarUrl, storeBio, storePolicies } = req.body;
@@ -1517,8 +1345,6 @@ app.patch("/profile/store", authenticate, async (req, res) => {
   }
 });
 
-// Change password while logged in — requires the current password, unlike
-// the forgot-password flow which is for when you're locked out entirely.
 app.patch("/profile/change-password", authenticate, authRateLimit, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
@@ -1535,10 +1361,6 @@ app.patch("/profile/change-password", authenticate, authRateLimit, async (req, r
       return res.status(401).json({ error: "Current password doesn't match" });
     }
     const newHash = await bcrypt.hash(newPassword, 10);
-    // Bumping token_version here signs out every other device using the old
-    // password — standard practice, since a password change is often a
-    // response to "something felt off." We issue this session a fresh
-    // token immediately after so the person doesn't get logged out too.
     const updated = await pool.query(
       `UPDATE users SET password_hash = $1, token_version = COALESCE(token_version, 0) + 1
        WHERE id = $2 RETURNING ${USER_RETURNING_FIELDS}`,
@@ -1550,10 +1372,6 @@ app.patch("/profile/change-password", authenticate, authRateLimit, async (req, r
   }
 });
 
-// Signs out every other device/session by bumping the token version —
-// all previously issued tokens instantly fail the version check in
-// authenticate(). Issues a fresh token for this session so the person
-// doing this stays logged in themselves.
 app.post("/profile/sign-out-other-devices", authenticate, async (req, res) => {
   try {
     const result = await pool.query(
@@ -1567,9 +1385,6 @@ app.post("/profile/sign-out-other-devices", authenticate, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-// --- Saved addresses (multiple, unlike the single legacy shipping_address
-// field on users) ---
 
 app.get("/addresses", authenticate, async (req, res) => {
   try {
@@ -1589,8 +1404,6 @@ app.post("/addresses", authenticate, async (req, res) => {
     if (!street || !city || !country) {
       return res.status(400).json({ error: "Street, city, and country are required" });
     }
-    // First address a person saves becomes their default automatically,
-    // even if they didn't check the box for it.
     const existingCount = await pool.query("SELECT COUNT(*) FROM user_addresses WHERE user_id = $1", [req.user.id]);
     const shouldBeDefault = !!isDefault || Number(existingCount.rows[0].count) === 0;
     if (shouldBeDefault) {
@@ -1661,9 +1474,6 @@ app.delete("/addresses/:id", authenticate, async (req, res) => {
       return res.status(403).json({ error: "You can only delete your own addresses" });
     }
     await pool.query("DELETE FROM user_addresses WHERE id = $1", [req.params.id]);
-    // If the deleted one was the default, hand default status to whichever
-    // address was saved most recently, so there's always a clear default
-    // as long as at least one address remains.
     if (existing.rows[0].is_default) {
       const remaining = await pool.query(
         "SELECT id FROM user_addresses WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
@@ -1678,9 +1488,6 @@ app.delete("/addresses/:id", authenticate, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-// --- Saved cards (view/manage the reusable Paystack authorization tokens
-// saved during checkout — never a raw card number) ---
 
 app.get("/saved-cards", authenticate, async (req, res) => {
   try {
@@ -1732,10 +1539,6 @@ app.delete("/saved-cards/:id", authenticate, async (req, res) => {
   }
 });
 
-
-// since you're authenticated to call this) and isn't available to admins.
-// Turning it ON is handled by the two endpoints below instead — this one
-// rejects enable attempts so nothing can flip it on without a verified code.
 app.patch("/profile/two-factor", authenticate, async (req, res) => {
   try {
     const { enabled } = req.body;
@@ -1756,11 +1559,6 @@ app.patch("/profile/two-factor", authenticate, async (req, res) => {
   }
 });
 
-// Step 1 of turning two-factor ON: email a code to the address on file.
-// Doesn't touch two_factor_enabled yet — that only flips once the code
-// below is verified, so "on" always means a code was actually confirmed.
-// Admin accounts don't use this — they set up an authenticator app instead,
-// via /admin/totp/setup below.
 app.post("/profile/two-factor/enable/send", authenticate, async (req, res) => {
   try {
     if (req.user.isAdmin) {
@@ -1795,7 +1593,6 @@ app.post("/profile/two-factor/enable/send", authenticate, async (req, res) => {
   }
 });
 
-// Step 2: the emailed code actually turns two-factor on.
 app.post("/profile/two-factor/enable/verify", authenticate, async (req, res) => {
   try {
     if (req.user.isAdmin) {
@@ -1821,10 +1618,6 @@ app.post("/profile/two-factor/enable/verify", authenticate, async (req, res) => 
   }
 });
 
-// Admin-only: step 1 of setting up an authenticator app (Google Authenticator,
-// Authy, 1Password, etc). Generates a fresh secret and stores it unconfirmed —
-// two_factor_enabled only flips once the code from the app is verified below,
-// so a half-finished setup never silently counts as "on."
 app.post("/admin/totp/setup", authenticate, async (req, res) => {
   try {
     if (!req.user.isAdmin) return res.status(403).json({ error: "Admin access required" });
@@ -1840,8 +1633,6 @@ app.post("/admin/totp/setup", authenticate, async (req, res) => {
   }
 });
 
-// Admin-only: step 2 — the 6-digit code the app is now generating confirms
-// setup and actually turns two-factor on for this admin account.
 app.post("/admin/totp/confirm", authenticate, async (req, res) => {
   try {
     if (!req.user.isAdmin) return res.status(403).json({ error: "Admin access required" });
@@ -1863,10 +1654,6 @@ app.post("/admin/totp/confirm", authenticate, async (req, res) => {
   }
 });
 
-
-// Re-authentication gate for entering the admin panel. Being logged in
-// normally isn't enough — opening Admin requires proving it's really you,
-// right then, even with a valid 30-day session. Step 1: password.
 app.post("/admin/reauth", authenticate, authRateLimit, async (req, res) => {
   try {
     if (!req.user.isAdmin) return res.status(403).json({ error: "Admin access required" });
@@ -1878,24 +1665,17 @@ app.post("/admin/reauth", authenticate, authRateLimit, async (req, res) => {
     if (!matches) return res.status(401).json({ error: "Password doesn't match" });
 
     if (!result.rows[0].two_factor_enabled) {
-      // Shouldn't normally happen since 2FA is required for admin actions,
-      // but handle it rather than leaving a dead end.
       return res.json({ success: true });
     }
     if (!result.rows[0].totp_secret) {
       return res.status(500).json({ error: "Two-factor isn't configured — contact support" });
     }
-    // Nothing to send — the code already exists on the admin's authenticator
-    // app. Just tell the frontend to show the code-entry step.
     res.json({ twoFactorRequired: true, method: "totp" });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Step 2: the authenticator app code. On success this does NOT unlock the
-// panel yet — it auto-sends an email code and requires that too, via
-// /admin/reauth/verify-email below. Both factors are mandatory.
 app.post("/admin/reauth/verify", authenticate, authRateLimit, async (req, res) => {
   try {
     if (!req.user.isAdmin) return res.status(403).json({ error: "Admin access required" });
@@ -1935,8 +1715,6 @@ app.post("/admin/reauth/verify", authenticate, authRateLimit, async (req, res) =
   }
 });
 
-// Step 3: the emailed code. Only reachable after the authenticator step
-// above set a fresh marker — can't be called on its own to skip it.
 app.post("/admin/reauth/verify-email", authenticate, authRateLimit, async (req, res) => {
   try {
     if (!req.user.isAdmin) return res.status(403).json({ error: "Admin access required" });
@@ -1960,9 +1738,6 @@ app.post("/admin/reauth/verify-email", authenticate, authRateLimit, async (req, 
   }
 });
 
-// Attaches a verified email to the current account. Requires having
-// already passed /email-verify/send + /email-verify/check for that exact
-// address — this endpoint just checks that record and flips the flag.
 app.patch("/profile/verify-email", authenticate, async (req, res) => {
   try {
     const check = await pool.query("SELECT email FROM users WHERE id = $1", [req.user.id]);
@@ -1982,8 +1757,6 @@ app.patch("/profile/verify-email", authenticate, async (req, res) => {
   }
 });
 
-// Same idea for phone — requires having passed /phone-verify/send +
-// /phone-verify/check for that exact number first.
 app.patch("/profile/verify-phone", authenticate, async (req, res) => {
   try {
     const { phone } = req.body;
@@ -2000,10 +1773,6 @@ app.patch("/profile/verify-phone", authenticate, async (req, res) => {
   }
 });
 
-// Submit (or resubmit) a seller application. Sets status back to "pending"
-// so a previously-rejected member can try again after fixing whatever
-// was wrong. bankStatementUrl is optional — a data URL from the frontend's
-// file upload, same pattern as license photos.
 app.post("/profile/apply-to-sell", authenticate, async (req, res) => {
   try {
     const { bankStatementUrl } = req.body;
@@ -2023,15 +1792,11 @@ app.post("/profile/apply-to-sell", authenticate, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-// Full member list for the admin dashboard. No password hashes returned.
-// Fields visible to everyone — used for storefronts, follower lists, etc.
-// Deliberately excludes email, phone, and ID/document fields.
+
 const USER_PUBLIC_FIELDS = `id, username, display_name, first_name, last_name, office_location,
   country, is_admin, is_approved, is_verified, is_suspended, account_type, verification_status, created_at,
   avatar_url, store_bio, store_policies, is_email_verified, is_phone_verified`;
 
-// Full fields — only returned to a signed-in admin. bank_statement_url and
-// rejection_reason are sensitive/internal, so they stay out of USER_PUBLIC_FIELDS.
 const USER_FULL_FIELDS = `id, username, email, phone, display_name, first_name, last_name, office_location,
   country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
@@ -2085,9 +1850,6 @@ app.patch("/users/:id/suspend", authenticate, requirePermission("user_management
   }
 });
 
-// Grants, changes, or revokes admin access with a specific role. Passing
-// role: null revokes admin entirely. Only super_admin can do this — it's
-// the one action that controls who controls everything else.
 app.patch("/users/:id/admin-role", authenticate, requirePermission("role_assignment"), async (req, res) => {
   try {
     const { role } = req.body;
@@ -2106,8 +1868,6 @@ app.patch("/users/:id/admin-role", authenticate, requirePermission("role_assignm
   }
 });
 
-// Currently only logs role changes — the table's ready to log more admin
-// actions later without needing another migration.
 app.get("/admin-audit-log", authenticate, requirePermission("role_assignment"), async (req, res) => {
   try {
     const result = await pool.query(
@@ -2166,10 +1926,6 @@ app.delete("/users/:id", authenticate, requirePermission("user_management"), asy
     logAdminAction(req.user.id, "user_deleted", `Deleted member ${target.rows[0]?.username || req.params.id}`);
     res.json({ success: true });
   } catch (err) {
-    // Postgres foreign-key-violation code — this member has order or
-    // withdrawal history that references them, so a hard delete would
-    // either fail or destroy financial records other users depend on.
-    // Tell the frontend so it can offer suspending instead.
     if (err.code === "23503") {
       return res.status(409).json({
         error: "This member has order or payout history and can't be permanently deleted. Suspend them instead to block access while keeping records intact.",
@@ -2180,7 +1936,6 @@ app.delete("/users/:id", authenticate, requirePermission("user_management"), asy
   }
 });
 
-// Lets an admin create a real account directly (used by the admin "Add member" tool).
 app.post("/admin/create-member", authenticate, requirePermission("user_management"), async (req, res) => {
   try {
     const { username, email, phone, password, displayName, isAdmin, isApproved, isVerified } = req.body;
@@ -2218,7 +1973,6 @@ app.post("/admin/create-member", authenticate, requirePermission("user_managemen
   }
 });
 
-// Follows — who follows whom on seller storefronts.
 app.get("/follows", async (req, res) => {
   try {
     const result = await pool.query("SELECT follower_username, followed_username FROM follows");
@@ -2264,8 +2018,6 @@ app.delete("/follows", authenticate, async (req, res) => {
   }
 });
 
-// Cart and watchlist — always sent/returned as a whole list, matching the
-// "replace the whole thing" pattern the frontend already uses.
 app.get("/cart", authenticate, async (req, res) => {
   try {
     const result = await pool.query(
@@ -2375,9 +2127,6 @@ app.post("/login", authRateLimit, async (req, res) => {
 
     if (user.two_factor_enabled) {
       if (user.is_admin) {
-        // Admin accounts use an authenticator app — nothing to send, the
-        // code already exists on their phone. Just tell the frontend to
-        // show the code-entry step.
         if (!user.totp_secret) {
           return res.status(500).json({ error: "Two-factor is on but no authenticator is set up — contact support" });
         }
@@ -2421,13 +2170,6 @@ app.post("/login", authRateLimit, async (req, res) => {
   }
 });
 
-// Step 2 of a two-factor login: check the code (authenticator app for
-// admins, emailed code for everyone else), then actually issue the session
-// token — mirrors what /login does for accounts without two-factor on,
-// including recording login history.
-// Step 2 of admin login: check the authenticator app code. On success this
-// does NOT log the admin in yet — it auto-sends an email code and requires
-// that too, via /login/verify-2fa-email below. Both factors are mandatory.
 app.post("/login/verify-2fa", authRateLimit, async (req, res) => {
   try {
     const { userId, code } = req.body;
@@ -2492,9 +2234,6 @@ app.post("/login/verify-2fa", authRateLimit, async (req, res) => {
   }
 });
 
-// Step 3 of admin login: the emailed code. Only reachable after the
-// authenticator step above set a fresh marker — this can't be called on its
-// own to skip the authenticator-app requirement.
 app.post("/login/verify-2fa-email", authRateLimit, async (req, res) => {
   try {
     const { userId, code } = req.body;
@@ -2532,13 +2271,6 @@ app.post("/login/verify-2fa-email", authRateLimit, async (req, res) => {
   }
 });
 
-// Runs an uploaded photo through Sightengine's moderation API and returns a
-// list of plain-English reasons it might need a human look — never used to
-// auto-reject or auto-hide anything, purely a signal for admin review, per
-// the same "uncertain isn't automatically punished" principle used
-// throughout the rest of moderation on this platform. Skips silently (no
-// flags, no error) if Sightengine isn't configured, so this is fully
-// optional infrastructure — nothing breaks if the keys aren't set yet.
 async function moderateImageUrl(url) {
   const { SIGHTENGINE_API_USER, SIGHTENGINE_API_SECRET } = process.env;
   if (!SIGHTENGINE_API_USER || !SIGHTENGINE_API_SECRET) return [];
@@ -2569,9 +2301,6 @@ async function moderateImageUrl(url) {
   }
 }
 
-// Fire-and-forget: checks each photo on a listing and records any flags
-// without delaying the listing's own create/update response — moderation
-// happening a few seconds late is fine, a slow "Save" button isn't.
 async function moderateListingImagesAsync(listingId, imageUrls) {
   if (!Array.isArray(imageUrls) || !imageUrls.length) return;
   const flagged = [];
@@ -2586,11 +2315,6 @@ async function moderateListingImagesAsync(listingId, imageUrls) {
   }
 }
 
-// Uploads one image to Cloudinary on the seller's behalf. The API secret
-// never reaches the browser — it's only ever used here, server-side, to
-// compute a signature Cloudinary requires for authenticated (non-public)
-// uploads. The frontend sends a data URL; Cloudinary does the actual
-// storage, CDN delivery, and on-the-fly resizing from here on.
 app.post("/uploads/image", authenticate, async (req, res) => {
   try {
     const { dataUrl, folder } = req.body;
@@ -2602,11 +2326,6 @@ app.post("/uploads/image", authenticate, async (req, res) => {
 
     const timestamp = Math.floor(Date.now() / 1000);
     const uploadFolder = folder || "stallyard/listings";
-    // Cloudinary's signature: every param EXCEPT file/cloud_name/api_key/
-    // signature/resource_type, sorted alphabetically, joined as
-    // key=value&key=value, with the API secret appended (no separator),
-    // then SHA1-hashed. This is Cloudinary's documented algorithm, not
-    // something invented here.
     const paramsToSign = `folder=${uploadFolder}&timestamp=${timestamp}`;
     const signature = crypto
       .createHash("sha1")
@@ -2640,6 +2359,13 @@ app.post("/uploads/image", authenticate, async (req, res) => {
   }
 });
 
+// Publishes a new listing. RETURNING * only pulls columns from the
+// listings table itself, so seller_name/owner_username (which the
+// frontend needs to attribute the listing to the right seller, e.g. for
+// "My Stall" filtering) aren't in that row — they only come from the JOIN
+// in GET /listings. Fetching them here and merging them into the response
+// keeps a freshly published listing consistent with what a page refresh
+// would show, instead of silently missing its owner until then.
 app.post("/listings", authenticate, async (req, res) => {
   try {
     const {
@@ -2660,7 +2386,7 @@ app.post("/listings", authenticate, async (req, res) => {
     // The frontend already hides the listing form until a seller is
     // approved, but that's only a UI convenience — enforce it here too,
     // since nothing stops someone from calling this endpoint directly.
-    const sellerCheck = await pool.query("SELECT is_approved FROM users WHERE id = $1", [ownerId]);
+    const sellerCheck = await pool.query("SELECT is_approved, username, display_name FROM users WHERE id = $1", [ownerId]);
     if (!sellerCheck.rows.length || !sellerCheck.rows[0].is_approved) {
       return res.status(403).json({ error: "Your seller account must be approved before you can list items." });
     }
@@ -2685,7 +2411,13 @@ app.post("/listings", authenticate, async (req, res) => {
       ]
     );
 
-    res.status(201).json({ listing: result.rows[0] });
+    const listingWithOwner = {
+      ...result.rows[0],
+      owner_username: sellerCheck.rows[0].username,
+      seller_name: sellerCheck.rows[0].display_name,
+    };
+
+    res.status(201).json({ listing: listingWithOwner });
     moderateListingImagesAsync(result.rows[0].id, images);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2706,8 +2438,6 @@ app.get("/listings", async (req, res) => {
   }
 });
 
-// Generic partial update — covers editing, admin approve/remove, feature toggle,
-// and auction bid updates, all through one whitelisted column map.
 const LISTING_FIELD_MAP = {
   title: "title",
   description: "description",
@@ -2783,8 +2513,6 @@ app.patch("/listings/:id", authenticate, async (req, res) => {
   }
 });
 
-// Admin-only: clears a flag once it's been reviewed and judged fine —
-// doesn't touch the photo itself, just removes the "needs review" marker.
 app.patch("/listings/:id/dismiss-flag", authenticate, async (req, res) => {
   try {
     if (!hasPermission(req.user, "listing_moderation")) {
@@ -2805,10 +2533,6 @@ app.patch("/listings/:id/dismiss-flag", authenticate, async (req, res) => {
   }
 });
 
-// Admin-only: hide or unhide one specific photo on a listing, without
-// touching the listing itself or its other photos. Hidden photos stay in
-// the listing's real image list (nothing is deleted) — they're just kept
-// out of what buyers see.
 app.patch("/listings/:id/image-visibility", authenticate, async (req, res) => {
   try {
     if (!hasPermission(req.user, "listing_moderation")) {
@@ -2838,8 +2562,6 @@ app.patch("/listings/:id/image-visibility", authenticate, async (req, res) => {
       "listing_image_visibility_changed",
       `${hidden ? "Hid" : "Unhid"} a photo on listing "${listing.title}"${reason ? ` — reason: ${reason}` : ""}`
     );
-    // The seller needs to actually find out — otherwise a hidden photo is
-    // invisible to them too, and they have no idea a replacement is needed.
     if (hidden) {
       createNotification(
         listing.owner_id,
@@ -2879,10 +2601,7 @@ app.delete("/listings/by-owner/:ownerId", authenticate, requirePermission("user_
     res.status(500).json({ error: err.message });
   }
 });
-// Public settings: homepage auth image and the commission rate. Both used
-// to be admin-editable in the UI but never actually persisted anywhere —
-// the "save" button wrote to the browser only, and checkout used a
-// hardcoded 5% regardless of what the admin panel showed. Both are real now.
+
 app.get("/settings", async (req, res) => {
   try {
     const result = await pool.query("SELECT commission_rate, tax_rate, auth_image FROM site_settings WHERE id = 1");
@@ -2953,7 +2672,7 @@ async function getCommissionRate() {
     const result = await pool.query("SELECT commission_rate FROM site_settings WHERE id = 1");
     return result.rows.length ? Number(result.rows[0].commission_rate) : 0.05;
   } catch {
-    return 0.05; // safe fallback if the settings row is ever missing
+    return 0.05;
   }
 }
 
@@ -2962,13 +2681,10 @@ async function getTaxRate() {
     const result = await pool.query("SELECT tax_rate FROM site_settings WHERE id = 1");
     return result.rows.length ? Number(result.rows[0].tax_rate || 0) : 0;
   } catch {
-    return 0; // safe fallback if the settings row is ever missing
+    return 0;
   }
 }
 
-// Real cart checkout — recomputes every price server-side from the live
-// listings table rather than trusting whatever the cart claims, and creates
-// one order with one order_items row per cart line, grouped by seller.
 app.post("/checkout", authenticate, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -3065,24 +2781,11 @@ app.post("/checkout", authenticate, async (req, res) => {
   }
 });
 
-// --- Real Paystack checkout ---
-// The /checkout endpoint above creates an order immediately with no actual
-// charge — kept as-is so nothing currently live breaks. These new endpoints
-// are the real flow: initialize validates the cart and sends the buyer to
-// Paystack; the order itself is only created once payment is confirmed,
-// either by the webhook or by this fallback verify endpoint (whichever
-// happens first — both are safe to call more than once for the same
-// payment thanks to the unique index on orders.paystack_reference).
-
 function formatMoneyServer(amount, currency) {
   const symbol = currency === "NGN" ? "₦" : "$";
   return `${symbol}${Number(amount || 0).toFixed(2)}`;
 }
 
-// Turns a validated cart into the actual order + order_items rows, marks
-// listings sold, and notifies sellers. Shared by the webhook and the
-// verify-fallback endpoint so an order is only ever created once per
-// Paystack reference, however the confirmation arrives.
 async function finalizeOrderFromPaystackCharge(reference, paystackData) {
   const existing = await pool.query("SELECT * FROM orders WHERE paystack_reference = $1", [reference]);
   if (existing.rows.length) {
@@ -3108,10 +2811,6 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
         [cartItem.listingId]
       );
       if (listingResult.rows.length === 0) {
-        // Someone else bought it in the time the buyer spent on Paystack's
-        // page. Skip this item rather than failing the whole paid-for
-        // order — it'll need a manual look from support/admin either way
-        // since the buyer already paid for it.
         continue;
       }
       const listing = listingResult.rows[0];
@@ -3174,10 +2873,6 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
 
     await client.query("COMMIT");
 
-    // Save the card for one-tap future checkout, but only if the buyer
-    // actually opted in at checkout AND Paystack confirms this specific
-    // authorization can be charged again — some banks/cards issue
-    // one-time-only authorizations that can't be reused even if asked.
     if (meta.saveCard && authorization.reusable && authorization.authorization_code) {
       try {
         await pool.query(
@@ -3204,9 +2899,6 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
   }
 }
 
-// Step 1: validate the cart (same checks as /checkout) and send the buyer
-// to Paystack. Nothing is created in the database yet — that only happens
-// once the payment actually succeeds.
 app.post("/checkout/initialize", authenticate, async (req, res) => {
   try {
     const { items, shippingAddress, currency, saveCard } = req.body;
@@ -3255,7 +2947,7 @@ app.post("/checkout/initialize", authenticate, async (req, res) => {
       },
       body: JSON.stringify({
         email,
-        amount: Math.round(total * 100), // kobo
+        amount: Math.round(total * 100),
         currency: currency || "NGN",
         callback_url: "https://stallyard.com/order-confirmation",
         metadata: {
@@ -3278,11 +2970,6 @@ app.post("/checkout/initialize", authenticate, async (req, res) => {
   }
 });
 
-// Step 2 (fallback): once Paystack redirects the buyer back, the frontend
-// calls this to confirm payment immediately rather than waiting on the
-// webhook, which is reliable but not instant. Safe to call even if the
-// webhook already finalized the order — finalizeOrderFromPaystackCharge
-// returns the existing order instead of creating a second one.
 app.get("/checkout/verify/:reference", authenticate, async (req, res) => {
   try {
     if (!process.env.PAYSTACK_SECRET_KEY) {
@@ -3302,9 +2989,6 @@ app.get("/checkout/verify/:reference", authenticate, async (req, res) => {
   }
 });
 
-// One-tap checkout with a previously saved card — charges directly via
-// Paystack's charge_authorization API, no redirect needed. Same cart
-// validation as /checkout/initialize, just a different way of paying.
 app.post("/checkout/pay-with-saved-card", authenticate, async (req, res) => {
   try {
     const { items, shippingAddress, currency, cardId } = req.body;
@@ -3399,7 +3083,6 @@ async function fetchOrdersWithItems(whereClause, params) {
   }));
 }
 
-// A buyer's own purchase history.
 app.get("/orders/mine", authenticate, async (req, res) => {
   try {
     const orders = await fetchOrdersWithItems("buyer_id = $1", [req.user.id]);
@@ -3409,7 +3092,6 @@ app.get("/orders/mine", authenticate, async (req, res) => {
   }
 });
 
-// A seller's own sales — orders containing at least one of their items.
 app.get("/orders/selling", authenticate, async (req, res) => {
   try {
     const orders = await fetchOrdersWithItems(
@@ -3422,7 +3104,6 @@ app.get("/orders/selling", authenticate, async (req, res) => {
   }
 });
 
-// Admin view of every order.
 app.get("/orders", authenticate, requireAdmin, async (req, res) => {
   try {
     const orders = await fetchOrdersWithItems("TRUE", []);
@@ -3508,7 +3189,6 @@ app.patch("/orders/:id/dispute", authenticate, async (req, res) => {
 
 const ORDER_ITEM_STATUSES = new Set(["new", "preparing", "shipped", "delivered", "cancelled", "returned"]);
 
-// Update one item's fulfillment status/tracking/carrier — only that item's seller or an admin.
 app.patch("/order-items/:id", authenticate, async (req, res) => {
   try {
     const existing = await pool.query("SELECT seller_id FROM order_items WHERE id = $1", [req.params.id]);
@@ -3527,8 +3207,6 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
       sets.push(`fulfillment_status = $${i++}`);
       values.push(fulfillmentStatus);
       if (fulfillmentStatus === "shipped") {
-        // Only set the first time — re-saving other fields shouldn't reset
-        // the on-time-shipping clock.
         sets.push(`shipped_at = COALESCE(shipped_at, NOW())`);
       }
     }
@@ -3556,16 +3234,6 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
   }
 });
 
-// Buyer confirms they received an item. Only the order's buyer can do this,
-// and only once the seller has actually marked it shipped or delivered.
-// Once every non-cancelled/non-returned item in the order is confirmed,
-// the order's held payment auto-releases to the seller(s) — the same
-// status flip the "Release payout" admin action performs.
-// Shared by both the buyer's direct "Confirm receipt" click and a seller
-// redeeming a buyer-given delivery token: marks one item as buyer-confirmed,
-// then — once every non-cancelled/non-returned item in the order is
-// confirmed — auto-releases the order's held payment, the same status flip
-// the "Release payout" admin action performs.
 async function markItemReceivedAndMaybeRelease(itemId) {
   const result = await pool.query(
     "UPDATE order_items SET buyer_confirmed_at = NOW(), delivery_token = NULL, delivery_token_generated_at = NULL WHERE id = $1 RETURNING *",
@@ -3593,8 +3261,6 @@ async function markItemReceivedAndMaybeRelease(itemId) {
   return { item, order };
 }
 
-// Buyer confirms they received an item. Only the order's buyer can do this,
-// and only once the seller has actually marked it shipped or delivered.
 app.patch("/order-items/:id/confirm-receipt", authenticate, async (req, res) => {
   try {
     const existing = await pool.query(
@@ -3618,9 +3284,6 @@ app.patch("/order-items/:id/confirm-receipt", authenticate, async (req, res) => 
   }
 });
 
-// Buyer requests a return on a shipped/delivered item, with a reason,
-// optional note, and optional photo evidence (data URLs, same pattern as
-// bank statements and proof-of-delivery photos elsewhere in the app).
 app.post("/order-items/:id/request-return", authenticate, async (req, res) => {
   try {
     const { reason, note, evidenceUrls } = req.body;
@@ -3657,7 +3320,6 @@ app.post("/order-items/:id/request-return", authenticate, async (req, res) => {
   }
 });
 
-// Seller (or admin) accepts or denies a pending return request.
 app.patch("/order-items/:id/return-response", authenticate, async (req, res) => {
   try {
     const { decision } = req.body;
@@ -3689,7 +3351,6 @@ app.patch("/order-items/:id/return-response", authenticate, async (req, res) => 
   }
 });
 
-// Buyer adds tracking for shipping the item back, once their return's approved.
 app.patch("/order-items/:id/return-tracking", authenticate, async (req, res) => {
   try {
     const { trackingNumber } = req.body;
@@ -3720,10 +3381,6 @@ app.patch("/order-items/:id/return-tracking", authenticate, async (req, res) => 
 
 const DELIVERY_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
-// Buyer generates a 10-digit code to hand to the seller in person as proof
-// of a successful delivery — an alternative to tapping "Confirm receipt"
-// themselves, useful for cash-on-delivery or in-person handoffs. Only the
-// order's buyer can generate one, and only once the item's shipped.
 app.post("/order-items/:id/generate-delivery-token", authenticate, async (req, res) => {
   try {
     const existing = await pool.query(
@@ -3754,10 +3411,6 @@ app.post("/order-items/:id/generate-delivery-token", authenticate, async (req, r
   }
 });
 
-// Seller enters the code the buyer gave them. On a match, this confirms
-// receipt exactly like the buyer clicking "Confirm receipt" themselves —
-// same auto-release-payment behavior — since the buyer generating and
-// handing over the code IS their confirmation.
 app.post("/order-items/:id/redeem-delivery-token", authenticate, codeRateLimit, async (req, res) => {
   try {
     const { token } = req.body;
@@ -3785,9 +3438,6 @@ app.post("/order-items/:id/redeem-delivery-token", authenticate, codeRateLimit, 
   }
 });
 
-// Pre-existing single-listing Paystack payment page flow (initiate → buyer pays
-// on Paystack's hosted page → webhook below confirms and creates the order).
-// Kept under its own path since /checkout is now the real cart-checkout endpoint.
 app.post("/checkout/single-item-payment", authenticate, async (req, res) => {
   try {
     const { listingId, email } = req.body;
@@ -3858,10 +3508,6 @@ app.post("/webhook/paystack", async (req, res) => {
       try {
         await finalizeOrderFromPaystackCharge(event.data.reference, event.data);
       } catch (err) {
-        // Logged, not thrown — Paystack retries webhooks on non-200
-        // responses, and /checkout/verify is a working fallback if this
-        // keeps failing, so a 200 here avoids Paystack hammering retries
-        // for something a human needs to look at anyway.
         console.error("Webhook order finalization error:", err.message);
       }
     }
@@ -3872,8 +3518,7 @@ app.post("/webhook/paystack", async (req, res) => {
     res.sendStatus(500);
   }
 });
-// Proxies Paystack's bank list so the frontend can show a dropdown instead of
-// asking sellers to type a bank code by hand (typos there would silently fail).
+
 app.get("/paystack/banks", authenticate, async (req, res) => {
   try {
     const banksRes = await fetch("https://api.paystack.co/bank?country=nigeria", {
@@ -3889,9 +3534,6 @@ app.get("/paystack/banks", authenticate, async (req, res) => {
   }
 });
 
-// Shared by both first-time setup (saves immediately) and a confirmed
-// bank-account change (after the email code is verified) — actually
-// creates the Paystack transfer recipient and saves it.
 async function verifyAndSaveBankDetails(userId, bankCode, accountNumber) {
   const userResult = await pool.query("SELECT display_name FROM users WHERE id = $1", [userId]);
   if (userResult.rows.length === 0) {
@@ -3933,10 +3575,6 @@ app.post("/sellers/bank-details", authenticate, async (req, res) => {
       return res.status(403).json({ error: "You can only set your own bank details" });
     }
 
-    // First-time setup saves immediately. Changing an account that's
-    // already on file needs an emailed confirmation first — protects
-    // against payouts getting silently redirected if a session's ever
-    // compromised.
     const existing = await pool.query("SELECT account_number, email FROM users WHERE id = $1", [userId]);
     if (existing.rows.length === 0) return res.status(404).json({ error: "User not found" });
     const hadAccountBefore = !!existing.rows[0].account_number;
@@ -3995,8 +3633,7 @@ app.post("/sellers/bank-details/confirm", authenticate, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-// Shared helper — actually moves money via Paystack. Used by both the
-// automatic withdrawal flow and the admin manual-override endpoint below.
+
 async function sendPaystackTransfer(recipientCode, amountInKobo, reason) {
   const transferRes = await fetch("https://api.paystack.co/transfer", {
     method: "POST",
@@ -4014,9 +3651,6 @@ async function sendPaystackTransfer(recipientCode, amountInKobo, reason) {
   return transferRes.json();
 }
 
-// Admin-only manual override — the normal path for sellers is POST /withdrawals,
-// which validates their real balance server-side before calling the same
-// transfer logic. This endpoint bypasses that balance check, so it's admin-only.
 app.post("/sellers/payout", authenticate, requirePermission("finance"), async (req, res) => {
   try {
     const { userId, amount, reason } = req.body;
@@ -4048,9 +3682,7 @@ app.post("/sellers/payout", authenticate, requirePermission("finance"), async (r
     res.status(500).json({ error: err.message });
   }
 });
-// A seller's true available balance, computed entirely from real order data —
-// released order items, minus commission, minus anything already withdrawn
-// or currently mid-withdrawal. Never trusts a client-supplied number.
+
 async function computeAvailableBalance(client, sellerId) {
   const releasedResult = await client.query(
     `SELECT COALESCE(SUM(
@@ -4074,9 +3706,6 @@ async function computeAvailableBalance(client, sellerId) {
   return Math.round((released - reserved) * 100) / 100;
 }
 
-// Sellers request their own withdrawal — no admin approval step. The balance
-// check and the reservation happen in one locked transaction so two requests
-// fired at once can't both succeed against the same money.
 app.post("/withdrawals", authenticate, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -4086,8 +3715,6 @@ app.post("/withdrawals", authenticate, async (req, res) => {
     }
 
     await client.query("BEGIN");
-    // Locks this seller's row for the duration of the transaction, so a
-    // second concurrent request from the same seller has to wait its turn.
     await client.query("SELECT id, paystack_recipient_code FROM users WHERE id = $1 FOR UPDATE", [req.user.id]);
 
     const available = await computeAvailableBalance(client, req.user.id);
@@ -4113,8 +3740,6 @@ app.post("/withdrawals", authenticate, async (req, res) => {
     const withdrawal = withdrawalResult.rows[0];
     await client.query("COMMIT");
 
-    // Money actually moves here, outside the DB transaction so the external
-    // network call doesn't hold a lock open.
     try {
       const transferData = await sendPaystackTransfer(recipientCode, Math.round(amount * 100), "Stallyard seller withdrawal");
       if (transferData.status) {
@@ -4224,7 +3849,7 @@ app.get("/threads/:userId", authenticate, async (req, res) => {
 app.post("/messages", authenticate, async (req, res) => {
   try {
     const { threadId, body, messageType, offerAmount, imageUrl, orderId } = req.body;
-    const senderId = req.user.id; // never trust a client-supplied sender
+    const senderId = req.user.id;
 
     if (!threadId) {
       return res.status(400).json({ error: "Missing threadId" });
@@ -4282,8 +3907,6 @@ app.get("/messages/:threadId", authenticate, async (req, res) => {
   }
 });
 
-// Accept or decline an offer — only the person who *received* it (not the
-// one who sent it) can respond.
 app.patch("/messages/:id/offer", authenticate, async (req, res) => {
   try {
     const { status } = req.body;
@@ -4316,9 +3939,6 @@ app.patch("/messages/:id/offer", authenticate, async (req, res) => {
   }
 });
 
-// A buyer or seller reports a specific message as inappropriate. Only
-// someone actually in that thread can report it — prevents a stranger
-// from spamming reports on messages they were never party to.
 app.post("/messages/:id/report", authenticate, async (req, res) => {
   try {
     const { reason } = req.body;
@@ -4342,8 +3962,6 @@ app.post("/messages/:id/report", authenticate, async (req, res) => {
   }
 });
 
-// Admin queue of reported messages — joined with the message body/image,
-// who sent it, who reported it, and which listing the thread is about.
 app.get("/message-reports", authenticate, requirePermission("dispute_resolution"), async (req, res) => {
   try {
     const result = await pool.query(
@@ -4380,7 +3998,6 @@ app.patch("/message-reports/:id/resolve", authenticate, requirePermission("dispu
   }
 });
 
-// All reviews, public — used to compute seller ratings across the whole app.
 app.get("/reviews", async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM reviews ORDER BY created_at DESC");
@@ -4393,7 +4010,7 @@ app.get("/reviews", async (req, res) => {
 app.post("/reviews", authenticate, async (req, res) => {
   try {
     const { orderId, listingId, sellerId, rating, comment } = req.body;
-    const buyerId = req.user.id; // never trust a client-supplied reviewer identity
+    const buyerId = req.user.id;
 
     if (!orderId || !listingId || !sellerId || !rating) {
       return res.status(400).json({ error: "Missing required fields" });
@@ -4402,8 +4019,6 @@ app.post("/reviews", authenticate, async (req, res) => {
       return res.status(400).json({ error: "Rating must be between 1 and 5" });
     }
 
-    // A review is only allowed if this buyer actually bought this exact item,
-    // from this seller, in this order — no reviewing things you never bought.
     const purchase = await pool.query(
       `SELECT 1 FROM orders o
        JOIN order_items oi ON oi.order_id = o.id
@@ -4479,8 +4094,6 @@ app.get("/sellers/:id/reviews", async (req, res) => {
   }
 });
 
-// Seller replies to a review left on one of their sales. One reply per
-// review — resubmitting overwrites the previous response.
 app.patch("/reviews/:id/respond", authenticate, async (req, res) => {
   try {
     const { response } = req.body;
@@ -4502,9 +4115,6 @@ app.patch("/reviews/:id/respond", authenticate, async (req, res) => {
   }
 });
 
-// Anyone signed in can flag a review as abusive or fraudulent — not
-// restricted to the seller it's about, since a false or malicious review
-// could be spotted by anyone browsing.
 app.post("/reviews/:id/report", authenticate, async (req, res) => {
   try {
     const { reason } = req.body;
@@ -4520,8 +4130,6 @@ app.post("/reviews/:id/report", authenticate, async (req, res) => {
   }
 });
 
-// Admin queue of reported reviews, joined with the review content and who
-// wrote it/reported it.
 app.get("/review-reports", authenticate, requirePermission("dispute_resolution"), async (req, res) => {
   try {
     const result = await pool.query(
@@ -4557,9 +4165,6 @@ app.patch("/review-reports/:id/resolve", authenticate, requirePermission("disput
   }
 });
 
-// A user reports something suspicious about their own account — an
-// unrecognized login, a bank change they didn't make, anything that
-// doesn't fit a more specific report flow.
 app.post("/account-reports", authenticate, async (req, res) => {
   try {
     const { message } = req.body;
@@ -4604,8 +4209,6 @@ app.patch("/account-reports/:id/resolve", authenticate, requirePermission("user_
   }
 });
 
-// Admin issues a warning to a seller — a lighter-weight step than
-// suspension, visible to both the admin team and the seller themselves.
 app.post("/users/:id/warnings", authenticate, requirePermission("user_management"), async (req, res) => {
   try {
     const { message } = req.body;
@@ -4623,7 +4226,6 @@ app.post("/users/:id/warnings", authenticate, requirePermission("user_management
   }
 });
 
-// Admin views warning history for a specific seller.
 app.get("/users/:id/warnings", authenticate, requirePermission("user_management"), async (req, res) => {
   try {
     const result = await pool.query(
@@ -4636,7 +4238,6 @@ app.get("/users/:id/warnings", authenticate, requirePermission("user_management"
   }
 });
 
-// A seller views their own warning history.
 app.get("/warnings/mine", authenticate, async (req, res) => {
   try {
     const result = await pool.query(
@@ -4649,8 +4250,6 @@ app.get("/warnings/mine", authenticate, async (req, res) => {
   }
 });
 
-// Public trust signal for a seller's storefront — just a count, no order
-// details exposed. "Completed" = the item actually made it to the buyer.
 app.get("/sellers/:username/completed-sales-count", async (req, res) => {
   try {
     const result = await pool.query(
@@ -4677,9 +4276,6 @@ app.get("/login-history/mine", authenticate, async (req, res) => {
   }
 });
 
-// Public: homepage banners, help articles, and FAQs — read by everyone,
-// written by admins only. This replaces what used to be purely local
-// browser state that never reached the database.
 app.get("/content", async (req, res) => {
   try {
     const [banners, articles, faqs] = await Promise.all([
@@ -4818,8 +4414,6 @@ app.delete("/content/faqs/:id", authenticate, requirePermission("content_managem
   }
 });
 
-// Marketplace policies — six fixed categories, always present (seeded by
-// the migration), each just a free-text body an admin can edit.
 app.get("/policies", async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM marketplace_policies");
@@ -4852,8 +4446,6 @@ app.patch("/policies/:category", authenticate, requirePermission("content_manage
   }
 });
 
-// Support tickets — a buyer or seller opens one with an initial message,
-// then it's a simple back-and-forth thread with an admin, tracked by status.
 app.post("/support-tickets", authenticate, async (req, res) => {
   try {
     const { subject, message } = req.body;
@@ -4993,9 +4585,6 @@ app.patch("/notifications/mark-all-read", authenticate, async (req, res) => {
   }
 });
 
-// Reminds sellers about items that have sat unshipped for 24+ hours.
-// Checks hourly; each item is only reminded once (ship_reminder_sent_at
-// gets stamped so it isn't repeated every hour after that).
 async function sendShipReminders() {
   try {
     const result = await pool.query(
@@ -5013,7 +4602,7 @@ async function sendShipReminders() {
   }
 }
 setInterval(sendShipReminders, 60 * 60 * 1000).unref();
-sendShipReminders(); // also run once on startup, in case items crossed the threshold while the server was offline
+sendShipReminders();
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
