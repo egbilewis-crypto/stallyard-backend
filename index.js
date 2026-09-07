@@ -1153,6 +1153,29 @@ app.get("/migrate/seller-performance", requireMigrationKey, async (req, res) => 
   }
 });
 
+app.get("/migrate/buyer-risk", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS payment_attempts (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        reference TEXT,
+        method TEXT DEFAULT 'checkout',
+        status TEXT NOT NULL,
+        amount NUMERIC DEFAULT 0,
+        currency TEXT DEFAULT 'NGN',
+        message TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_payment_attempts_user_id ON payment_attempts(user_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_payment_attempts_reference ON payment_attempts(reference)`);
+    res.send("Migration complete: payment_attempts table created for buyer-risk review.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/admin-roles", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_role TEXT`);
@@ -3103,6 +3126,19 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
   }
 }
 
+async function recordPaymentAttempt(userId, { reference = null, method = "checkout", status, amount = 0, currency = "NGN", message = "" }) {
+  try {
+    await pool.query(
+      `INSERT INTO payment_attempts (user_id, reference, method, status, amount, currency, message)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [userId, reference, method, status, amount, currency, String(message || "").slice(0, 1000)]
+    );
+  } catch (err) {
+    // The buyer-risk migration may not have been run yet; checkout must never fail because telemetry failed.
+    if (err.code !== "42P01") console.error("Couldn't record payment attempt:", err.message);
+  }
+}
+
 app.post("/checkout/initialize", authenticate, async (req, res) => {
   try {
     const { items, shippingAddress, currency, saveCard } = req.body;
@@ -3166,8 +3202,10 @@ app.post("/checkout/initialize", authenticate, async (req, res) => {
     });
     const paystackData = await paystackRes.json();
     if (!paystackData.status) {
+      await recordPaymentAttempt(req.user.id, { method: "checkout_initialize", status: "failed", amount: total, currency: currency || "NGN", message: paystackData.message || "Paystack error" });
       return res.status(500).json({ error: paystackData.message || "Paystack error" });
     }
+    await recordPaymentAttempt(req.user.id, { reference: paystackData.data.reference, method: "checkout_initialize", status: "initialized", amount: total, currency: currency || "NGN" });
     res.json({ authorizationUrl: paystackData.data.authorization_url, reference: paystackData.data.reference });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -3184,8 +3222,10 @@ app.get("/checkout/verify/:reference", authenticate, async (req, res) => {
     });
     const verifyData = await verifyRes.json();
     if (!verifyData.status || verifyData.data.status !== "success") {
+      await recordPaymentAttempt(req.user.id, { reference: req.params.reference, method: "checkout_verify", status: "failed", amount: Number(verifyData.data?.amount || 0) / 100, currency: verifyData.data?.currency || "NGN", message: verifyData.data?.gateway_response || verifyData.message || "Payment hasn't succeeded yet" });
       return res.status(400).json({ error: "Payment hasn't succeeded yet" });
     }
+    await recordPaymentAttempt(req.user.id, { reference: req.params.reference, method: "checkout_verify", status: "success", amount: Number(verifyData.data?.amount || 0) / 100, currency: verifyData.data?.currency || "NGN" });
     const { order } = await finalizeOrderFromPaystackCharge(req.params.reference, verifyData.data);
     res.json({ order });
   } catch (err) {
@@ -3260,8 +3300,10 @@ app.post("/checkout/pay-with-saved-card", authenticate, async (req, res) => {
     });
     const chargeData = await chargeRes.json();
     if (!chargeData.status || chargeData.data.status !== "success") {
+      await recordPaymentAttempt(req.user.id, { reference: chargeData.data?.reference || null, method: "saved_card", status: "failed", amount: total, currency: currency || "NGN", message: chargeData.data?.gateway_response || chargeData.message || "Payment failed" });
       return res.status(400).json({ error: chargeData.data?.gateway_response || chargeData.message || "Payment failed" });
     }
+    await recordPaymentAttempt(req.user.id, { reference: chargeData.data.reference, method: "saved_card", status: "success", amount: total, currency: currency || "NGN" });
     const { order } = await finalizeOrderFromPaystackCharge(chargeData.data.reference, chargeData.data);
     res.json({ order });
   } catch (err) {
@@ -4358,6 +4400,158 @@ app.get("/withdrawals", authenticate, requirePermission("finance"), async (req, 
   }
 });
 
+
+// Buyer risk dashboard. This is a human-review aid only: the score never automatically
+// suspends, blocks, refunds, or otherwise penalizes a buyer.
+app.get("/admin/buyer-risk", authenticate, requirePermission("user_management"), async (req, res) => {
+  try {
+    const hasPaymentAttempts = await pool.query(`SELECT to_regclass('public.payment_attempts') AS name`);
+    const paymentAttemptsReady = !!hasPaymentAttempts.rows[0]?.name;
+    const paymentAttemptSelect = paymentAttemptsReady
+      ? `(SELECT COUNT(*) FROM payment_attempts pa WHERE pa.user_id = u.id AND pa.status = 'failed') AS failed_payment_count,`
+      : `0 AS failed_payment_count,`;
+
+    const result = await pool.query(`
+      SELECT
+        u.id AS user_id,
+        u.username,
+        u.display_name,
+        u.email,
+        u.phone,
+        u.is_suspended,
+        u.is_email_verified,
+        u.is_phone_verified,
+        u.created_at AS joined_at,
+        (SELECT MAX(lh.created_at) FROM login_history lh WHERE lh.user_id = u.id) AS last_login_at,
+        (SELECT COUNT(*) FROM orders o WHERE o.buyer_id = u.id) AS order_count,
+        (SELECT COUNT(*) FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.buyer_id = u.id) AS item_count,
+        (SELECT COUNT(*) FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.buyer_id = u.id AND oi.fulfillment_status = 'delivered') AS completed_items,
+        (SELECT COUNT(*) FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.buyer_id = u.id AND oi.fulfillment_status = 'cancelled') AS cancelled_items,
+        (SELECT COUNT(*) FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.buyer_id = u.id AND oi.return_status IS NOT NULL) AS return_count,
+        (SELECT COUNT(*) FROM dispute_cases dc JOIN orders o ON o.id = dc.order_id WHERE o.buyer_id = u.id) AS dispute_count,
+        (SELECT COUNT(*) FROM dispute_cases dc JOIN orders o ON o.id = dc.order_id WHERE o.buyer_id = u.id AND dc.status <> 'resolved') AS open_disputes,
+        (SELECT COUNT(*) FROM orders o WHERE o.buyer_id = u.id AND (o.refund_status IS NOT NULL OR o.payment_status = 'refunded')) AS refund_count,
+        (SELECT COUNT(*) FROM account_reports ar WHERE ar.user_id = u.id) AS report_count,
+        (SELECT COUNT(*) FROM account_reports ar WHERE ar.user_id = u.id AND ar.status = 'open') AS open_report_count,
+        ${paymentAttemptSelect}
+        (SELECT COALESCE(SUM(o.total), 0) FROM orders o WHERE o.buyer_id = u.id) AS lifetime_spend
+      FROM users u
+      WHERE u.is_admin = false
+        AND EXISTS (SELECT 1 FROM orders o WHERE o.buyer_id = u.id)
+      ORDER BY u.display_name ASC, u.username ASC
+    `);
+
+    const buyers = result.rows.map((row) => {
+      const orderCount = Number(row.order_count) || 0;
+      const itemCount = Number(row.item_count) || 0;
+      const completedItems = Number(row.completed_items) || 0;
+      const cancelledItems = Number(row.cancelled_items) || 0;
+      const returnCount = Number(row.return_count) || 0;
+      const disputeCount = Number(row.dispute_count) || 0;
+      const openDisputes = Number(row.open_disputes) || 0;
+      const refundCount = Number(row.refund_count) || 0;
+      const reportCount = Number(row.report_count) || 0;
+      const openReportCount = Number(row.open_report_count) || 0;
+      const failedPaymentCount = Number(row.failed_payment_count) || 0;
+      const returnRate = itemCount ? (returnCount / itemCount) * 100 : 0;
+      const cancellationRate = itemCount ? (cancelledItems / itemCount) * 100 : 0;
+      const disputeRate = orderCount ? (disputeCount / orderCount) * 100 : 0;
+
+      let score = 0;
+      const signals = [];
+      if (openDisputes > 0) {
+        score += Math.min(30, openDisputes * 12);
+        signals.push({ severity: "high", message: `${openDisputes} unresolved dispute${openDisputes === 1 ? "" : "s"}` });
+      }
+      if (openReportCount > 0) {
+        score += Math.min(30, openReportCount * 15);
+        signals.push({ severity: "high", message: `${openReportCount} open suspicious-activity report${openReportCount === 1 ? "" : "s"}` });
+      } else if (reportCount > 0) {
+        score += Math.min(12, reportCount * 4);
+        signals.push({ severity: "medium", message: `${reportCount} suspicious-activity report${reportCount === 1 ? "" : "s"} on record` });
+      }
+      if (returnRate > 30 && itemCount >= 3) {
+        score += 20;
+        signals.push({ severity: "high", message: `High return rate (${returnRate.toFixed(1)}%)` });
+      } else if (returnRate > 15 && itemCount >= 3) {
+        score += 10;
+        signals.push({ severity: "medium", message: `Elevated return rate (${returnRate.toFixed(1)}%)` });
+      }
+      if (disputeRate > 25 && orderCount >= 3) {
+        score += 20;
+        signals.push({ severity: "high", message: `High dispute rate (${disputeRate.toFixed(1)}%)` });
+      } else if (disputeRate > 10 && orderCount >= 3) {
+        score += 10;
+        signals.push({ severity: "medium", message: `Elevated dispute rate (${disputeRate.toFixed(1)}%)` });
+      }
+      if (cancellationRate > 35 && itemCount >= 3) {
+        score += 10;
+        signals.push({ severity: "medium", message: `High cancellation rate (${cancellationRate.toFixed(1)}%)` });
+      }
+      if (failedPaymentCount >= 5) {
+        score += 15;
+        signals.push({ severity: "medium", message: `${failedPaymentCount} failed payment attempts` });
+      } else if (failedPaymentCount >= 2) {
+        score += 6;
+        signals.push({ severity: "low", message: `${failedPaymentCount} failed payment attempts` });
+      }
+      if (refundCount >= 3 && orderCount >= 3) {
+        score += 10;
+        signals.push({ severity: "medium", message: `${refundCount} refunded order${refundCount === 1 ? "" : "s"}` });
+      }
+      if (row.is_suspended) {
+        score = Math.max(score, 80);
+        signals.push({ severity: "high", message: "Account is currently suspended" });
+      }
+
+      score = Math.min(100, Math.round(score));
+      const riskBand = score >= 60 ? "high" : score >= 25 ? "watch" : "low";
+      return {
+        userId: row.user_id,
+        username: row.username,
+        displayName: row.display_name,
+        email: row.email,
+        phone: row.phone,
+        isSuspended: !!row.is_suspended,
+        isEmailVerified: !!row.is_email_verified,
+        isPhoneVerified: !!row.is_phone_verified,
+        joinedAt: row.joined_at,
+        lastLoginAt: row.last_login_at,
+        orderCount,
+        itemCount,
+        completedItems,
+        cancelledItems,
+        returnCount,
+        returnRate,
+        cancellationRate,
+        disputeCount,
+        openDisputes,
+        disputeRate,
+        refundCount,
+        reportCount,
+        openReportCount,
+        failedPaymentCount,
+        lifetimeSpend: Number(row.lifetime_spend) || 0,
+        riskScore: score,
+        riskBand,
+        riskSignals: signals,
+      };
+    });
+
+    res.json({
+      buyers,
+      paymentAttemptTrackingReady: paymentAttemptsReady,
+      summary: {
+        buyerCount: buyers.length,
+        highRisk: buyers.filter((b) => b.riskBand === "high").length,
+        watch: buyers.filter((b) => b.riskBand === "watch").length,
+        openReports: buyers.reduce((sum, b) => sum + b.openReportCount, 0),
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // Seller performance dashboard. These are deterministic operational indicators
 // for human review, not an automated enforcement system. No seller is suspended,
