@@ -1022,6 +1022,19 @@ app.get("/migrate/refunds", requireMigrationKey, async (req, res) => {
   }
 });
 
+app.get("/migrate/refund-management", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE orders
+        ADD COLUMN IF NOT EXISTS refund_reason TEXT,
+        ADD COLUMN IF NOT EXISTS refund_requested_by INTEGER REFERENCES users(id)
+    `);
+    res.send("Migration complete: refund management reason and requesting-admin fields added.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/saved-cards", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -3341,6 +3354,13 @@ app.patch("/orders/:id/refund", authenticate, requirePermission("finance"), asyn
   const client = await pool.connect();
   let order;
   try {
+    const reason = String(req.body?.reason || "").trim();
+    if (!reason) {
+      return res.status(400).json({ error: "Enter a reason for the refund" });
+    }
+    if (reason.length > 1000) {
+      return res.status(400).json({ error: "Refund reason is too long" });
+    }
     if (!process.env.PAYSTACK_SECRET_KEY) {
       return res.status(500).json({ error: "Paystack refunds aren't configured — contact support" });
     }
@@ -3375,11 +3395,14 @@ app.patch("/orders/:id/refund", authenticate, requirePermission("finance"), asyn
          payment_status = 'refund_pending',
          refund_status = 'requesting',
          refund_previous_payment_status = $1,
+         refund_reason = $2,
+         refund_requested_by = $3,
          refund_requested_at = NOW(),
+         refunded_at = NULL,
          refund_failure_reason = NULL
-       WHERE id = $2
+       WHERE id = $4
        RETURNING *`,
-      [previousStatus, req.params.id]
+      [previousStatus, reason, req.user.id, req.params.id]
     );
     order = locked.rows[0];
     await client.query("COMMIT");
@@ -3397,8 +3420,8 @@ app.patch("/orders/:id/refund", authenticate, requirePermission("finance"), asyn
           transaction: order.paystack_reference,
           amount: Math.round(Number(order.total) * 100),
           currency: order.currency || "NGN",
-          customer_note: `Refund for Stallyard order #${order.id}`,
-          merchant_note: `Admin ${req.user.username} initiated refund for Stallyard order #${order.id}`,
+          customer_note: `Refund for Stallyard order #${order.id}: ${reason.slice(0, 180)}`,
+          merchant_note: `Admin ${req.user.username} initiated refund for Stallyard order #${order.id}: ${reason.slice(0, 180)}`,
         }),
       });
       paystackData = await paystackRes.json();
