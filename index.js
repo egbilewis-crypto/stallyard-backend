@@ -4359,6 +4359,179 @@ app.get("/withdrawals", authenticate, requirePermission("finance"), async (req, 
 });
 
 
+// Seller performance dashboard. These are deterministic operational indicators
+// for human review, not an automated enforcement system. No seller is suspended,
+// rejected, or otherwise penalized from this score alone.
+app.get("/admin/seller-performance", authenticate, requirePermission("seller_verification"), async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        u.id AS user_id,
+        u.username,
+        u.display_name,
+        u.email,
+        u.phone,
+        u.is_suspended,
+        u.verification_status,
+        u.created_at AS joined_at,
+        (SELECT MAX(lh.created_at) FROM login_history lh WHERE lh.user_id = u.id) AS last_login_at,
+        (SELECT COUNT(DISTINCT oi.order_id) FROM order_items oi WHERE oi.seller_id = u.id) AS order_count,
+        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id) AS item_count,
+        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.fulfillment_status = 'delivered') AS completed_deliveries,
+        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.fulfillment_status = 'cancelled') AS cancelled_count,
+        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.fulfillment_status = 'returned') AS returned_count,
+        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.ship_reminder_sent_at IS NOT NULL) AS ship_reminder_count,
+        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.fulfillment_status = 'new' AND oi.created_at < NOW() - INTERVAL '24 hours') AS active_ship_reminders,
+        (SELECT AVG(EXTRACT(EPOCH FROM (oi.shipped_at - oi.created_at)) / 3600.0)
+           FROM order_items oi WHERE oi.seller_id = u.id AND oi.shipped_at IS NOT NULL AND oi.shipped_at >= oi.created_at) AS average_hours_to_ship,
+        (SELECT COALESCE(SUM((oi.price * oi.qty) + (oi.shipping_fee * oi.qty)), 0)
+           FROM order_items oi WHERE oi.seller_id = u.id AND oi.fulfillment_status NOT IN ('cancelled', 'returned')) AS gross_merchandise,
+        (SELECT COUNT(*) FROM reviews r WHERE r.seller_id = u.id) AS review_count,
+        (SELECT COALESCE(AVG(r.rating), 0) FROM reviews r WHERE r.seller_id = u.id) AS average_rating,
+        (SELECT COUNT(*) FROM seller_warnings sw WHERE sw.user_id = u.id) AS warning_count,
+        (SELECT COUNT(DISTINCT dc.id)
+           FROM dispute_cases dc
+           WHERE EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = dc.order_id AND oi.seller_id = u.id)) AS dispute_count,
+        (SELECT COUNT(DISTINCT dc.id)
+           FROM dispute_cases dc
+           WHERE dc.status <> 'resolved'
+             AND EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = dc.order_id AND oi.seller_id = u.id)) AS open_disputes,
+        (SELECT COALESCE(SUM(amount), 0) FROM withdrawals w WHERE w.seller_id = u.id AND w.status = 'failed') AS failed_withdrawal_amount
+      FROM users u
+      WHERE u.is_admin = false
+        AND (
+          u.is_approved = true
+          OR u.has_applied_to_sell = true
+          OR EXISTS (SELECT 1 FROM order_items oi WHERE oi.seller_id = u.id)
+        )
+      ORDER BY u.display_name ASC, u.username ASC
+    `);
+
+    const sellers = [];
+    for (const row of result.rows) {
+      const orderCount = Number(row.order_count) || 0;
+      const itemCount = Number(row.item_count) || 0;
+      const completedDeliveries = Number(row.completed_deliveries) || 0;
+      const cancelledCount = Number(row.cancelled_count) || 0;
+      const returnedCount = Number(row.returned_count) || 0;
+      const shipReminderCount = Number(row.ship_reminder_count) || 0;
+      const activeShipReminders = Number(row.active_ship_reminders) || 0;
+      const disputeCount = Number(row.dispute_count) || 0;
+      const openDisputes = Number(row.open_disputes) || 0;
+      const warningCount = Number(row.warning_count) || 0;
+      const reviewCount = Number(row.review_count) || 0;
+      const averageRating = Number(row.average_rating) || 0;
+      const returnRate = itemCount ? (returnedCount / itemCount) * 100 : 0;
+      const cancelRate = itemCount ? (cancelledCount / itemCount) * 100 : 0;
+      const reminderRate = itemCount ? (shipReminderCount / itemCount) * 100 : 0;
+
+      let score = 100;
+      const signals = [];
+      if (openDisputes > 0) {
+        const deduction = Math.min(36, openDisputes * 12);
+        score -= deduction;
+        signals.push({ severity: "high", message: `${openDisputes} unresolved dispute${openDisputes === 1 ? "" : "s"}` });
+      }
+      if (warningCount > 0) {
+        score -= Math.min(24, warningCount * 8);
+        signals.push({ severity: warningCount >= 2 ? "high" : "medium", message: `${warningCount} admin warning${warningCount === 1 ? "" : "s"} on record` });
+      }
+      if (returnRate > 20) {
+        score -= 20;
+        signals.push({ severity: "high", message: `High return rate (${returnRate.toFixed(1)}%)` });
+      } else if (returnRate > 10) {
+        score -= 10;
+        signals.push({ severity: "medium", message: `Elevated return rate (${returnRate.toFixed(1)}%)` });
+      } else if (returnRate > 5) {
+        score -= 5;
+        signals.push({ severity: "low", message: `Return rate is ${returnRate.toFixed(1)}%` });
+      }
+      if (cancelRate > 20) {
+        score -= 15;
+        signals.push({ severity: "high", message: `High cancellation rate (${cancelRate.toFixed(1)}%)` });
+      } else if (cancelRate > 10) {
+        score -= 8;
+        signals.push({ severity: "medium", message: `Elevated cancellation rate (${cancelRate.toFixed(1)}%)` });
+      } else if (cancelRate > 5) {
+        score -= 4;
+        signals.push({ severity: "low", message: `Cancellation rate is ${cancelRate.toFixed(1)}%` });
+      }
+      if (reminderRate > 25) {
+        score -= 15;
+        signals.push({ severity: "medium", message: `${reminderRate.toFixed(1)}% of items triggered a 24-hour shipping reminder` });
+      } else if (reminderRate > 10) {
+        score -= 8;
+        signals.push({ severity: "low", message: `${reminderRate.toFixed(1)}% of items triggered a 24-hour shipping reminder` });
+      }
+      if (reviewCount >= 3 && averageRating < 3) {
+        score -= 15;
+        signals.push({ severity: "high", message: `Low buyer rating (${averageRating.toFixed(1)}/5 across ${reviewCount} reviews)` });
+      } else if (reviewCount >= 3 && averageRating < 4) {
+        score -= 7;
+        signals.push({ severity: "medium", message: `Buyer rating is ${averageRating.toFixed(1)}/5 across ${reviewCount} reviews` });
+      }
+      if (activeShipReminders > 0) {
+        signals.push({ severity: "medium", message: `${activeShipReminders} item${activeShipReminders === 1 ? " is" : "s are"} still unshipped after 24 hours` });
+      }
+      score = Math.max(0, Math.min(100, Math.round(score)));
+      const healthBand = score < 60 ? "review" : score < 80 ? "watch" : "good";
+      const healthLabel = healthBand === "review" ? "Needs review" : healthBand === "watch" ? "Watch" : "Good standing";
+
+      // Uses the exact same balance logic as seller withdrawals so the admin view
+      // cannot disagree with what the seller is actually allowed to withdraw.
+      const balance = await computeAvailableBalance(pool, row.user_id);
+      sellers.push({
+        userId: row.user_id,
+        username: row.username,
+        displayName: row.display_name,
+        email: row.email,
+        phone: row.phone,
+        isSuspended: !!row.is_suspended,
+        verificationStatus: row.verification_status || "none",
+        joinedAt: row.joined_at,
+        lastLoginAt: row.last_login_at,
+        orderCount,
+        itemCount,
+        completedDeliveries,
+        cancelledCount,
+        returnedCount,
+        shipReminderCount,
+        activeShipReminders,
+        averageHoursToShip: row.average_hours_to_ship == null ? null : Number(row.average_hours_to_ship),
+        grossMerchandise: Math.round((Number(row.gross_merchandise) || 0) * 100) / 100,
+        availableBalance: balance,
+        reviewCount,
+        averageRating,
+        warningCount,
+        disputeCount,
+        openDisputes,
+        failedWithdrawalAmount: Math.round((Number(row.failed_withdrawal_amount) || 0) * 100) / 100,
+        returnRate,
+        cancelRate,
+        healthScore: score,
+        healthBand,
+        healthLabel,
+        riskSignals: signals,
+      });
+    }
+
+    sellers.sort((a, b) => a.healthScore - b.healthScore || b.openDisputes - a.openDisputes || a.username.localeCompare(b.username));
+    res.json({
+      generatedAt: new Date().toISOString(),
+      summary: {
+        sellerCount: sellers.length,
+        needsReview: sellers.filter((s) => s.healthBand === "review").length,
+        watch: sellers.filter((s) => s.healthBand === "watch").length,
+        openDisputes: sellers.reduce((sum, seller) => sum + seller.openDisputes, 0),
+        activeShipReminders: sellers.reduce((sum, seller) => sum + seller.activeShipReminders, 0),
+      },
+      sellers,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Finance reconciliation: one server-side view of what buyers paid, what is
 // still held, what has been released to sellers, Stallyard commission,
 // refunds, and seller withdrawals. This intentionally calculates from the
