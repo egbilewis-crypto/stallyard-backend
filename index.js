@@ -1881,6 +1881,7 @@ app.post("/admin/reauth/verify-email", authenticate, authRateLimit, async (req, 
     }
     twoFactorCodes.delete(req.user.id);
     totpVerifiedMarkers.delete(req.user.id);
+    logAdminAction(req.user.id, "admin_reauth_completed", "Completed password + authenticator + email re-authentication for the admin panel");
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2088,7 +2089,7 @@ app.get("/admin-audit-log", authenticate, requirePermission("role_assignment"), 
       `SELECT aal.*, u.username, u.display_name
        FROM admin_audit_log aal
        LEFT JOIN users u ON aal.admin_id = u.id
-       ORDER BY aal.created_at DESC LIMIT 100`
+       ORDER BY aal.created_at DESC LIMIT 500`
     );
     res.json({ log: result.rows });
   } catch (err) {
@@ -2178,6 +2179,7 @@ app.post("/admin/create-member", authenticate, requirePermission("user_managemen
       ]
     );
 
+    logAdminAction(req.user.id, "member_created", `Created member ${result.rows[0].username}${result.rows[0].is_admin ? " as an admin" : ""}`);
     res.status(201).json({ user: result.rows[0], token: signToken(result.rows[0]) });
   } catch (err) {
     if (err.code === "23505") {
@@ -2541,6 +2543,9 @@ app.post("/login/verify-2fa-email", authRateLimit, async (req, res) => {
     pool
       .query("INSERT INTO login_history (user_id, ip, user_agent) VALUES ($1, $2, $3)", [user.id, ip, userAgent])
       .catch((err) => console.error("Failed to record login history:", err.message));
+    if (user.is_admin) {
+      logAdminAction(user.id, "admin_login_completed", `Completed three-step admin login from ${ip || "unknown IP"}`);
+    }
     res.json({ user, token: signToken(user) });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2834,6 +2839,7 @@ app.patch("/listings/:id/dismiss-flag", authenticate, async (req, res) => {
       "UPDATE listings SET flagged_images = $1 WHERE id = $2 RETURNING *",
       [JSON.stringify(remaining), req.params.id]
     );
+    logAdminAction(req.user.id, "listing_image_flag_dismissed", `Dismissed an image moderation flag on listing #${req.params.id}`);
     res.json({ listing: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2902,8 +2908,9 @@ app.delete("/listings/:id", authenticate, async (req, res) => {
 
 app.delete("/listings/by-owner/:ownerId", authenticate, requirePermission("user_management"), async (req, res) => {
   try {
-    await pool.query("DELETE FROM listings WHERE owner_id = $1", [req.params.ownerId]);
-    res.json({ success: true });
+    const removed = await pool.query("DELETE FROM listings WHERE owner_id = $1 RETURNING id", [req.params.ownerId]);
+    logAdminAction(req.user.id, "seller_listings_removed", `Removed ${removed.rowCount} listing${removed.rowCount === 1 ? "" : "s"} belonging to user #${req.params.ownerId}`);
+    res.json({ success: true, removedCount: removed.rowCount });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2962,6 +2969,7 @@ app.patch("/settings", authenticate, async (req, res) => {
         "INSERT INTO site_settings (id, auth_image) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET auth_image = $1",
         [authImage]
       );
+      logAdminAction(req.user.id, "site_branding_changed", "Updated the sign-in/site branding image");
     }
     const result = await pool.query("SELECT commission_rate, tax_rate, auth_image FROM site_settings WHERE id = 1");
     res.json({
@@ -5517,6 +5525,7 @@ app.post("/content/banners", authenticate, requirePermission("content_management
        VALUES ($1, $2, $3, $4, $5) RETURNING *`,
       [message.trim(), tone || "info", mediaType || "none", imageUrl || "", videoUrl || ""]
     );
+    logAdminAction(req.user.id, "banner_created", `Created banner #${result.rows[0].id}`);
     res.status(201).json({ banner: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -5539,6 +5548,7 @@ app.patch("/content/banners/:id", authenticate, requirePermission("content_manag
     values.push(req.params.id);
     const result = await pool.query(`UPDATE banners SET ${sets.join(", ")} WHERE id = $${i} RETURNING *`, values);
     if (result.rows.length === 0) return res.status(404).json({ error: "Banner not found" });
+    logAdminAction(req.user.id, "banner_updated", `Updated banner #${req.params.id} (${Object.keys(req.body || {}).join(", ")})`);
     res.json({ banner: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -5563,6 +5573,7 @@ app.post("/content/articles", authenticate, requirePermission("content_managemen
       "INSERT INTO help_articles (title, body) VALUES ($1, $2) RETURNING *",
       [title.trim(), body.trim()]
     );
+    logAdminAction(req.user.id, "article_created", `Created help article #${result.rows[0].id}: ${result.rows[0].title}`);
     res.status(201).json({ article: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -5578,6 +5589,7 @@ app.patch("/content/articles/:id", authenticate, requirePermission("content_mana
       [title?.trim() || null, body?.trim() || null, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Article not found" });
+    logAdminAction(req.user.id, "article_updated", `Updated help article #${req.params.id}: ${result.rows[0].title}`);
     res.json({ article: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -5602,6 +5614,7 @@ app.post("/content/faqs", authenticate, requirePermission("content_management"),
       "INSERT INTO help_faqs (question, answer) VALUES ($1, $2) RETURNING *",
       [question.trim(), answer.trim()]
     );
+    logAdminAction(req.user.id, "faq_created", `Created FAQ #${result.rows[0].id}`);
     res.status(201).json({ faq: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -5617,6 +5630,7 @@ app.patch("/content/faqs/:id", authenticate, requirePermission("content_manageme
       [question?.trim() || null, answer?.trim() || null, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "FAQ not found" });
+    logAdminAction(req.user.id, "faq_updated", `Updated FAQ #${req.params.id}`);
     res.json({ faq: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -5747,6 +5761,9 @@ app.post("/support-tickets/:id/messages", authenticate, requireTicketAccess, asy
       [req.params.id, req.user.id, body.trim()]
     );
     await pool.query("UPDATE support_tickets SET updated_at = NOW() WHERE id = $1", [req.params.id]);
+    if (req.user.isAdmin && hasPermission(req.user, "support_tickets")) {
+      logAdminAction(req.user.id, "support_reply_sent", `Sent an admin reply on support ticket #${req.params.id}`);
+    }
     res.status(201).json({ message: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -5764,6 +5781,7 @@ app.patch("/support-tickets/:id/status", authenticate, requirePermission("suppor
       [status, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Ticket not found" });
+    logAdminAction(req.user.id, "support_ticket_status_changed", `Changed support ticket #${req.params.id} to ${status}`);
     res.json({ ticket: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
