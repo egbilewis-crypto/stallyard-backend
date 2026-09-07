@@ -5831,6 +5831,120 @@ app.get("/support-tickets", authenticate, requirePermission("support_tickets"), 
   }
 });
 
+
+// Super-admin-only, non-destructive health checks. Live checks are used only
+// where a read-only endpoint is available; services whose validation would
+// consume quota or create user-visible side effects are reported as configured.
+async function fetchWithTimeout(url, options = {}, timeoutMs = 7000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+app.get("/admin/system-health", authenticate, requirePermission("role_assignment"), async (req, res) => {
+  const services = [];
+  const add = (key, name, purpose, status, message, extra = {}) => {
+    services.push({ key, name, purpose, status, message, ...extra });
+  };
+  const timed = async (fn) => {
+    const started = Date.now();
+    try {
+      const value = await fn();
+      return { ok: true, value, latencyMs: Date.now() - started };
+    } catch (error) {
+      return { ok: false, error, latencyMs: Date.now() - started };
+    }
+  };
+
+  // The request itself proves Express/Railway is serving traffic.
+  add("backend", "Railway backend", "API server", "healthy", "Stallyard backend is responding.", { liveCheck: true, latencyMs: 0 });
+
+  const db = await timed(() => pool.query("SELECT 1 AS ok"));
+  add(
+    "postgres",
+    "PostgreSQL",
+    "Marketplace database",
+    db.ok ? "healthy" : "unhealthy",
+    db.ok ? "Database connection and query succeeded." : `Database check failed: ${db.error?.message || "unknown error"}`,
+    { liveCheck: true, latencyMs: db.latencyMs }
+  );
+
+  const supabaseUrl = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
+  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY;
+  const supabaseBucket = process.env.SUPABASE_STORAGE_BUCKET || "stallyard-media";
+  if (!supabaseUrl || !supabaseKey) {
+    add("supabase", "Supabase Storage", "Listing and marketplace media", "not_configured", "Supabase URL or server key is missing.", { liveCheck: false });
+  } else {
+    const sb = await timed(async () => {
+      const response = await fetchWithTimeout(`${supabaseUrl}/storage/v1/bucket/${encodeURIComponent(supabaseBucket)}`, {
+        headers: { apikey: supabaseKey, Authorization: `Bearer ${supabaseKey}` },
+      });
+      if (!response.ok) throw new Error(`Storage API returned HTTP ${response.status}`);
+      return response;
+    });
+    add("supabase", "Supabase Storage", "Listing and marketplace media", sb.ok ? "healthy" : "unhealthy",
+      sb.ok ? `Storage bucket “${supabaseBucket}” is reachable.` : `Storage check failed: ${sb.error?.message || "unknown error"}`,
+      { liveCheck: true, latencyMs: sb.latencyMs });
+  }
+
+  if (!process.env.PAYSTACK_SECRET_KEY) {
+    add("paystack", "Paystack", "Buyer payments, refunds, seller payouts", "not_configured", "PAYSTACK_SECRET_KEY is missing.", { liveCheck: false });
+  } else {
+    const ps = await timed(async () => {
+      const response = await fetchWithTimeout("https://api.paystack.co/bank?country=nigeria&perPage=1", {
+        headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` },
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data.status === false) throw new Error(data.message || `Paystack returned HTTP ${response.status}`);
+      return data;
+    });
+    add("paystack", "Paystack", "Buyer payments, refunds, seller payouts", ps.ok ? "healthy" : "unhealthy",
+      ps.ok ? "Paystack API authentication and connectivity succeeded." : `Paystack check failed: ${ps.error?.message || "unknown error"}`,
+      { liveCheck: true, latencyMs: ps.latencyMs });
+  }
+
+  if (!process.env.RESEND_API_KEY) {
+    add("resend", "Resend", "Verification and security email", "not_configured", "RESEND_API_KEY is missing.", { liveCheck: false });
+  } else {
+    const re = await timed(async () => {
+      const response = await fetchWithTimeout("https://api.resend.com/domains", {
+        headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
+      });
+      if (!response.ok) throw new Error(`Resend returned HTTP ${response.status}`);
+      return response;
+    });
+    add("resend", "Resend", "Verification and security email", re.ok ? "healthy" : "unhealthy",
+      re.ok ? "Resend API authentication and connectivity succeeded." : `Resend check failed: ${re.error?.message || "unknown error"}`,
+      { liveCheck: true, latencyMs: re.latencyMs });
+  }
+
+  const sightengineConfigured = !!(process.env.SIGHTENGINE_API_USER && process.env.SIGHTENGINE_API_SECRET);
+  add("sightengine", "Sightengine", "Listing-image moderation", sightengineConfigured ? "configured" : "not_configured",
+    sightengineConfigured ? "Moderation credentials are present. Live image analysis is skipped to avoid consuming moderation quota." : "Sightengine credentials are missing.",
+    { liveCheck: false });
+
+  const ipqsConfigured = !!process.env.IPQS_API_KEY;
+  add("ipqs", "IPQualityScore", "VPN/proxy and phone-risk checks", ipqsConfigured ? "configured" : "not_configured",
+    ipqsConfigured ? "Risk-check API key is present. Live lookup is skipped to avoid consuming quota." : "IPQS_API_KEY is missing; VPN/phone risk checks will be skipped.",
+    { liveCheck: false });
+
+  const termiiConfigured = !!process.env.TERMII_API_KEY;
+  add("termii", "Termii", "SMS/phone verification", termiiConfigured ? "configured" : "not_configured",
+    termiiConfigured ? "SMS API key is present. No test SMS is sent by this health check." : "TERMII_API_KEY is missing; SMS verification is unavailable.",
+    { liveCheck: false });
+
+  const problems = services.filter((service) => service.status === "unhealthy");
+  res.json({
+    checkedAt: new Date().toISOString(),
+    overall: problems.length ? "degraded" : "operational",
+    services,
+  });
+});
+
 async function requireTicketAccess(req, res, next) {
   try {
     const result = await pool.query("SELECT user_id FROM support_tickets WHERE id = $1", [req.params.id]);
