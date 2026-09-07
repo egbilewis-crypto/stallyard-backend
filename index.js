@@ -3883,19 +3883,59 @@ app.get("/orders", authenticate, requireAdmin, async (req, res) => {
 });
 
 app.patch("/orders/:id/release", authenticate, requirePermission("finance"), async (req, res) => {
+  const client = await pool.connect();
   try {
-    const result = await pool.query(
-      `UPDATE orders SET payment_status = 'released'
-       WHERE id = $1 AND COALESCE(is_disputed, false) = false
-       RETURNING *`,
+    await client.query("BEGIN");
+    const orderResult = await client.query("SELECT * FROM orders WHERE id = $1 FOR UPDATE", [req.params.id]);
+    if (!orderResult.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Order not found" });
+    }
+    const order = orderResult.rows[0];
+    if (order.payment_status !== "held") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: `Only held payments can be released. This order is currently ${order.payment_status}.` });
+    }
+
+    // A disputed order stays locked unless the active case has already been
+    // explicitly decided in the seller's favor. In that one case, release
+    // and dispute resolution happen in the SAME database transaction so
+    // there is never a window where the dispute lock is removed first.
+    let resolvedDispute = null;
+    if (order.is_disputed) {
+      const disputeResult = await client.query(
+        `SELECT * FROM dispute_cases
+         WHERE order_id = $1 AND status <> 'resolved' AND resolution = 'seller_release'
+         ORDER BY updated_at DESC LIMIT 1 FOR UPDATE`,
+        [req.params.id]
+      );
+      if (!disputeResult.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          error: "Payment cannot be released while this order has an active dispute unless the dispute decision is 'Release to seller'.",
+        });
+      }
+      const resolved = await client.query(
+        `UPDATE dispute_cases SET
+           status = 'resolved', resolved_by_id = $1, resolved_at = NOW(), updated_at = NOW()
+         WHERE id = $2 RETURNING *`,
+        [req.user.id, disputeResult.rows[0].id]
+      );
+      resolvedDispute = resolved.rows[0];
+    }
+
+    const updated = await client.query(
+      `UPDATE orders SET payment_status = 'released', is_disputed = false
+       WHERE id = $1 RETURNING *`,
       [req.params.id]
     );
-    if (result.rows.length === 0) {
-      const check = await pool.query("SELECT id, is_disputed FROM orders WHERE id = $1", [req.params.id]);
-      if (!check.rows.length) return res.status(404).json({ error: "Order not found" });
-      return res.status(409).json({ error: "Payment cannot be released while this order has an active dispute" });
-    }
-    logAdminAction(req.user.id, "payment_released", `Released payment for order #${result.rows[0].id} ($${result.rows[0].total})`);
+    await client.query("COMMIT");
+
+    logAdminAction(
+      req.user.id,
+      "payment_released",
+      `Released payment for order #${updated.rows[0].id} (${formatMoneyServer(updated.rows[0].total, updated.rows[0].currency)})${resolvedDispute ? ` and resolved dispute #${resolvedDispute.id}` : ""}`
+    );
     const sellerIds = await pool.query(
       "SELECT DISTINCT seller_id FROM order_items WHERE order_id = $1",
       [req.params.id]
@@ -3903,9 +3943,18 @@ app.patch("/orders/:id/release", authenticate, requirePermission("finance"), asy
     for (const row of sellerIds.rows) {
       createNotification(row.seller_id, "funds_released", "Funds released for order — payment is now in your available balance.");
     }
-    res.json({ order: result.rows[0] });
+    if (resolvedDispute) {
+      const buyer = await pool.query("SELECT buyer_id FROM orders WHERE id = $1", [req.params.id]);
+      if (buyer.rows[0]?.buyer_id) {
+        createNotification(buyer.rows[0].buyer_id, "dispute_status", `Your dispute for order #${req.params.id} has been resolved. Payment was released to the seller.`);
+      }
+    }
+    res.json({ order: updated.rows[0], resolvedDispute });
   } catch (err) {
+    try { await client.query("ROLLBACK"); } catch {}
     res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -4216,6 +4265,48 @@ app.patch("/disputes/:id", authenticate, requirePermission("dispute_resolution")
     }
     const current = existing.rows[0];
     const nextStatus = status || current.status;
+    const nextResolution = resolution === undefined ? current.resolution : (resolution || null);
+
+    const orderStateResult = await client.query(
+      "SELECT id, payment_status, is_disputed FROM orders WHERE id = $1 FOR UPDATE",
+      [current.order_id]
+    );
+    if (!orderStateResult.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Linked order not found" });
+    }
+    const orderState = orderStateResult.rows[0];
+
+    // Never remove the dispute money lock before the financial outcome is
+    // actually complete. A refund decision remains in review until Paystack
+    // confirms refund.processed. A seller-release decision remains in review
+    // until the finance release succeeds. Partial refunds are intentionally
+    // blocked from final resolution until the real partial-refund flow exists.
+    if (nextStatus === "resolved") {
+      if (!nextResolution) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "Choose a final decision before resolving this dispute" });
+      }
+      if (nextResolution === "buyer_refund" && orderState.payment_status !== "refunded") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          error: "Keep this case In review until Paystack confirms the refund as processed. The dispute lock will stay on automatically.",
+        });
+      }
+      if (nextResolution === "seller_release" && orderState.payment_status !== "released") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          error: "Release the seller payment first. The dispute will resolve atomically when that release succeeds.",
+        });
+      }
+      if (nextResolution === "partial_refund") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          error: "Partial refund cannot be marked resolved yet because the real partial-refund payment flow has not been completed.",
+        });
+      }
+    }
+
     const result = await client.query(`
       UPDATE dispute_cases SET
         status = $1,
@@ -4228,15 +4319,17 @@ app.patch("/disputes/:id", authenticate, requirePermission("dispute_resolution")
       WHERE id = $6 RETURNING *
     `, [
       nextStatus,
-      resolution === undefined ? current.resolution : (resolution || null),
+      nextResolution,
       resolutionNote === undefined ? current.resolution_note : String(resolutionNote || ""),
       adminNotes === undefined ? current.admin_notes : String(adminNotes || ""),
       req.user.id,
       req.params.id,
     ]);
+
+    // The order stays disputed until the case is genuinely complete.
     await client.query("UPDATE orders SET is_disputed = $1 WHERE id = $2", [nextStatus !== "resolved", current.order_id]);
     await client.query("COMMIT");
-    logAdminAction(req.user.id, "dispute_case_updated", `Updated dispute #${req.params.id} for order #${current.order_id} to ${nextStatus}${resolution ? ` (${resolution})` : ""}`);
+    logAdminAction(req.user.id, "dispute_case_updated", `Updated dispute #${req.params.id} for order #${current.order_id} to ${nextStatus}${nextResolution ? ` (${nextResolution})` : ""}`);
     const orderParties = await pool.query(`
       SELECT o.buyer_id, array_agg(DISTINCT oi.seller_id) FILTER (WHERE oi.seller_id IS NOT NULL) AS seller_ids
       FROM orders o LEFT JOIN order_items oi ON oi.order_id = o.id WHERE o.id = $1 GROUP BY o.buyer_id
@@ -4608,6 +4701,29 @@ app.post("/webhook/paystack", async (req, res) => {
                  WHERE id = $2`,
                 [data.id || null, order.id]
               );
+
+              // If this refund was the chosen outcome of an active dispute,
+              // only NOW—after Paystack confirms it processed—do we resolve
+              // the case and remove the order's dispute lock.
+              const resolvedCases = await pool.query(
+                `UPDATE dispute_cases SET
+                   status = 'resolved', resolved_at = NOW(), updated_at = NOW()
+                 WHERE order_id = $1 AND status <> 'resolved' AND resolution = 'buyer_refund'
+                 RETURNING id`,
+                [order.id]
+              );
+              if (resolvedCases.rows.length) {
+                const remaining = await pool.query(
+                  "SELECT COUNT(*)::int AS count FROM dispute_cases WHERE order_id = $1 AND status <> 'resolved'",
+                  [order.id]
+                );
+                if ((remaining.rows[0]?.count || 0) === 0) {
+                  await pool.query("UPDATE orders SET is_disputed = false WHERE id = $1", [order.id]);
+                }
+                for (const row of resolvedCases.rows) {
+                  logAdminAction(null, "dispute_auto_resolved_after_refund", `Resolved dispute #${row.id} after Paystack processed refund for order #${order.id}`);
+                }
+              }
               createNotification(order.buyer_id, "refund_processed", `Your refund for order #${order.id} has been processed.`);
             } else if (event.event === "refund.failed") {
               await pool.query(
