@@ -2151,6 +2151,70 @@ app.post("/admin/staff/:id/revoke-sessions", authenticate, requirePermission("ro
   }
 });
 
+app.post("/admin/staff/:id/reset-password", authenticate, requirePermission("role_assignment"), authRateLimit, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const targetId = Number(req.params.id);
+    if (!Number.isFinite(targetId)) return res.status(400).json({ error: "Invalid staff account" });
+    if (targetId === Number(req.user.id)) {
+      return res.status(400).json({ error: "Use your own account security controls to change your password." });
+    }
+    if (!process.env.RESEND_API_KEY) {
+      return res.status(500).json({ error: "Password reset email isn't configured" });
+    }
+
+    await client.query("BEGIN");
+    const found = await client.query(
+      `SELECT id, username, email, display_name, is_admin
+       FROM users WHERE id = $1 FOR UPDATE`,
+      [targetId]
+    );
+    if (!found.rows.length || !found.rows[0].is_admin) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Active admin account not found" });
+    }
+    const target = found.rows[0];
+    if (!target.email) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "This admin account has no email on file" });
+    }
+
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
+    const resendRes = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
+      body: JSON.stringify({
+        from: fromAddress,
+        to: [target.email],
+        subject: `Stallyard admin password reset code: ${code}`,
+        html: `<p>A Stallyard Super Admin started a password reset for your admin account.</p><p>Your password reset code is <strong>${code}</strong>.</p><p>This code expires in 15 minutes. Go to Stallyard sign in, choose <strong>Forgot password</strong>, enter your admin username <strong>${target.username}</strong>, and use this code to set a new password.</p><p>Your existing sessions have been signed out for security. If you did not expect this reset, contact the Stallyard Super Admin immediately.</p>`,
+      }),
+    });
+    const resendData = await resendRes.json().catch(() => ({}));
+    if (!resendRes.ok) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: resendData.message || "Couldn't send the password reset email" });
+    }
+
+    passwordResetCodes.set(target.username.trim().toLowerCase(), { code, sentAt: Date.now() });
+    await client.query(
+      "UPDATE users SET token_version = COALESCE(token_version, 0) + 1 WHERE id = $1",
+      [targetId]
+    );
+    await client.query("COMMIT");
+
+    const maskedEmail = target.email.replace(/^(.{1,2}).*(@.*)$/, (m, a, b) => `${a}***${b}`);
+    logAdminAction(req.user.id, "admin_password_reset_started", `Started a secure password reset for admin ${target.username} and revoked existing sessions`);
+    res.json({ success: true, maskedEmail });
+  } catch (err) {
+    try { await client.query("ROLLBACK"); } catch {}
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 const ADMIN_NOTE_ENTITY_TYPES = new Set(["member", "listing", "order", "dispute", "support_ticket"]);
 
 function canAccessAdminNotes(user, entityType) {
