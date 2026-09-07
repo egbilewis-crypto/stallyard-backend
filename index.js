@@ -1345,6 +1345,27 @@ app.get("/migrate/cart-watchlist", requireMigrationKey, async (req, res) => {
   }
 });
 
+app.get("/migrate/admin-notes", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS admin_notes (
+        id SERIAL PRIMARY KEY,
+        entity_type TEXT NOT NULL,
+        entity_id INTEGER NOT NULL,
+        admin_id INTEGER NOT NULL REFERENCES users(id),
+        body TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        CHECK (entity_type IN ('member', 'listing', 'order', 'dispute', 'support_ticket'))
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_admin_notes_entity ON admin_notes(entity_type, entity_id, created_at DESC)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_admin_notes_admin ON admin_notes(admin_id, created_at DESC)`);
+    res.send("Migration complete: admin_notes table created.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.post("/signup", authRateLimit, async (req, res) => {
   try {
     const { username, email, password, displayName } = req.body;
@@ -1991,6 +2012,71 @@ app.patch("/users/:id/admin-role", authenticate, requirePermission("role_assignm
     if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
     logAdminAction(req.user.id, "admin_role_changed", `Set ${result.rows[0].username}'s admin role to ${role || "none (revoked)"}`);
     res.json({ user: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const ADMIN_NOTE_ENTITY_TYPES = new Set(["member", "listing", "order", "dispute", "support_ticket"]);
+
+function canAccessAdminNotes(user, entityType) {
+  if (!user?.isAdmin || !user.twoFactorEnabled) return false;
+  if (!user.adminRole || user.adminRole === "super_admin") return true;
+  if (entityType === "member") return hasPermission(user, "seller_verification") || hasPermission(user, "user_management");
+  if (entityType === "listing") return hasPermission(user, "listing_moderation");
+  if (entityType === "order") return hasPermission(user, "finance") || hasPermission(user, "dispute_resolution");
+  if (entityType === "dispute") return hasPermission(user, "dispute_resolution");
+  if (entityType === "support_ticket") return hasPermission(user, "support_tickets");
+  return false;
+}
+
+function requireAdminNotesAccess(req, res, next) {
+  const entityType = String(req.params.entityType || "");
+  if (!ADMIN_NOTE_ENTITY_TYPES.has(entityType)) return res.status(400).json({ error: "Invalid note type" });
+  if (!canAccessAdminNotes(req.user, entityType)) return res.status(403).json({ error: "You don't have permission to view notes for this record" });
+  next();
+}
+
+app.get("/admin-notes/:entityType/:entityId", authenticate, requireAdminNotesAccess, async (req, res) => {
+  try {
+    const entityId = Number(req.params.entityId);
+    if (!Number.isInteger(entityId) || entityId <= 0) return res.status(400).json({ error: "Invalid record ID" });
+    const result = await pool.query(
+      `SELECT n.id, n.entity_type, n.entity_id, n.body, n.created_at, n.admin_id,
+              u.username AS admin_username, u.display_name AS admin_display_name
+       FROM admin_notes n
+       LEFT JOIN users u ON n.admin_id = u.id
+       WHERE n.entity_type = $1 AND n.entity_id = $2
+       ORDER BY n.created_at DESC, n.id DESC`,
+      [req.params.entityType, entityId]
+    );
+    res.json({ notes: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/admin-notes/:entityType/:entityId", authenticate, requireAdminNotesAccess, async (req, res) => {
+  try {
+    const entityId = Number(req.params.entityId);
+    const body = String(req.body?.body || "").trim();
+    if (!Number.isInteger(entityId) || entityId <= 0) return res.status(400).json({ error: "Invalid record ID" });
+    if (!body) return res.status(400).json({ error: "Write a note first" });
+    if (body.length > 4000) return res.status(400).json({ error: "Internal notes are limited to 4,000 characters" });
+    const result = await pool.query(
+      `INSERT INTO admin_notes (entity_type, entity_id, admin_id, body)
+       VALUES ($1, $2, $3, $4)
+       RETURNING *`,
+      [req.params.entityType, entityId, req.user.id, body]
+    );
+    const admin = await pool.query("SELECT username, display_name FROM users WHERE id = $1", [req.user.id]);
+    const note = {
+      ...result.rows[0],
+      admin_username: admin.rows[0]?.username || req.user.username,
+      admin_display_name: admin.rows[0]?.display_name || req.user.username,
+    };
+    logAdminAction(req.user.id, "admin_note_added", `Added private note to ${req.params.entityType} #${entityId}`);
+    res.status(201).json({ note });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
