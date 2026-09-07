@@ -4254,7 +4254,7 @@ async function computeAvailableBalance(client, sellerId) {
   const releasedResult = await client.query(
     `SELECT COALESCE(SUM(
        CASE WHEN oi.fulfillment_status NOT IN ('cancelled', 'returned')
-         THEN (oi.price * oi.qty) - (oi.price * oi.qty * o.commission_rate) + oi.shipping_fee
+         THEN (oi.price * oi.qty) - (oi.price * oi.qty * o.commission_rate) + (oi.shipping_fee * oi.qty)
          ELSE 0
        END
      ), 0) AS released_total
@@ -4353,6 +4353,205 @@ app.get("/withdrawals", authenticate, requirePermission("finance"), async (req, 
   try {
     const result = await pool.query("SELECT * FROM withdrawals ORDER BY requested_at DESC");
     res.json({ withdrawals: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// Finance reconciliation: one server-side view of what buyers paid, what is
+// still held, what has been released to sellers, Stallyard commission,
+// refunds, and seller withdrawals. This intentionally calculates from the
+// database rather than trusting totals assembled in the browser.
+app.get("/admin/reconciliation", authenticate, requirePermission("finance"), async (req, res) => {
+  try {
+    const ordersResult = await pool.query(`
+      SELECT
+        o.*,
+        COALESCE(SUM(CASE WHEN oi.fulfillment_status NOT IN ('cancelled', 'returned')
+          THEN oi.price * oi.qty ELSE 0 END), 0) AS eligible_merchandise,
+        COALESCE(SUM(CASE WHEN oi.fulfillment_status NOT IN ('cancelled', 'returned')
+          THEN oi.shipping_fee * oi.qty ELSE 0 END), 0) AS eligible_shipping,
+        COUNT(oi.id) AS item_count,
+        COUNT(oi.id) FILTER (
+          WHERE oi.fulfillment_status NOT IN ('cancelled', 'returned')
+            AND oi.buyer_confirmed_at IS NULL
+        ) AS unconfirmed_item_count,
+        COUNT(oi.id) FILTER (
+          WHERE oi.fulfillment_status NOT IN ('cancelled', 'returned')
+            AND COALESCE(oi.proof_of_delivery_url, '') = ''
+        ) AS missing_pod_count
+      FROM orders o
+      LEFT JOIN order_items oi ON oi.order_id = o.id
+      GROUP BY o.id
+      ORDER BY o.created_at DESC
+      LIMIT 500
+    `);
+    const withdrawalsResult = await pool.query(`
+      SELECT status, COALESCE(SUM(amount), 0) AS amount, COUNT(*) AS count
+      FROM withdrawals
+      GROUP BY status
+    `);
+
+    const byCurrency = {};
+    const records = [];
+    for (const row of ordersResult.rows) {
+      const currency = row.currency || "NGN";
+      if (!byCurrency[currency]) {
+        byCurrency[currency] = {
+          currency,
+          grossPayments: 0,
+          held: 0,
+          released: 0,
+          refundPending: 0,
+          refunded: 0,
+          recordedCommission: 0,
+          releasedSellerPayable: 0,
+          tax: 0,
+        };
+      }
+      const bucket = byCurrency[currency];
+      const total = Number(row.total) || 0;
+      const subtotal = Number(row.subtotal) || 0;
+      const shippingTotal = Number(row.shipping_total) || 0;
+      const taxAmount = Number(row.tax_amount) || 0;
+      const commissionRate = Number(row.commission_rate) || 0;
+      const commissionAmount = Number(row.commission_amount) || 0;
+      const expectedTotal = Math.round((subtotal + shippingTotal + taxAmount) * 100) / 100;
+      const expectedCommission = Math.round(subtotal * commissionRate * 100) / 100;
+      const eligibleMerchandise = Number(row.eligible_merchandise) || 0;
+      const eligibleShipping = Number(row.eligible_shipping) || 0;
+      const sellerPayable = Math.round((eligibleMerchandise * (1 - commissionRate) + eligibleShipping) * 100) / 100;
+
+      bucket.grossPayments += total;
+      bucket.recordedCommission += commissionAmount;
+      bucket.tax += taxAmount;
+      if (row.payment_status === "held") bucket.held += total;
+      else if (row.payment_status === "released") {
+        bucket.released += total;
+        bucket.releasedSellerPayable += sellerPayable;
+      } else if (row.payment_status === "refund_pending") bucket.refundPending += total;
+      else if (row.payment_status === "refunded") bucket.refunded += total;
+
+      const flags = [];
+      if (["held", "released", "refund_pending", "refunded"].includes(row.payment_status) && !row.paystack_reference) {
+        flags.push({ code: "missing_reference", severity: "high", message: "Paid order has no Paystack transaction reference" });
+      }
+      if (Math.abs(total - expectedTotal) > 0.01) {
+        flags.push({ code: "total_mismatch", severity: "high", message: `Order total differs from subtotal + shipping + tax by ${Math.abs(total - expectedTotal).toFixed(2)}` });
+      }
+      if (Math.abs(commissionAmount - expectedCommission) > 0.01) {
+        flags.push({ code: "commission_mismatch", severity: "medium", message: `Recorded commission differs from the order rate by ${Math.abs(commissionAmount - expectedCommission).toFixed(2)}` });
+      }
+      if (row.payment_status === "released" && row.is_disputed) {
+        flags.push({ code: "released_disputed", severity: "high", message: "Payment is released while the order is marked disputed" });
+      }
+      if (row.payment_status === "released" && Number(row.unconfirmed_item_count) > 0) {
+        flags.push({ code: "released_unconfirmed", severity: "high", message: `${row.unconfirmed_item_count} eligible item(s) are not delivery-confirmed` });
+      }
+      if (row.payment_status === "released" && Number(row.missing_pod_count) > 0) {
+        flags.push({ code: "released_no_pod", severity: "high", message: `${row.missing_pod_count} eligible item(s) have no proof-of-delivery image` });
+      }
+      if (row.payment_status === "refunded" && row.refund_status && row.refund_status !== "processed") {
+        flags.push({ code: "refund_status_mismatch", severity: "high", message: `Order says refunded but refund status is ${row.refund_status}` });
+      }
+      if (row.payment_status === "refund_pending" && row.refund_status === "failed") {
+        flags.push({ code: "failed_refund_locked", severity: "medium", message: "Refund failed but order is still locked as refund pending" });
+      }
+
+      records.push({
+        orderId: row.id,
+        buyerUsername: row.buyer_username,
+        currency,
+        total,
+        subtotal,
+        shippingTotal,
+        taxAmount,
+        commissionRate,
+        commissionAmount,
+        expectedTotal,
+        expectedCommission,
+        sellerPayable,
+        paymentStatus: row.payment_status,
+        refundStatus: row.refund_status,
+        isDisputed: !!row.is_disputed,
+        paystackReference: row.paystack_reference,
+        createdAt: row.created_at,
+        flags,
+      });
+    }
+
+    for (const value of Object.values(byCurrency)) {
+      for (const key of Object.keys(value)) {
+        if (key !== "currency") value[key] = Math.round(Number(value[key] || 0) * 100) / 100;
+      }
+    }
+
+    const withdrawals = { processing: 0, paid: 0, failed: 0, counts: {} };
+    for (const row of withdrawalsResult.rows) {
+      const status = row.status || "unknown";
+      const amount = Math.round((Number(row.amount) || 0) * 100) / 100;
+      withdrawals.counts[status] = Number(row.count) || 0;
+      if (status === "processing") withdrawals.processing += amount;
+      else if (status === "paid") withdrawals.paid += amount;
+      else if (status === "failed") withdrawals.failed += amount;
+    }
+
+    const flaggedRecords = records.filter((r) => r.flags.length > 0);
+    res.json({
+      generatedAt: new Date().toISOString(),
+      byCurrency: Object.values(byCurrency),
+      withdrawals,
+      alerts: {
+        total: flaggedRecords.length,
+        high: flaggedRecords.filter((r) => r.flags.some((f) => f.severity === "high")).length,
+      },
+      records,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Live spot-check against Paystack for a single order. We do this on demand
+// instead of calling Paystack for hundreds of orders every time the dashboard
+// opens, which keeps the finance page fast and avoids unnecessary API traffic.
+app.get("/admin/reconciliation/orders/:id/verify-paystack", authenticate, requirePermission("finance"), async (req, res) => {
+  try {
+    if (!process.env.PAYSTACK_SECRET_KEY) {
+      return res.status(500).json({ error: "Paystack isn't configured" });
+    }
+    const result = await pool.query(
+      "SELECT id, total, currency, payment_status, paystack_reference FROM orders WHERE id = $1",
+      [req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: "Order not found" });
+    const order = result.rows[0];
+    if (!order.paystack_reference) {
+      return res.status(400).json({ error: "This order has no Paystack transaction reference" });
+    }
+    const paystackRes = await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(order.paystack_reference)}`, {
+      headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` },
+    });
+    const data = await paystackRes.json();
+    if (!paystackRes.ok || !data.status) {
+      return res.status(502).json({ error: data.message || "Couldn't verify this transaction with Paystack" });
+    }
+    const tx = data.data || {};
+    const paystackAmount = Math.round((Number(tx.amount) || 0)) / 100;
+    const expectedAmount = Math.round((Number(order.total) || 0) * 100) / 100;
+    const amountMatches = Math.abs(paystackAmount - expectedAmount) <= 0.01;
+    const currencyMatches = String(tx.currency || "").toUpperCase() === String(order.currency || "NGN").toUpperCase();
+    const paymentSucceeded = tx.status === "success";
+    res.json({
+      orderId: order.id,
+      reference: order.paystack_reference,
+      checkedAt: new Date().toISOString(),
+      matches: amountMatches && currencyMatches && paymentSucceeded,
+      checks: { amountMatches, currencyMatches, paymentSucceeded },
+      stallyard: { amount: expectedAmount, currency: order.currency || "NGN", paymentStatus: order.payment_status },
+      paystack: { amount: paystackAmount, currency: tx.currency || null, status: tx.status || null, paidAt: tx.paid_at || null, channel: tx.channel || null },
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
