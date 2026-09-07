@@ -7,20 +7,16 @@ const jwt = require("jsonwebtoken");
 
 const app = express();
 
-// Railway sits behind a reverse proxy. Trust the first proxy hop so req.ip
-// reflects the visitor rather than Railway's internal proxy address, without
-// blindly trusting an arbitrary chain of forwarded IPs.
+// Railway sits behind a reverse proxy. Trust only the first proxy hop.
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
 
-// Browser access is limited to the real Stallyard domains. Additional origins
-// (for example a temporary preview deployment) can be supplied in Railway as
-// a comma-separated ALLOWED_ORIGINS environment variable. Requests without an
-// Origin header are still allowed because server-to-server calls and webhooks
-// normally do not send one.
+// Restrict browser API access to Stallyard frontends. Extra origins such as
+// Vercel preview/admin hosts are supplied through Railway ALLOWED_ORIGINS.
 const DEFAULT_ALLOWED_ORIGINS = [
   "https://stallyard.com",
   "https://www.stallyard.com",
+  "https://admin.stallyard.com",
 ];
 const EXTRA_ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
@@ -28,7 +24,7 @@ const EXTRA_ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .filter(Boolean);
 const ALLOWED_ORIGINS = new Set([...DEFAULT_ALLOWED_ORIGINS, ...EXTRA_ALLOWED_ORIGINS]);
 
-const corsOptions = {
+app.use(cors({
   origin(origin, callback) {
     if (!origin || ALLOWED_ORIGINS.has(origin)) return callback(null, true);
     return callback(new Error("Origin not allowed by CORS"));
@@ -36,11 +32,8 @@ const corsOptions = {
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "X-Paystack-Signature"],
   maxAge: 86400,
-};
-app.use(cors(corsOptions));
+}));
 
-// Lightweight production security headers. These protect the API without
-// introducing another dependency such as helmet.
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
@@ -1726,11 +1719,11 @@ app.post("/admin/reauth", authenticate, authRateLimit, async (req, res) => {
     const matches = await bcrypt.compare(password, result.rows[0].password_hash);
     if (!matches) return res.status(401).json({ error: "Password doesn't match" });
 
-    if (!result.rows[0].two_factor_enabled) {
-      return res.json({ success: true });
-    }
-    if (!result.rows[0].totp_secret) {
-      return res.status(500).json({ error: "Two-factor isn't configured — contact support" });
+    if (!result.rows[0].two_factor_enabled || !result.rows[0].totp_secret) {
+      return res.status(403).json({
+        error: "Admin multi-factor authentication is not configured. Authenticator setup is required before admin access.",
+        code: "ADMIN_MFA_REQUIRED",
+      });
     }
     res.json({ twoFactorRequired: true, method: "totp" });
   } catch (err) {
@@ -2153,6 +2146,64 @@ app.put("/watchlist", authenticate, async (req, res) => {
   }
 });
 
+// Dedicated admin entrance. Admin accounts must complete all three steps:
+// password -> authenticator TOTP -> emailed code. There is no password-only
+// fallback, and non-admin credentials receive the same generic error as bad
+// credentials so this endpoint does not disclose account roles.
+app.post("/admin/login", authRateLimit, async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(401).json({ error: "Username or password doesn't match" });
+    }
+
+    const result = await pool.query(
+      `SELECT ${USER_RETURNING_FIELDS}, password_hash, totp_secret
+       FROM users WHERE username = $1`,
+      [String(username).trim().toLowerCase()]
+    );
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: "Username or password doesn't match" });
+    }
+
+    const user = result.rows[0];
+    const passwordMatches = await bcrypt.compare(password, user.password_hash);
+    if (!passwordMatches || !user.is_admin) {
+      return res.status(401).json({ error: "Username or password doesn't match" });
+    }
+    if (user.is_suspended) {
+      return res.status(403).json({ error: "This account has been suspended" });
+    }
+
+    const vpnDetected = await isVpnOrProxy(getClientIp(req));
+    if (vpnDetected) {
+      return res.status(403).json({ error: "Admin login isn't allowed over a VPN, proxy, or Tor connection. Please disable it and try again." });
+    }
+
+    if (!user.two_factor_enabled || !user.totp_secret) {
+      return res.status(403).json({
+        error: "Admin multi-factor authentication is not configured. Authenticator setup is required before admin access.",
+        code: "ADMIN_MFA_REQUIRED",
+      });
+    }
+    if (!user.email) {
+      return res.status(403).json({
+        error: "Admin email verification is required before admin access.",
+        code: "ADMIN_EMAIL_REQUIRED",
+      });
+    }
+    if (!process.env.RESEND_API_KEY) {
+      return res.status(500).json({ error: "Admin email verification isn't configured — contact support" });
+    }
+
+    // Password is step 1. The existing verify-2fa endpoint performs TOTP
+    // (step 2), then sends the email code required for step 3.
+    res.json({ twoFactorRequired: true, userId: user.id, method: "totp" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/login", authRateLimit, async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -2180,6 +2231,10 @@ app.post("/login", authRateLimit, async (req, res) => {
 
     if (user.is_suspended) {
       return res.status(403).json({ error: "This account has been suspended" });
+    }
+
+    if (user.is_admin) {
+      return res.status(403).json({ error: "Admin accounts must sign in through the Stallyard admin portal." });
     }
 
     const vpnDetected = await isVpnOrProxy(getClientIp(req));
