@@ -1973,10 +1973,37 @@ const USER_FULL_FIELDS = `id, username, email, phone, display_name, first_name, 
   bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
   is_email_verified, is_phone_verified, admin_role`;
 
+// Safe admin directory fields. Admin roles that do not perform seller verification
+// can still resolve role/2FA state for UI permissions, but do NOT receive member
+// email, phone, ID/license data, ID photos, bank statements, or rejection details.
+const USER_ADMIN_SAFE_FIELDS = `${USER_PUBLIC_FIELDS}, two_factor_enabled, admin_role`;
+
 app.get("/users", async (req, res) => {
   try {
     const requester = getRequester(req);
-    const fields = requester?.isAdmin ? USER_FULL_FIELDS : USER_PUBLIC_FIELDS;
+    let fields = USER_PUBLIC_FIELDS;
+
+    // Do not trust the JWT's old isAdmin claim for deciding whether private
+    // member records can be returned. Re-check the account against PostgreSQL,
+    // including suspension and token_version, on every privileged directory read.
+    if (requester?.id) {
+      const authCheck = await pool.query(
+        `SELECT is_admin, is_suspended, token_version, admin_role, two_factor_enabled
+         FROM users WHERE id = $1`,
+        [requester.id]
+      );
+      if (authCheck.rows.length) {
+        const current = authCheck.rows[0];
+        const tokenIsCurrent = (requester.tokenVersion || 0) === (current.token_version || 0);
+        if (current.is_admin && !current.is_suspended && tokenIsCurrent) {
+          const role = current.admin_role || "super_admin";
+          const canReviewSellerPrivateData =
+            current.two_factor_enabled && (role === "super_admin" || role === "seller_verification");
+          fields = canReviewSellerPrivateData ? USER_FULL_FIELDS : USER_ADMIN_SAFE_FIELDS;
+        }
+      }
+    }
+
     const result = await pool.query(`SELECT ${fields} FROM users ORDER BY display_name ASC`);
     res.json({ users: result.rows });
   } catch (err) {
