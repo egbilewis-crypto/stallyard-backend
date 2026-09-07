@@ -4926,6 +4926,202 @@ app.get("/admin/seller-performance", authenticate, requirePermission("seller_ver
   }
 });
 
+
+// Admin CSV/business reports. The endpoint returns structured rows so the
+// authenticated admin frontend can preview the report and build a CSV locally.
+// Financial reports require the finance permission; the seller directory report
+// also permits seller-verification staff. Super Admin can access every report.
+function normalizeReportDate(value, endOfDay = false) {
+  if (!value) return null;
+  const d = new Date(`${value}${endOfDay ? "T23:59:59.999Z" : "T00:00:00.000Z"}`);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function reportPermissionAllowed(user, type) {
+  if (!user?.isAdmin || !user.twoFactorEnabled) return false;
+  if (!user.adminRole || user.adminRole === "super_admin") return true;
+  if (type === "sellers") return hasPermission(user, "seller_verification") || hasPermission(user, "finance");
+  return hasPermission(user, "finance");
+}
+
+app.get("/admin/reports/:type", authenticate, async (req, res) => {
+  try {
+    const type = String(req.params.type || "").toLowerCase();
+    const allowedTypes = new Set(["sales", "orders", "commissions", "payouts", "refunds", "sellers", "taxes"]);
+    if (!allowedTypes.has(type)) return res.status(400).json({ error: "Unknown report type" });
+    if (!reportPermissionAllowed(req.user, type)) {
+      return res.status(403).json({ error: "You don't have permission to view that report" });
+    }
+
+    const from = normalizeReportDate(req.query.from, false);
+    const to = normalizeReportDate(req.query.to, true);
+    if (req.query.from && !from) return res.status(400).json({ error: "Invalid from date" });
+    if (req.query.to && !to) return res.status(400).json({ error: "Invalid to date" });
+    if (from && to && from > to) return res.status(400).json({ error: "From date must be before To date" });
+
+    const params = [];
+    const dateWhere = (column) => {
+      const clauses = [];
+      if (from) { params.push(from); clauses.push(`${column} >= $${params.length}`); }
+      if (to) { params.push(to); clauses.push(`${column} <= $${params.length}`); }
+      return clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    };
+
+    let columns = [];
+    let rows = [];
+    let summary = {};
+
+    if (["sales", "orders", "commissions", "taxes", "refunds"].includes(type)) {
+      const where = dateWhere("o.created_at");
+      const result = await pool.query(`
+        SELECT o.id, o.created_at, o.buyer_username, o.currency, o.subtotal, o.shipping_total,
+               o.tax_amount, o.total, o.commission_rate, o.commission_amount, o.payment_status,
+               o.is_disputed, o.paystack_reference, o.payment_channel, o.refund_status,
+               o.refund_reason, o.refund_requested_at, o.refunded_at, o.refund_failure_reason,
+               COALESCE(string_agg(DISTINCT oi.seller_username, ', '), '') AS sellers,
+               COALESCE(string_agg(DISTINCT oi.title, ' | '), '') AS items,
+               COALESCE(SUM(oi.qty), 0) AS item_quantity
+        FROM orders o
+        LEFT JOIN order_items oi ON oi.order_id = o.id
+        ${where}
+        GROUP BY o.id
+        ORDER BY o.created_at DESC
+        LIMIT 10000
+      `, params);
+      const base = result.rows.map((r) => ({
+        order_number: `STL-${String(r.id).replace(/[^a-z0-9]/gi, "").slice(-8).toUpperCase()}`,
+        order_id: r.id,
+        date: r.created_at,
+        buyer: r.buyer_username || "",
+        sellers: r.sellers || "",
+        items: r.items || "",
+        item_quantity: Number(r.item_quantity) || 0,
+        currency: r.currency || "NGN",
+        subtotal: Number(r.subtotal) || 0,
+        shipping: Number(r.shipping_total) || 0,
+        tax: Number(r.tax_amount) || 0,
+        total: Number(r.total) || 0,
+        commission_rate: Number(r.commission_rate) || 0,
+        commission: Number(r.commission_amount) || 0,
+        seller_payable: Math.round(((Number(r.subtotal) || 0) + (Number(r.shipping_total) || 0) - (Number(r.commission_amount) || 0)) * 100) / 100,
+        payment_status: r.payment_status || "",
+        disputed: !!r.is_disputed,
+        paystack_reference: r.paystack_reference || "",
+        payment_channel: r.payment_channel || "",
+        refund_status: r.refund_status || "",
+        refund_reason: r.refund_reason || "",
+        refund_requested_at: r.refund_requested_at || "",
+        refunded_at: r.refunded_at || "",
+        refund_failure_reason: r.refund_failure_reason || "",
+      }));
+
+      if (type === "sales") {
+        columns = ["order_number","date","buyer","sellers","currency","subtotal","shipping","tax","total","payment_status","paystack_reference"];
+        rows = base.map((r) => Object.fromEntries(columns.map((c) => [c, r[c]])));
+      } else if (type === "orders") {
+        columns = ["order_number","order_id","date","buyer","sellers","items","item_quantity","currency","subtotal","shipping","tax","total","commission","seller_payable","payment_status","disputed","refund_status","paystack_reference","payment_channel"];
+        rows = base.map((r) => Object.fromEntries(columns.map((c) => [c, r[c]])));
+      } else if (type === "commissions") {
+        columns = ["order_number","date","currency","subtotal","commission_rate","commission","payment_status","paystack_reference"];
+        rows = base.map((r) => Object.fromEntries(columns.map((c) => [c, r[c]])));
+      } else if (type === "taxes") {
+        columns = ["order_number","date","buyer","currency","subtotal","shipping","tax","total","payment_status"];
+        rows = base.map((r) => Object.fromEntries(columns.map((c) => [c, r[c]])));
+      } else {
+        columns = ["order_number","date","buyer","currency","total","payment_status","refund_status","refund_reason","refund_requested_at","refunded_at","refund_failure_reason","paystack_reference"];
+        rows = base.filter((r) => r.refund_status || r.payment_status === "refunded" || r.payment_status === "refund_pending")
+          .map((r) => Object.fromEntries(columns.map((c) => [c, r[c]])));
+      }
+
+      const currencies = {};
+      for (const r of base) {
+        const c = r.currency || "NGN";
+        currencies[c] ||= { orders: 0, gross: 0, commission: 0, tax: 0, refunded: 0 };
+        currencies[c].orders += 1;
+        currencies[c].gross += r.total;
+        currencies[c].commission += r.commission;
+        currencies[c].tax += r.tax;
+        if (r.payment_status === "refunded") currencies[c].refunded += r.total;
+      }
+      for (const c of Object.values(currencies)) {
+        for (const k of ["gross","commission","tax","refunded"]) c[k] = Math.round(c[k] * 100) / 100;
+      }
+      summary = { rowCount: rows.length, currencies };
+    } else if (type === "payouts") {
+      const where = dateWhere("w.requested_at");
+      const result = await pool.query(`
+        SELECT w.id, w.seller_username, w.amount, w.status, w.failure_reason,
+               w.paystack_transfer_code, w.requested_at, w.processed_at
+        FROM withdrawals w
+        ${where}
+        ORDER BY w.requested_at DESC
+        LIMIT 10000
+      `, params);
+      columns = ["withdrawal_id","requested_at","seller","amount","status","processed_at","paystack_transfer_code","failure_reason"];
+      rows = result.rows.map((r) => ({
+        withdrawal_id: r.id,
+        requested_at: r.requested_at,
+        seller: r.seller_username || "",
+        amount: Number(r.amount) || 0,
+        status: r.status || "",
+        processed_at: r.processed_at || "",
+        paystack_transfer_code: r.paystack_transfer_code || "",
+        failure_reason: r.failure_reason || "",
+      }));
+      summary = {
+        rowCount: rows.length,
+        paid: Math.round(rows.filter((r) => r.status === "paid").reduce((s, r) => s + r.amount, 0) * 100) / 100,
+        processing: Math.round(rows.filter((r) => r.status === "processing").reduce((s, r) => s + r.amount, 0) * 100) / 100,
+        failed: Math.round(rows.filter((r) => r.status === "failed").reduce((s, r) => s + r.amount, 0) * 100) / 100,
+      };
+    } else if (type === "sellers") {
+      const where = dateWhere("u.created_at");
+      const result = await pool.query(`
+        SELECT u.id, u.username, u.display_name, u.email, u.phone, u.country, u.account_type,
+               u.verification_status, u.is_approved, u.is_verified, u.is_suspended, u.created_at,
+               COALESCE((SELECT COUNT(DISTINCT oi.order_id) FROM order_items oi WHERE oi.seller_id = u.id), 0) AS order_count,
+               COALESCE((
+                 SELECT SUM(oi.price * oi.qty)
+                 FROM order_items oi
+                 JOIN orders o ON o.id = oi.order_id
+                 WHERE oi.seller_id = u.id AND o.payment_status = 'released'
+               ), 0) AS released_merchandise,
+               COALESCE((SELECT AVG(rv.rating) FROM reviews rv WHERE rv.seller_id = u.id), 0) AS avg_rating,
+               COALESCE((SELECT COUNT(*) FROM reviews rv WHERE rv.seller_id = u.id), 0) AS review_count
+        FROM users u
+        ${where ? where + " AND (u.has_applied_to_sell = true OR u.is_approved = true)" : "WHERE (u.has_applied_to_sell = true OR u.is_approved = true)"}
+        ORDER BY u.created_at DESC
+        LIMIT 10000
+      `, params);
+      columns = ["seller_id","joined_at","username","display_name","email","phone","country","account_type","verification_status","approved","verified","suspended","order_count","released_merchandise","avg_rating","review_count"];
+      rows = result.rows.map((r) => ({
+        seller_id: r.id,
+        joined_at: r.created_at,
+        username: r.username || "",
+        display_name: r.display_name || "",
+        email: r.email || "",
+        phone: r.phone || "",
+        country: r.country || "",
+        account_type: r.account_type || "",
+        verification_status: r.verification_status || "",
+        approved: !!r.is_approved,
+        verified: !!r.is_verified,
+        suspended: !!r.is_suspended,
+        order_count: Number(r.order_count) || 0,
+        released_merchandise: Math.round((Number(r.released_merchandise) || 0) * 100) / 100,
+        avg_rating: Math.round((Number(r.avg_rating) || 0) * 100) / 100,
+        review_count: Number(r.review_count) || 0,
+      }));
+      summary = { rowCount: rows.length, approved: rows.filter((r) => r.approved).length, suspended: rows.filter((r) => r.suspended).length };
+    }
+
+    logAdminAction(req.user.id, "report_generated", `${type} report${req.query.from || req.query.to ? ` (${req.query.from || 'start'} to ${req.query.to || 'now'})` : ''}`);
+    res.json({ type, generatedAt: new Date().toISOString(), from: req.query.from || null, to: req.query.to || null, columns, rows, summary });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Finance reconciliation: one server-side view of what buyers paid, what is
 // still held, what has been released to sellers, Stallyard commission,
 // refunds, and seller withdrawals. This intentionally calculates from the
