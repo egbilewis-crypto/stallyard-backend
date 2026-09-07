@@ -5907,19 +5907,24 @@ app.get("/admin/system-health", authenticate, requirePermission("role_assignment
       { liveCheck: true, latencyMs: ps.latencyMs });
   }
 
+  // Resend production keys can intentionally be restricted to Sending access.
+  // A send-only key is not allowed to call account-level endpoints such as
+  // GET /domains, so using that endpoint as a health check produces a false
+  // HTTP 401 even while Stallyard email delivery is working correctly.
+  // Do not send a test email from System Health either: that would create a
+  // user-visible side effect and consume sending quota. Instead, report the
+  // email integration as configured when the server-side sending key exists.
   if (!process.env.RESEND_API_KEY) {
     add("resend", "Resend", "Verification and security email", "not_configured", "RESEND_API_KEY is missing.", { liveCheck: false });
   } else {
-    const re = await timed(async () => {
-      const response = await fetchWithTimeout("https://api.resend.com/domains", {
-        headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
-      });
-      if (!response.ok) throw new Error(`Resend returned HTTP ${response.status}`);
-      return response;
-    });
-    add("resend", "Resend", "Verification and security email", re.ok ? "healthy" : "unhealthy",
-      re.ok ? "Resend API authentication and connectivity succeeded." : `Resend check failed: ${re.error?.message || "unknown error"}`,
-      { liveCheck: true, latencyMs: re.latencyMs });
+    add(
+      "resend",
+      "Resend",
+      "Verification and security email",
+      "configured",
+      "Sending API key is present. A live account-level check is intentionally skipped because Stallyard uses a restricted send-only key; no test email is sent by System Health.",
+      { liveCheck: false }
+    );
   }
 
   const sightengineConfigured = !!(process.env.SIGHTENGINE_API_USER && process.env.SIGHTENGINE_API_SECRET);
