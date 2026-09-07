@@ -400,6 +400,12 @@ app.post("/email-verify/check", codeRateLimit, async (req, res) => {
 const passwordResetCodes = new Map();
 const PASSWORD_RESET_CODE_TTL_MS = 15 * 60 * 1000;
 
+// Tracks an admin who used a Super-Admin-issued temporary password for step 1.
+// The temporary password itself is stored only as a bcrypt hash in PostgreSQL;
+// this short-lived marker only carries the recovery state through TOTP + email.
+const adminTemporaryLoginMarkers = new Map();
+const ADMIN_TEMP_PASSWORD_TTL_MS = 10 * 60 * 1000;
+
 const twoFactorCodes = new Map();
 const TWO_FACTOR_CODE_TTL_MS = 10 * 60 * 1000;
 
@@ -1210,6 +1216,21 @@ app.get("/migrate/admin-staff-management", requireMigrationKey, async (req, res)
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_admin_role_history_user_id ON admin_role_history(user_id, created_at DESC)`);
     res.send("Migration complete: admin_role_history table created for staff management.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
+app.get("/migrate/admin-temporary-passwords", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS admin_temp_password_hash TEXT,
+        ADD COLUMN IF NOT EXISTS admin_temp_password_expires_at TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS admin_temp_password_created_at TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS admin_temp_password_created_by INTEGER REFERENCES users(id)
+    `);
+    res.send("Migration complete: temporary admin password fields added.");
   } catch (err) {
     res.status(500).send(`Migration failed: ${err.message}`);
   }
@@ -2151,6 +2172,76 @@ app.post("/admin/staff/:id/revoke-sessions", authenticate, requirePermission("ro
   }
 });
 
+app.post("/admin/staff/:id/temporary-password", authenticate, requirePermission("role_assignment"), authRateLimit, async (req, res) => {
+  try {
+    const targetId = Number(req.params.id);
+    if (!Number.isFinite(targetId)) return res.status(400).json({ error: "Invalid staff account" });
+    if (targetId === Number(req.user.id)) {
+      return res.status(400).json({ error: "Use your own account security controls to change your password." });
+    }
+
+    const found = await pool.query(
+      `SELECT id, username, email, display_name, is_admin, is_suspended
+       FROM users WHERE id = $1`,
+      [targetId]
+    );
+    if (!found.rows.length || !found.rows[0].is_admin) {
+      return res.status(404).json({ error: "Active admin account not found" });
+    }
+    const target = found.rows[0];
+    if (target.is_suspended) {
+      return res.status(400).json({ error: "Unsuspend this admin before issuing a temporary password." });
+    }
+
+    // Easy enough to type but still high entropy. Plaintext is returned once
+    // to the Super Admin; only the bcrypt hash is persisted.
+    const temporaryPassword = `STL-${crypto.randomBytes(6).toString("base64url")}`;
+    const passwordHash = await bcrypt.hash(temporaryPassword, 10);
+    const expiresAt = new Date(Date.now() + ADMIN_TEMP_PASSWORD_TTL_MS);
+
+    await pool.query(
+      `UPDATE users SET
+         admin_temp_password_hash = $1,
+         admin_temp_password_expires_at = $2,
+         admin_temp_password_created_at = NOW(),
+         admin_temp_password_created_by = $3,
+         token_version = COALESCE(token_version, 0) + 1
+       WHERE id = $4`,
+      [passwordHash, expiresAt, req.user.id, targetId]
+    );
+
+    // Notify the sub-admin that recovery was initiated, but never email the
+    // temporary password itself. The Super Admin should deliver it separately.
+    if (process.env.RESEND_API_KEY && target.email) {
+      const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
+      fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
+        body: JSON.stringify({
+          from: fromAddress,
+          to: [target.email],
+          subject: "A temporary Stallyard admin password was issued",
+          html: `<p>A Stallyard Super Admin issued a temporary password for your admin account.</p><p>It expires in 10 minutes and can only be used on the Stallyard Admin sign-in page. You will still need your authenticator code and emailed security code, then you will be required to choose a new permanent password.</p><p>If you did not request help signing in, contact the Stallyard Super Admin immediately.</p>`,
+        }),
+      }).catch((err) => console.error("Failed to send temporary-password notice:", err.message));
+    }
+
+    logAdminAction(req.user.id, "admin_temporary_password_issued", `Issued a 10-minute temporary password for admin ${target.username}; existing sessions were revoked`);
+    res.json({
+      success: true,
+      username: target.username,
+      displayName: target.display_name || target.username,
+      temporaryPassword,
+      expiresAt: expiresAt.toISOString(),
+    });
+  } catch (err) {
+    if (err.code === "42703") {
+      return res.status(409).json({ error: "Run the temporary admin password migration first", code: "MIGRATION_REQUIRED" });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/admin/staff/:id/reset-password", authenticate, requirePermission("role_assignment"), authRateLimit, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -2516,7 +2607,8 @@ app.post("/admin/login", authRateLimit, async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT ${USER_RETURNING_FIELDS}, password_hash, totp_secret
+      `SELECT ${USER_RETURNING_FIELDS}, password_hash, totp_secret,
+              admin_temp_password_hash, admin_temp_password_expires_at
        FROM users WHERE username = $1`,
       [String(username).trim().toLowerCase()]
     );
@@ -2526,8 +2618,25 @@ app.post("/admin/login", authRateLimit, async (req, res) => {
 
     const user = result.rows[0];
     const passwordMatches = await bcrypt.compare(password, user.password_hash);
-    if (!passwordMatches || !user.is_admin) {
+    let temporaryPasswordMatches = false;
+    const tempExpiry = user.admin_temp_password_expires_at ? new Date(user.admin_temp_password_expires_at).getTime() : 0;
+    if (!passwordMatches && user.admin_temp_password_hash && tempExpiry > Date.now()) {
+      temporaryPasswordMatches = await bcrypt.compare(password, user.admin_temp_password_hash);
+    }
+    if ((!passwordMatches && !temporaryPasswordMatches) || !user.is_admin) {
       return res.status(401).json({ error: "Username or password doesn't match" });
+    }
+    if (temporaryPasswordMatches) {
+      adminTemporaryLoginMarkers.set(Number(user.id), { expiresAt: tempExpiry });
+    } else {
+      adminTemporaryLoginMarkers.delete(Number(user.id));
+      if (user.admin_temp_password_hash && tempExpiry && tempExpiry <= Date.now()) {
+        pool.query(
+          `UPDATE users SET admin_temp_password_hash = NULL, admin_temp_password_expires_at = NULL,
+             admin_temp_password_created_at = NULL, admin_temp_password_created_by = NULL WHERE id = $1`,
+          [user.id]
+        ).catch(() => {});
+      }
     }
     if (user.is_suspended) {
       return res.status(403).json({ error: "This account has been suspended" });
@@ -2737,6 +2846,24 @@ app.post("/login/verify-2fa-email", authRateLimit, async (req, res) => {
     const user = result.rows[0];
     const ip = getClientIp(req);
     const userAgent = req.headers["user-agent"] || "";
+
+    const tempMarker = user.is_admin ? adminTemporaryLoginMarkers.get(Number(user.id)) : null;
+    if (tempMarker && tempMarker.expiresAt > Date.now()) {
+      adminTemporaryLoginMarkers.delete(Number(user.id));
+      const passwordChangeToken = jwt.sign(
+        { type: "admin_temp_password_change", userId: user.id },
+        JWT_SECRET,
+        { expiresIn: "10m" }
+      );
+      logAdminAction(user.id, "admin_temporary_password_mfa_completed", `Completed MFA using a Super-Admin-issued temporary password from ${ip || "unknown IP"}`);
+      return res.json({
+        temporaryPasswordChangeRequired: true,
+        passwordChangeToken,
+        username: user.username,
+      });
+    }
+    adminTemporaryLoginMarkers.delete(Number(user.id));
+
     pool
       .query("INSERT INTO login_history (user_id, ip, user_agent) VALUES ($1, $2, $3)", [user.id, ip, userAgent])
       .catch((err) => console.error("Failed to record login history:", err.message));
@@ -2745,6 +2872,70 @@ app.post("/login/verify-2fa-email", authRateLimit, async (req, res) => {
     }
     res.json({ user, token: signToken(user) });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/admin/temporary-password/complete", authRateLimit, async (req, res) => {
+  try {
+    const { passwordChangeToken, newPassword } = req.body;
+    if (!passwordChangeToken || !newPassword) {
+      return res.status(400).json({ error: "Enter a new password" });
+    }
+    if (String(newPassword).length < 8) {
+      return res.status(400).json({ error: "New password must be at least 8 characters" });
+    }
+
+    let decoded;
+    try {
+      decoded = jwt.verify(passwordChangeToken, JWT_SECRET);
+    } catch {
+      return res.status(401).json({ error: "That temporary-password recovery session expired — ask the Super Admin for a new temporary password" });
+    }
+    if (decoded.type !== "admin_temp_password_change") {
+      return res.status(401).json({ error: "Invalid password recovery session" });
+    }
+
+    const current = await pool.query(
+      `SELECT id, is_admin, is_suspended, admin_temp_password_expires_at
+       FROM users WHERE id = $1`,
+      [decoded.userId]
+    );
+    if (!current.rows.length || !current.rows[0].is_admin) {
+      return res.status(403).json({ error: "Admin access is no longer active" });
+    }
+    if (current.rows[0].is_suspended) {
+      return res.status(403).json({ error: "This admin account has been suspended" });
+    }
+    const expiry = current.rows[0].admin_temp_password_expires_at ? new Date(current.rows[0].admin_temp_password_expires_at).getTime() : 0;
+    if (!expiry || expiry <= Date.now()) {
+      return res.status(401).json({ error: "The temporary password expired — ask the Super Admin for a new one" });
+    }
+
+    const passwordHash = await bcrypt.hash(String(newPassword), 10);
+    const updated = await pool.query(
+      `UPDATE users SET
+         password_hash = $1,
+         admin_temp_password_hash = NULL,
+         admin_temp_password_expires_at = NULL,
+         admin_temp_password_created_at = NULL,
+         admin_temp_password_created_by = NULL,
+         token_version = COALESCE(token_version, 0) + 1
+       WHERE id = $2
+       RETURNING ${USER_RETURNING_FIELDS}`,
+      [passwordHash, decoded.userId]
+    );
+    if (!updated.rows.length) return res.status(404).json({ error: "Admin account not found" });
+    const user = updated.rows[0];
+    const ip = getClientIp(req);
+    const userAgent = req.headers["user-agent"] || "";
+    await pool.query("INSERT INTO login_history (user_id, ip, user_agent) VALUES ($1, $2, $3)", [user.id, ip, userAgent]);
+    logAdminAction(user.id, "admin_temporary_password_completed", `Set a new permanent password after temporary-password recovery from ${ip || "unknown IP"}`);
+    res.json({ user, token: signToken(user) });
+  } catch (err) {
+    if (err.code === "42703") {
+      return res.status(409).json({ error: "Run the temporary admin password migration first", code: "MIGRATION_REQUIRED" });
+    }
     res.status(500).json({ error: err.message });
   }
 });
