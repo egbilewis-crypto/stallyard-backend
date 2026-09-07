@@ -115,6 +115,20 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+// Admin identities are staff-only accounts. They may operate the marketplace
+// through authorized admin endpoints, but cannot act as buyers or sellers.
+// This is enforced server-side so hiding marketplace controls in the admin UI
+// is not the only protection.
+function rejectAdminMarketplaceUse(req, res, next) {
+  if (req.user?.isAdmin) {
+    return res.status(403).json({
+      error: "Admin accounts are staff-only and cannot use buyer or seller marketplace features.",
+      code: "ADMIN_STAFF_ONLY",
+    });
+  }
+  next();
+}
+
 const ADMIN_ROLES = new Set([
   "super_admin", "seller_verification", "listing_moderator",
   "order_dispute", "finance", "customer_support",
@@ -1576,7 +1590,7 @@ app.post("/profile/sign-out-other-devices", authenticate, async (req, res) => {
   }
 });
 
-app.get("/addresses", authenticate, async (req, res) => {
+app.get("/addresses", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     const result = await pool.query(
       "SELECT * FROM user_addresses WHERE user_id = $1 ORDER BY is_default DESC, created_at DESC",
@@ -1588,7 +1602,7 @@ app.get("/addresses", authenticate, async (req, res) => {
   }
 });
 
-app.post("/addresses", authenticate, async (req, res) => {
+app.post("/addresses", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     const { label, street, city, state, zip, country, isDefault } = req.body;
     if (!street || !city || !country) {
@@ -1679,7 +1693,7 @@ app.delete("/addresses/:id", authenticate, async (req, res) => {
   }
 });
 
-app.get("/saved-cards", authenticate, async (req, res) => {
+app.get("/saved-cards", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     const result = await pool.query(
       "SELECT id, card_type, last4, bank, exp_month, exp_year, is_default, created_at FROM saved_cards WHERE user_id = $1 ORDER BY is_default DESC, created_at DESC",
@@ -2486,7 +2500,7 @@ app.get("/follows", async (req, res) => {
   }
 });
 
-app.post("/follows", authenticate, async (req, res) => {
+app.post("/follows", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     const followerUsername = req.user.username;
     const { followedUsername } = req.body;
@@ -2505,7 +2519,7 @@ app.post("/follows", authenticate, async (req, res) => {
   }
 });
 
-app.delete("/follows", authenticate, async (req, res) => {
+app.delete("/follows", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     const followerUsername = req.user.username;
     const { followedUsername } = req.body;
@@ -2522,7 +2536,7 @@ app.delete("/follows", authenticate, async (req, res) => {
   }
 });
 
-app.get("/cart", authenticate, async (req, res) => {
+app.get("/cart", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     const result = await pool.query(
       "SELECT listing_id, qty, offer_price FROM cart_items WHERE user_id = $1",
@@ -2534,7 +2548,7 @@ app.get("/cart", authenticate, async (req, res) => {
   }
 });
 
-app.put("/cart", authenticate, async (req, res) => {
+app.put("/cart", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   const client = await pool.connect();
   try {
     const { items } = req.body;
@@ -2560,7 +2574,7 @@ app.put("/cart", authenticate, async (req, res) => {
   }
 });
 
-app.get("/watchlist", authenticate, async (req, res) => {
+app.get("/watchlist", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     const result = await pool.query(
       "SELECT listing_id FROM watchlist_items WHERE user_id = $1",
@@ -2572,7 +2586,7 @@ app.get("/watchlist", authenticate, async (req, res) => {
   }
 });
 
-app.put("/watchlist", authenticate, async (req, res) => {
+app.put("/watchlist", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   const client = await pool.connect();
   try {
     const { listingIds } = req.body;
@@ -2864,13 +2878,34 @@ app.post("/login/verify-2fa-email", authRateLimit, async (req, res) => {
     }
     adminTemporaryLoginMarkers.delete(Number(user.id));
 
-    pool
-      .query("INSERT INTO login_history (user_id, ip, user_agent) VALUES ($1, $2, $3)", [user.id, ip, userAgent])
-      .catch((err) => console.error("Failed to record login history:", err.message));
+    // Admin accounts are deliberately single-session. Only after all three
+    // admin authentication steps succeed do we advance token_version. This
+    // invalidates every older admin JWT while avoiding a password-only login
+    // attempt from kicking the currently signed-in admin out.
+    let sessionUser = user;
     if (user.is_admin) {
-      logAdminAction(user.id, "admin_login_completed", `Completed three-step admin login from ${ip || "unknown IP"}`);
+      const rotated = await pool.query(
+        `UPDATE users
+         SET token_version = COALESCE(token_version, 0) + 1
+         WHERE id = $1
+         RETURNING ${USER_RETURNING_FIELDS}`,
+        [user.id]
+      );
+      if (!rotated.rows.length) return res.status(404).json({ error: "Account not found" });
+      sessionUser = rotated.rows[0];
     }
-    res.json({ user, token: signToken(user) });
+
+    pool
+      .query("INSERT INTO login_history (user_id, ip, user_agent) VALUES ($1, $2, $3)", [sessionUser.id, ip, userAgent])
+      .catch((err) => console.error("Failed to record login history:", err.message));
+    if (sessionUser.is_admin) {
+      logAdminAction(
+        sessionUser.id,
+        "admin_login_completed",
+        `Completed three-step admin login from ${ip || "unknown IP"}; previous admin sessions were revoked`
+      );
+    }
+    res.json({ user: sessionUser, token: signToken(sessionUser) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -3066,7 +3101,7 @@ app.post("/uploads/image", authenticate, async (req, res) => {
 // in GET /listings. Fetching them here and merging them into the response
 // keeps a freshly published listing consistent with what a page refresh
 // would show, instead of silently missing its owner until then.
-app.post("/listings", authenticate, async (req, res) => {
+app.post("/listings", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     const {
       title, description, price, category, condition, shippingFee,
@@ -3388,7 +3423,7 @@ async function getTaxRate() {
   }
 }
 
-app.post("/checkout", authenticate, async (req, res) => {
+app.post("/checkout", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   const client = await pool.connect();
   try {
     const { items, shippingAddress, currency } = req.body;
@@ -3621,7 +3656,7 @@ async function recordPaymentAttempt(userId, { reference = null, method = "checko
   }
 }
 
-app.post("/checkout/initialize", authenticate, async (req, res) => {
+app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     const { items, shippingAddress, currency, saveCard } = req.body;
     if (!Array.isArray(items) || items.length === 0) {
@@ -3715,7 +3750,7 @@ app.get("/checkout/verify/:reference", authenticate, async (req, res) => {
   }
 });
 
-app.post("/checkout/pay-with-saved-card", authenticate, async (req, res) => {
+app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     const { items, shippingAddress, currency, cardId } = req.body;
     if (!Array.isArray(items) || items.length === 0) {
@@ -3816,7 +3851,7 @@ async function fetchOrdersWithItems(whereClause, params, { includeDeliveryTokens
   }));
 }
 
-app.get("/orders/mine", authenticate, async (req, res) => {
+app.get("/orders/mine", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     // Only the buyer may receive the secret delivery token.
     const orders = await fetchOrdersWithItems("buyer_id = $1", [req.user.id], { includeDeliveryTokens: true });
@@ -3826,7 +3861,7 @@ app.get("/orders/mine", authenticate, async (req, res) => {
   }
 });
 
-app.get("/orders/selling", authenticate, async (req, res) => {
+app.get("/orders/selling", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     const orders = await fetchOrdersWithItems(
       "id IN (SELECT order_id FROM order_items WHERE seller_id = $1)",
@@ -4475,7 +4510,7 @@ app.post("/order-items/:id/redeem-delivery-token", authenticate, codeRateLimit, 
   }
 });
 
-app.post("/checkout/single-item-payment", authenticate, async (req, res) => {
+app.post("/checkout/single-item-payment", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     const { listingId, email } = req.body;
 
@@ -4797,7 +4832,7 @@ async function computeAvailableBalance(client, sellerId) {
   return Math.round((released - reserved) * 100) / 100;
 }
 
-app.post("/withdrawals", authenticate, async (req, res) => {
+app.post("/withdrawals", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   const client = await pool.connect();
   try {
     const amount = Math.round(Number(req.body.amount) * 100) / 100;
@@ -4861,7 +4896,7 @@ app.post("/withdrawals", authenticate, async (req, res) => {
   }
 });
 
-app.get("/withdrawals/mine", authenticate, async (req, res) => {
+app.get("/withdrawals/mine", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     const result = await pool.query(
       "SELECT * FROM withdrawals WHERE seller_id = $1 ORDER BY requested_at DESC",
@@ -5611,7 +5646,7 @@ app.get("/wallet/balance", authenticate, async (req, res) => {
   }
 });
 
-app.post("/threads", authenticate, async (req, res) => {
+app.post("/threads", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     const { listingId, buyerId, sellerId } = req.body;
 
@@ -5642,7 +5677,7 @@ app.post("/threads", authenticate, async (req, res) => {
   }
 });
 
-app.get("/threads/:userId", authenticate, async (req, res) => {
+app.get("/threads/:userId", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     if (req.user.id !== Number(req.params.userId) && !req.user.isAdmin) {
       return res.status(403).json({ error: "You can only view your own threads" });
@@ -5657,7 +5692,7 @@ app.get("/threads/:userId", authenticate, async (req, res) => {
   }
 });
 
-app.post("/messages", authenticate, async (req, res) => {
+app.post("/messages", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     const { threadId, body, messageType, offerAmount, imageUrl, orderId } = req.body;
     const senderId = req.user.id;
