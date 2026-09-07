@@ -1055,6 +1055,19 @@ app.get("/migrate/refund-management", requireMigrationKey, async (req, res) => {
   }
 });
 
+app.get("/migrate/partial-refunds", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE orders
+        ADD COLUMN IF NOT EXISTS refund_type TEXT,
+        ADD COLUMN IF NOT EXISTS refund_amount NUMERIC DEFAULT 0
+    `);
+    res.send("Migration complete: partial-refund tracking fields added to orders.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/saved-cards", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -4005,6 +4018,8 @@ app.patch("/orders/:id/refund", authenticate, requirePermission("finance"), asyn
          refund_previous_payment_status = $1,
          refund_reason = $2,
          refund_requested_by = $3,
+         refund_type = 'full',
+         refund_amount = total,
          refund_requested_at = NOW(),
          refunded_at = NULL,
          refund_failure_reason = NULL
@@ -4080,6 +4095,162 @@ app.patch("/orders/:id/refund", authenticate, requirePermission("finance"), asyn
       `Your refund for order #${order.id} has been submitted for processing.`
     );
     res.json({ order: updated.rows[0], paystackMessage: paystackData.message || "Refund queued" });
+  } catch (err) {
+    try { await client.query("ROLLBACK"); } catch {}
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.patch("/orders/:id/refund/partial", authenticate, requirePermission("finance"), async (req, res) => {
+  const client = await pool.connect();
+  let order;
+  try {
+    const amount = Math.round(Number(req.body?.amount) * 100) / 100;
+    const reason = String(req.body?.reason || "").trim();
+    const disputeId = Number(req.body?.disputeId);
+    if (!(amount > 0)) return res.status(400).json({ error: "Enter a partial refund amount greater than zero" });
+    if (!reason) return res.status(400).json({ error: "Enter the reason / negotiated outcome for the partial refund" });
+    if (reason.length > 1000) return res.status(400).json({ error: "Refund reason is too long" });
+    if (!disputeId) return res.status(400).json({ error: "A linked dispute case is required for a partial refund" });
+    if (!process.env.PAYSTACK_SECRET_KEY) {
+      return res.status(500).json({ error: "Paystack refunds aren't configured — contact support" });
+    }
+
+    await client.query("BEGIN");
+    const orderResult = await client.query("SELECT * FROM orders WHERE id = $1 FOR UPDATE", [req.params.id]);
+    if (!orderResult.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Order not found" });
+    }
+    order = orderResult.rows[0];
+    const disputeResult = await client.query(
+      "SELECT * FROM dispute_cases WHERE id = $1 AND order_id = $2 FOR UPDATE",
+      [disputeId, req.params.id]
+    );
+    if (!disputeResult.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Linked dispute case not found" });
+    }
+    if (disputeResult.rows[0].status === "resolved") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "This dispute is already resolved" });
+    }
+    if (!order.paystack_reference) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "This order has no Paystack transaction reference" });
+    }
+    if (order.payment_status === "refunded") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "This order has already been fully refunded" });
+    }
+    if (order.payment_status === "refund_pending") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "A refund is already in progress for this order" });
+    }
+    if (order.refund_status === "processed" && Number(order.refund_amount || 0) > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "A refund has already been processed for this order. Additional partial refunds require manual review." });
+    }
+
+    const sellerCountResult = await client.query(
+      "SELECT COUNT(DISTINCT seller_id)::int AS count FROM order_items WHERE order_id = $1",
+      [req.params.id]
+    );
+    if ((sellerCountResult.rows[0]?.count || 0) !== 1) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error: "Partial refunds are currently limited to single-seller orders so Stallyard can reduce the correct seller balance safely. Use a full refund or handle the multi-seller case manually.",
+      });
+    }
+
+    const sellerPayable = Math.max(0,
+      (Number(order.subtotal) || 0) + (Number(order.shipping_total) || 0) - (Number(order.commission_amount) || 0)
+    );
+    if (amount >= Number(order.total || 0)) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "For the entire order amount, use Full refund instead" });
+    }
+    if (amount > sellerPayable) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        error: `Partial refund cannot exceed the seller payable amount of ${formatMoneyServer(sellerPayable, order.currency)}.`,
+      });
+    }
+
+    const previousStatus = order.payment_status || "held";
+    const locked = await client.query(
+      `UPDATE orders SET
+         payment_status = 'refund_pending',
+         refund_status = 'requesting',
+         refund_previous_payment_status = $1,
+         refund_reason = $2,
+         refund_requested_by = $3,
+         refund_type = 'partial',
+         refund_amount = $4,
+         refund_requested_at = NOW(),
+         refunded_at = NULL,
+         refund_failure_reason = NULL,
+         is_disputed = true
+       WHERE id = $5 RETURNING *`,
+      [previousStatus, reason, req.user.id, amount, req.params.id]
+    );
+    order = locked.rows[0];
+    await client.query(
+      `UPDATE dispute_cases SET status = 'in_review', resolution = 'partial_refund', resolution_note = $1,
+       resolved_by_id = NULL, resolved_at = NULL, updated_at = NOW() WHERE id = $2`,
+      [reason, disputeId]
+    );
+    await client.query("COMMIT");
+
+    let paystackRes;
+    let paystackData;
+    try {
+      paystackRes = await fetch("https://api.paystack.co/refund", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          transaction: order.paystack_reference,
+          amount: Math.round(amount * 100),
+          currency: order.currency || "NGN",
+          customer_note: `Partial refund for Stallyard order #${order.id}: ${reason.slice(0, 180)}`,
+          merchant_note: `Admin ${req.user.username} initiated partial refund of ${formatMoneyServer(amount, order.currency)} for dispute #${disputeId}`,
+        }),
+      });
+      paystackData = await paystackRes.json();
+    } catch {
+      await pool.query(
+        `UPDATE orders SET refund_status = 'request_unknown', refund_failure_reason = $1 WHERE id = $2`,
+        ["Could not confirm whether Paystack received the partial refund request. Check Paystack before retrying.", req.params.id]
+      );
+      return res.status(502).json({ error: "Couldn't confirm the partial refund request with Paystack. The order remains locked for manual review." });
+    }
+
+    if (!paystackRes.ok || !paystackData.status) {
+      const message = paystackData.message || "Paystack rejected the partial refund request";
+      const restored = await pool.query(
+        `UPDATE orders SET payment_status = COALESCE(refund_previous_payment_status, 'held'),
+         refund_status = 'failed', refund_failure_reason = $1 WHERE id = $2 RETURNING *`,
+        [message, req.params.id]
+      );
+      return res.status(400).json({ error: message, order: restored.rows[0] });
+    }
+
+    const refund = paystackData.data || {};
+    const updated = await pool.query(
+      `UPDATE orders SET payment_status = 'refund_pending', refund_status = $1,
+       paystack_refund_id = $2, refund_failure_reason = NULL WHERE id = $3 RETURNING *`,
+      [refund.status || "pending", refund.id || null, req.params.id]
+    );
+    logAdminAction(req.user.id, "partial_refund_requested",
+      `Requested partial refund of ${formatMoneyServer(amount, order.currency)} for order #${order.id}, dispute #${disputeId}`);
+    createNotification(order.buyer_id, "refund_started",
+      `A partial refund of ${formatMoneyServer(amount, order.currency)} for order #${order.id} has been submitted for processing.`);
+    res.json({ order: updated.rows[0], paystackMessage: paystackData.message || "Partial refund queued" });
   } catch (err) {
     try { await client.query("ROLLBACK"); } catch {}
     res.status(500).json({ error: err.message });
@@ -4299,10 +4470,10 @@ app.patch("/disputes/:id", authenticate, requirePermission("dispute_resolution")
           error: "Release the seller payment first. The dispute will resolve atomically when that release succeeds.",
         });
       }
-      if (nextResolution === "partial_refund") {
+      if (nextResolution === "partial_refund" && !(orderState.payment_status === "released")) {
         await client.query("ROLLBACK");
         return res.status(409).json({
-          error: "Partial refund cannot be marked resolved yet because the real partial-refund payment flow has not been completed.",
+          error: "Keep this case In review until Paystack confirms the partial refund. The remaining seller payment will be released automatically when the refund is processed.",
         });
       }
     }
@@ -4683,7 +4854,7 @@ app.post("/webhook/paystack", async (req, res) => {
       if (transactionReference) {
         try {
           const orderResult = await pool.query(
-            "SELECT id, buyer_id, payment_status, refund_previous_payment_status FROM orders WHERE paystack_reference = $1",
+            "SELECT id, buyer_id, payment_status, refund_previous_payment_status, refund_type, refund_amount, currency FROM orders WHERE paystack_reference = $1",
             [transactionReference]
           );
           if (orderResult.rows.length) {
@@ -4691,26 +4862,28 @@ app.post("/webhook/paystack", async (req, res) => {
             const refundStatus = data.status || event.event.replace("refund.", "");
 
             if (event.event === "refund.processed") {
+              const isPartialRefund = order.refund_type === "partial";
               await pool.query(
                 `UPDATE orders SET
-                   payment_status = 'refunded',
+                   payment_status = $1,
                    refund_status = 'processed',
-                   paystack_refund_id = COALESCE($1, paystack_refund_id),
+                   paystack_refund_id = COALESCE($2, paystack_refund_id),
                    refunded_at = NOW(),
                    refund_failure_reason = NULL
-                 WHERE id = $2`,
-                [data.id || null, order.id]
+                 WHERE id = $3`,
+                [isPartialRefund ? "released" : "refunded", data.id || null, order.id]
               );
 
-              // If this refund was the chosen outcome of an active dispute,
-              // only NOW—after Paystack confirms it processed—do we resolve
-              // the case and remove the order's dispute lock.
+              // Resolve only the matching financial outcome after Paystack
+              // confirms the money movement. For partial refunds the remaining
+              // seller proceeds are released immediately; computeAvailableBalance
+              // subtracts the processed partial-refund amount from that order.
               const resolvedCases = await pool.query(
                 `UPDATE dispute_cases SET
                    status = 'resolved', resolved_at = NOW(), updated_at = NOW()
-                 WHERE order_id = $1 AND status <> 'resolved' AND resolution = 'buyer_refund'
+                 WHERE order_id = $1 AND status <> 'resolved' AND resolution = $2
                  RETURNING id`,
-                [order.id]
+                [order.id, isPartialRefund ? "partial_refund" : "buyer_refund"]
               );
               if (resolvedCases.rows.length) {
                 const remaining = await pool.query(
@@ -4724,7 +4897,9 @@ app.post("/webhook/paystack", async (req, res) => {
                   logAdminAction(null, "dispute_auto_resolved_after_refund", `Resolved dispute #${row.id} after Paystack processed refund for order #${order.id}`);
                 }
               }
-              createNotification(order.buyer_id, "refund_processed", `Your refund for order #${order.id} has been processed.`);
+              createNotification(order.buyer_id, "refund_processed", isPartialRefund
+                ? `Your partial refund of ${formatMoneyServer(order.refund_amount || 0, order.currency)} for order #${order.id} has been processed.`
+                : `Your refund for order #${order.id} has been processed.`);
             } else if (event.event === "refund.failed") {
               await pool.query(
                 `UPDATE orders SET
@@ -4927,15 +5102,20 @@ app.post("/sellers/payout", authenticate, requirePermission("finance"), async (r
 
 async function computeAvailableBalance(client, sellerId) {
   const releasedResult = await client.query(
-    `SELECT COALESCE(SUM(
-       CASE WHEN oi.fulfillment_status NOT IN ('cancelled', 'returned')
-         THEN (oi.price * oi.qty) - (oi.price * oi.qty * o.commission_rate) + (oi.shipping_fee * oi.qty)
-         ELSE 0
-       END
+    `WITH seller_orders AS (
+       SELECT o.id, o.refund_type, COALESCE(o.refund_amount, 0) AS refund_amount,
+         SUM(CASE WHEN oi.fulfillment_status NOT IN ('cancelled', 'returned')
+           THEN (oi.price * oi.qty) - (oi.price * oi.qty * o.commission_rate) + (oi.shipping_fee * oi.qty)
+           ELSE 0 END) AS seller_proceeds
+       FROM order_items oi
+       JOIN orders o ON oi.order_id = o.id
+       WHERE oi.seller_id = $1 AND o.payment_status = 'released'
+       GROUP BY o.id, o.refund_type, o.refund_amount
+     )
+     SELECT COALESCE(SUM(
+       seller_proceeds - CASE WHEN refund_type = 'partial' THEN refund_amount ELSE 0 END
      ), 0) AS released_total
-     FROM order_items oi
-     JOIN orders o ON oi.order_id = o.id
-     WHERE oi.seller_id = $1 AND o.payment_status = 'released'`,
+     FROM seller_orders`,
     [sellerId]
   );
   const reservedResult = await client.query(
