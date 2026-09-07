@@ -1176,6 +1176,43 @@ app.get("/migrate/site-settings", requireMigrationKey, async (req, res) => {
   }
 });
 
+app.get("/migrate/dispute-cases", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS dispute_cases (
+        id SERIAL PRIMARY KEY,
+        order_id INTEGER NOT NULL UNIQUE REFERENCES orders(id) ON DELETE CASCADE,
+        opened_by_id INTEGER REFERENCES users(id),
+        reason TEXT DEFAULT '',
+        buyer_statement TEXT DEFAULT '',
+        seller_statement TEXT DEFAULT '',
+        evidence_urls JSONB DEFAULT '[]'::jsonb,
+        status TEXT DEFAULT 'open',
+        resolution TEXT,
+        resolution_note TEXT DEFAULT '',
+        admin_notes TEXT DEFAULT '',
+        resolved_by_id INTEGER REFERENCES users(id),
+        opened_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW(),
+        resolved_at TIMESTAMP
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_dispute_cases_status ON dispute_cases(status)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_dispute_cases_order_id ON dispute_cases(order_id)`);
+    // Backfill any legacy disputed orders so they immediately appear in the new case dashboard.
+    await pool.query(`
+      INSERT INTO dispute_cases (order_id, opened_by_id, reason, status, opened_at, updated_at)
+      SELECT id, buyer_id, 'Legacy dispute — add case details during review', 'open', created_at, NOW()
+      FROM orders
+      WHERE COALESCE(is_disputed, false) = true
+      ON CONFLICT (order_id) DO NOTHING
+    `);
+    res.send("Migration complete: dispute_cases table created and legacy disputes backfilled.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/help-support", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -3276,10 +3313,16 @@ app.get("/orders", authenticate, requireAdmin, async (req, res) => {
 app.patch("/orders/:id/release", authenticate, requirePermission("finance"), async (req, res) => {
   try {
     const result = await pool.query(
-      "UPDATE orders SET payment_status = 'released' WHERE id = $1 RETURNING *",
+      `UPDATE orders SET payment_status = 'released'
+       WHERE id = $1 AND COALESCE(is_disputed, false) = false
+       RETURNING *`,
       [req.params.id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: "Order not found" });
+    if (result.rows.length === 0) {
+      const check = await pool.query("SELECT id, is_disputed FROM orders WHERE id = $1", [req.params.id]);
+      if (!check.rows.length) return res.status(404).json({ error: "Order not found" });
+      return res.status(409).json({ error: "Payment cannot be released while this order has an active dispute" });
+    }
     logAdminAction(req.user.id, "payment_released", `Released payment for order #${result.rows[0].id} ($${result.rows[0].total})`);
     const sellerIds = await pool.query(
       "SELECT DISTINCT seller_id FROM order_items WHERE order_id = $1",
@@ -3415,41 +3458,220 @@ app.patch("/orders/:id/refund", authenticate, requirePermission("finance"), asyn
 });
 
 app.patch("/orders/:id/dispute", authenticate, async (req, res) => {
+  const client = await pool.connect();
   try {
-    const { isDisputed } = req.body;
-    const orderCheck = await pool.query("SELECT buyer_id FROM orders WHERE id = $1", [req.params.id]);
-    if (orderCheck.rows.length === 0) return res.status(404).json({ error: "Order not found" });
-    let isParty = orderCheck.rows[0].buyer_id === req.user.id;
-    if (!isParty) {
-      const sellerCheck = await pool.query(
-        "SELECT 1 FROM order_items WHERE order_id = $1 AND seller_id = $2 LIMIT 1",
-        [req.params.id, req.user.id]
-      );
-      isParty = sellerCheck.rows.length > 0;
-      if (!isParty && !hasPermission(req.user, "dispute_resolution")) {
-        return res.status(403).json({ error: "You can only dispute orders you're part of" });
-      }
+    const { isDisputed, reason, statement, evidenceUrls } = req.body;
+    await client.query("BEGIN");
+    const orderCheck = await client.query("SELECT buyer_id FROM orders WHERE id = $1 FOR UPDATE", [req.params.id]);
+    if (orderCheck.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Order not found" });
     }
-    const result = await pool.query(
+
+    const buyerId = orderCheck.rows[0].buyer_id;
+    const isBuyer = buyerId === req.user.id;
+    const sellerCheck = await client.query(
+      "SELECT 1 FROM order_items WHERE order_id = $1 AND seller_id = $2 LIMIT 1",
+      [req.params.id, req.user.id]
+    );
+    const isSeller = sellerCheck.rows.length > 0;
+    const isAdminResolver = hasPermission(req.user, "dispute_resolution");
+    const isParty = isBuyer || isSeller;
+
+    if (!isParty && !isAdminResolver) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "You can only dispute orders you're part of" });
+    }
+    // Buyers/sellers may open a case, but only a dispute admin may close one.
+    if (!isDisputed && !isAdminResolver) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Only a dispute administrator can resolve an open case" });
+    }
+
+    const result = await client.query(
       "UPDATE orders SET is_disputed = $1 WHERE id = $2 RETURNING *",
       [!!isDisputed, req.params.id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: "Order not found" });
-    if (!isParty) {
+
+    let dispute = null;
+    if (isDisputed) {
+      const buyerStatement = isBuyer ? String(statement || "").trim() : "";
+      const sellerStatement = isSeller ? String(statement || "").trim() : "";
+      const cleanReason = String(reason || "").trim();
+      const cleanEvidence = Array.isArray(evidenceUrls) ? evidenceUrls.filter(Boolean).slice(0, 10) : [];
+      const caseResult = await client.query(
+        `INSERT INTO dispute_cases (
+           order_id, opened_by_id, reason, buyer_statement, seller_statement, evidence_urls,
+           status, resolution, resolution_note, resolved_by_id, resolved_at, updated_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, 'open', NULL, '', NULL, NULL, NOW())
+         ON CONFLICT (order_id) DO UPDATE SET
+           opened_by_id = EXCLUDED.opened_by_id,
+           reason = CASE WHEN EXCLUDED.reason <> '' THEN EXCLUDED.reason ELSE dispute_cases.reason END,
+           buyer_statement = CASE WHEN EXCLUDED.buyer_statement <> '' THEN EXCLUDED.buyer_statement ELSE dispute_cases.buyer_statement END,
+           seller_statement = CASE WHEN EXCLUDED.seller_statement <> '' THEN EXCLUDED.seller_statement ELSE dispute_cases.seller_statement END,
+           evidence_urls = CASE WHEN jsonb_array_length(EXCLUDED.evidence_urls) > 0 THEN EXCLUDED.evidence_urls ELSE dispute_cases.evidence_urls END,
+           status = 'open', resolution = NULL, resolution_note = '', resolved_by_id = NULL, resolved_at = NULL, updated_at = NOW()
+         RETURNING *`,
+        [req.params.id, req.user.id, cleanReason, buyerStatement, sellerStatement, JSON.stringify(cleanEvidence)]
+      );
+      dispute = caseResult.rows[0];
+    } else {
+      const caseResult = await client.query(
+        `UPDATE dispute_cases SET status = 'resolved', resolved_by_id = $1,
+           resolved_at = NOW(), updated_at = NOW()
+         WHERE order_id = $2 RETURNING *`,
+        [req.user.id, req.params.id]
+      );
+      dispute = caseResult.rows[0] || null;
+    }
+
+    await client.query("COMMIT");
+    if (isAdminResolver && !isParty) {
       logAdminAction(req.user.id, "dispute_updated", `${isDisputed ? "Opened" : "Resolved"} dispute on order #${req.params.id}`);
     }
     if (isDisputed) {
-      const sellerIds = await pool.query(
-        "SELECT DISTINCT seller_id FROM order_items WHERE order_id = $1",
-        [req.params.id]
-      );
+      const sellerIds = await pool.query("SELECT DISTINCT seller_id FROM order_items WHERE order_id = $1", [req.params.id]);
       for (const row of sellerIds.rows) {
-        createNotification(row.seller_id, "dispute_opened", "A dispute was opened on one of your orders.");
+        if (row.seller_id !== req.user.id) createNotification(row.seller_id, "dispute_opened", "A dispute was opened on one of your orders. Open Sales to review and respond.");
       }
+      if (!isBuyer) createNotification(buyerId, "dispute_opened", "A dispute was opened on your order. Open Purchases to review it.");
     }
-    res.json({ order: result.rows[0] });
+    res.json({ order: result.rows[0], dispute });
+  } catch (err) {
+    try { await client.query("ROLLBACK"); } catch {}
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+const DISPUTE_STATUSES = new Set(["open", "in_review", "resolved"]);
+const DISPUTE_RESOLUTIONS = new Set(["buyer_refund", "seller_release", "partial_refund", "no_action", "cancelled"]);
+
+app.get("/disputes", authenticate, requirePermission("dispute_resolution"), async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT dc.*,
+        opener.username AS opened_by_username, opener.display_name AS opened_by_name,
+        resolver.username AS resolved_by_username, resolver.display_name AS resolved_by_name,
+        buyer.username AS buyer_username, buyer.display_name AS buyer_name,
+        o.total, o.currency, o.payment_status, o.created_at AS order_created_at,
+        COALESCE(string_agg(DISTINCT seller.username, ', '), '') AS seller_usernames,
+        COALESCE(string_agg(DISTINCT seller.display_name, ', '), '') AS seller_names
+      FROM dispute_cases dc
+      JOIN orders o ON o.id = dc.order_id
+      JOIN users buyer ON buyer.id = o.buyer_id
+      LEFT JOIN users opener ON opener.id = dc.opened_by_id
+      LEFT JOIN users resolver ON resolver.id = dc.resolved_by_id
+      LEFT JOIN order_items oi ON oi.order_id = o.id
+      LEFT JOIN users seller ON seller.id = oi.seller_id
+      GROUP BY dc.id, opener.username, opener.display_name, resolver.username, resolver.display_name,
+        buyer.username, buyer.display_name, o.total, o.currency, o.payment_status, o.created_at
+      ORDER BY CASE dc.status WHEN 'open' THEN 0 WHEN 'in_review' THEN 1 ELSE 2 END, dc.updated_at DESC
+    `);
+    res.json({ disputes: result.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/disputes/mine", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT DISTINCT dc.*
+      FROM dispute_cases dc
+      JOIN orders o ON o.id = dc.order_id
+      LEFT JOIN order_items oi ON oi.order_id = o.id
+      WHERE o.buyer_id = $1 OR oi.seller_id = $1
+      ORDER BY dc.updated_at DESC
+    `, [req.user.id]);
+    res.json({ disputes: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/disputes/:id/statement", authenticate, async (req, res) => {
+  try {
+    const statement = String(req.body.statement || "").trim();
+    if (!statement) return res.status(400).json({ error: "Enter a statement first" });
+    if (statement.length > 5000) return res.status(400).json({ error: "Statement is too long" });
+    const check = await pool.query(`
+      SELECT dc.*, o.buyer_id,
+        EXISTS(SELECT 1 FROM order_items oi WHERE oi.order_id = dc.order_id AND oi.seller_id = $2) AS is_seller
+      FROM dispute_cases dc JOIN orders o ON o.id = dc.order_id
+      WHERE dc.id = $1
+    `, [req.params.id, req.user.id]);
+    if (!check.rows.length) return res.status(404).json({ error: "Dispute case not found" });
+    const row = check.rows[0];
+    const isBuyer = row.buyer_id === req.user.id;
+    const isSeller = !!row.is_seller;
+    if (!isBuyer && !isSeller) return res.status(403).json({ error: "You are not part of this dispute" });
+    if (row.status === "resolved") return res.status(409).json({ error: "This dispute has already been resolved" });
+    const field = isBuyer ? "buyer_statement" : "seller_statement";
+    const result = await pool.query(
+      `UPDATE dispute_cases SET ${field} = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
+      [statement, req.params.id]
+    );
+    res.json({ dispute: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/disputes/:id", authenticate, requirePermission("dispute_resolution"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { status, resolution, resolutionNote, adminNotes } = req.body;
+    if (status && !DISPUTE_STATUSES.has(status)) return res.status(400).json({ error: "Invalid dispute status" });
+    if (resolution && !DISPUTE_RESOLUTIONS.has(resolution)) return res.status(400).json({ error: "Invalid resolution" });
+    await client.query("BEGIN");
+    const existing = await client.query("SELECT * FROM dispute_cases WHERE id = $1 FOR UPDATE", [req.params.id]);
+    if (!existing.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Dispute case not found" });
+    }
+    const current = existing.rows[0];
+    const nextStatus = status || current.status;
+    const result = await client.query(`
+      UPDATE dispute_cases SET
+        status = $1,
+        resolution = $2,
+        resolution_note = $3,
+        admin_notes = $4,
+        resolved_by_id = CASE WHEN $1 = 'resolved' THEN $5 ELSE NULL END,
+        resolved_at = CASE WHEN $1 = 'resolved' THEN NOW() ELSE NULL END,
+        updated_at = NOW()
+      WHERE id = $6 RETURNING *
+    `, [
+      nextStatus,
+      resolution === undefined ? current.resolution : (resolution || null),
+      resolutionNote === undefined ? current.resolution_note : String(resolutionNote || ""),
+      adminNotes === undefined ? current.admin_notes : String(adminNotes || ""),
+      req.user.id,
+      req.params.id,
+    ]);
+    await client.query("UPDATE orders SET is_disputed = $1 WHERE id = $2", [nextStatus !== "resolved", current.order_id]);
+    await client.query("COMMIT");
+    logAdminAction(req.user.id, "dispute_case_updated", `Updated dispute #${req.params.id} for order #${current.order_id} to ${nextStatus}${resolution ? ` (${resolution})` : ""}`);
+    const orderParties = await pool.query(`
+      SELECT o.buyer_id, array_agg(DISTINCT oi.seller_id) FILTER (WHERE oi.seller_id IS NOT NULL) AS seller_ids
+      FROM orders o LEFT JOIN order_items oi ON oi.order_id = o.id WHERE o.id = $1 GROUP BY o.buyer_id
+    `, [current.order_id]);
+    if (orderParties.rows.length) {
+      const message = nextStatus === "resolved"
+        ? `Your dispute for order #${current.order_id} has been resolved${resolutionNote ? `: ${String(resolutionNote).slice(0, 180)}` : "."}`
+        : `Your dispute for order #${current.order_id} is now ${nextStatus === "in_review" ? "under review" : "open"}.`;
+      createNotification(orderParties.rows[0].buyer_id, "dispute_status", message);
+      for (const sellerId of orderParties.rows[0].seller_ids || []) createNotification(sellerId, "dispute_status", message);
+    }
+    res.json({ dispute: result.rows[0] });
+  } catch (err) {
+    try { await client.query("ROLLBACK"); } catch {}
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
