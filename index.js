@@ -1195,6 +1195,26 @@ app.get("/migrate/admin-roles", requireMigrationKey, async (req, res) => {
   }
 });
 
+app.get("/migrate/admin-staff-management", requireMigrationKey, async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS admin_role_history (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        changed_by INTEGER REFERENCES users(id),
+        old_role TEXT,
+        new_role TEXT,
+        reason TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_admin_role_history_user_id ON admin_role_history(user_id, created_at DESC)`);
+    res.send("Migration complete: admin_role_history table created for staff management.");
+  } catch (err) {
+    res.status(500).send(`Migration failed: ${err.message}`);
+  }
+});
+
 app.get("/migrate/site-settings", requireMigrationKey, async (req, res) => {
   try {
     await pool.query(`
@@ -2001,18 +2021,104 @@ app.patch("/users/:id/suspend", authenticate, requirePermission("user_management
 });
 
 app.patch("/users/:id/admin-role", authenticate, requirePermission("role_assignment"), async (req, res) => {
+  const client = await pool.connect();
   try {
-    const { role } = req.body;
+    const { role, reason } = req.body;
     if (role !== null && !ADMIN_ROLES.has(role)) {
       return res.status(400).json({ error: "Invalid role" });
     }
-    const result = await pool.query(
-      `UPDATE users SET is_admin = $1, admin_role = $2 WHERE id = $3 RETURNING ${USER_RETURNING_FIELDS}`,
-      [role !== null, role, req.params.id]
+    const targetId = Number(req.params.id);
+    if (targetId === Number(req.user.id)) {
+      return res.status(400).json({ error: "You can't change or revoke your own admin role. Another Super Admin must do that." });
+    }
+    await client.query("BEGIN");
+    const existing = await client.query("SELECT id, username, is_admin, admin_role FROM users WHERE id = $1 FOR UPDATE", [targetId]);
+    if (!existing.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "User not found" });
+    }
+    const target = existing.rows[0];
+    const oldRole = target.is_admin ? (target.admin_role || "super_admin") : null;
+    if (oldRole === "super_admin" && role !== "super_admin") {
+      const superCount = await client.query(
+        "SELECT COUNT(*) FROM users WHERE is_admin = true AND COALESCE(admin_role, 'super_admin') = 'super_admin'"
+      );
+      if (Number(superCount.rows[0].count) <= 1) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "Stallyard must always have at least one active Super Admin." });
+      }
+    }
+    const result = await client.query(
+      `UPDATE users
+       SET is_admin = $1, admin_role = $2, token_version = COALESCE(token_version, 0) + 1
+       WHERE id = $3 RETURNING ${USER_RETURNING_FIELDS}`,
+      [role !== null, role, targetId]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
-    logAdminAction(req.user.id, "admin_role_changed", `Set ${result.rows[0].username}'s admin role to ${role || "none (revoked)"}`);
+    await client.query(
+      `INSERT INTO admin_role_history (user_id, changed_by, old_role, new_role, reason)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [targetId, req.user.id, oldRole, role, String(reason || "").trim()]
+    );
+    await client.query("COMMIT");
+    logAdminAction(req.user.id, "admin_role_changed", `Set ${result.rows[0].username}'s admin role from ${oldRole || "none"} to ${role || "none (revoked)"}`);
     res.json({ user: result.rows[0] });
+  } catch (err) {
+    try { await client.query("ROLLBACK"); } catch {}
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/admin/staff", authenticate, requirePermission("role_assignment"), async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        u.id, u.username, u.email, u.display_name, u.is_admin, u.admin_role,
+        u.two_factor_enabled, u.is_suspended, u.created_at,
+        (SELECT MAX(lh.created_at) FROM login_history lh WHERE lh.user_id = u.id) AS last_login_at,
+        (SELECT MAX(aal.created_at) FROM admin_audit_log aal WHERE aal.admin_id = u.id) AS last_action_at,
+        (SELECT COUNT(*) FROM admin_audit_log aal WHERE aal.admin_id = u.id) AS action_count
+      FROM users u
+      WHERE u.is_admin = true
+         OR EXISTS (SELECT 1 FROM admin_role_history arh WHERE arh.user_id = u.id)
+      ORDER BY u.is_admin DESC, u.display_name ASC, u.username ASC
+    `);
+    const staff = [];
+    for (const row of result.rows) {
+      const history = await pool.query(
+        `SELECT arh.*, actor.username AS changed_by_username, actor.display_name AS changed_by_name
+         FROM admin_role_history arh
+         LEFT JOIN users actor ON actor.id = arh.changed_by
+         WHERE arh.user_id = $1 ORDER BY arh.created_at DESC LIMIT 20`,
+        [row.id]
+      );
+      staff.push({ ...row, role_history: history.rows });
+    }
+    res.json({ staff });
+  } catch (err) {
+    if (err.code === "42P01") {
+      return res.status(409).json({ error: "Run the admin staff management migration first", code: "MIGRATION_REQUIRED" });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/admin/staff/:id/revoke-sessions", authenticate, requirePermission("role_assignment"), async (req, res) => {
+  try {
+    const targetId = Number(req.params.id);
+    if (targetId === Number(req.user.id)) {
+      return res.status(400).json({ error: "Use your own account security controls to sign out your other sessions." });
+    }
+    const result = await pool.query(
+      `UPDATE users SET token_version = COALESCE(token_version, 0) + 1
+       WHERE id = $1 AND is_admin = true
+       RETURNING id, username, display_name, token_version`,
+      [targetId]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: "Active admin account not found" });
+    logAdminAction(req.user.id, "admin_sessions_revoked", `Revoked all active sessions for admin ${result.rows[0].username}`);
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
