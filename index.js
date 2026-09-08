@@ -1110,6 +1110,256 @@ function decryptFieldSafe(value) {
   return plaintext.toString("utf8");
 }
 
+
+function decryptTotpSecret(value) {
+  const secret = decryptFieldSafe(value);
+  return secret ? String(secret) : "";
+}
+
+// Minimal local QR encoder for authenticator setup. Keeping generation inside
+// Stallyard means the otpauth URI/TOTP secret never has to be sent to a
+// third-party QR service. This implementation emits a Version 10-L QR code,
+// which comfortably fits Stallyard's otpauth URI.
+function makeLocalTotpQrDataUrl(text) {
+  const VERSION = 10;
+  const MODULE_COUNT = VERSION * 4 + 17; // 57
+  const DATA_CODEWORDS = 274; // QR Version 10, error correction L
+  const RS_BLOCKS = [
+    { total: 86, data: 68 },
+    { total: 86, data: 68 },
+    { total: 87, data: 69 },
+    { total: 87, data: 69 },
+  ];
+  const ALIGNMENT = [6, 28, 50];
+
+  const bytes = Buffer.from(String(text), "utf8");
+  if (bytes.length > 271) throw new Error("Authenticator setup URI is too long for the local QR encoder");
+
+  const bits = [];
+  const putBits = (value, length) => {
+    for (let i = length - 1; i >= 0; i--) bits.push(((value >>> i) & 1) === 1);
+  };
+  putBits(0b0100, 4); // byte mode
+  putBits(bytes.length, 16); // version 10-40 byte-mode length field
+  for (const byte of bytes) putBits(byte, 8);
+  const capacityBits = DATA_CODEWORDS * 8;
+  for (let i = 0; i < Math.min(4, capacityBits - bits.length); i++) bits.push(false);
+  while (bits.length % 8) bits.push(false);
+  const dataCodewords = [];
+  for (let i = 0; i < bits.length; i += 8) {
+    let value = 0;
+    for (let j = 0; j < 8; j++) value = (value << 1) | (bits[i + j] ? 1 : 0);
+    dataCodewords.push(value);
+  }
+  let pad = true;
+  while (dataCodewords.length < DATA_CODEWORDS) {
+    dataCodewords.push(pad ? 0xec : 0x11);
+    pad = !pad;
+  }
+
+  const EXP = new Array(512).fill(0);
+  const LOG = new Array(256).fill(0);
+  let x = 1;
+  for (let i = 0; i < 255; i++) {
+    EXP[i] = x;
+    LOG[x] = i;
+    x <<= 1;
+    if (x & 0x100) x ^= 0x11d;
+  }
+  for (let i = 255; i < 512; i++) EXP[i] = EXP[i - 255];
+  const gfMul = (a, b) => (a === 0 || b === 0 ? 0 : EXP[LOG[a] + LOG[b]]);
+  const generator = (degree) => {
+    let poly = [1];
+    for (let i = 0; i < degree; i++) {
+      const next = new Array(poly.length + 1).fill(0);
+      for (let j = 0; j < poly.length; j++) {
+        next[j] ^= poly[j];
+        next[j + 1] ^= gfMul(poly[j], EXP[i]);
+      }
+      poly = next;
+    }
+    return poly;
+  };
+  const rsRemainder = (data, ecCount) => {
+    const gen = generator(ecCount);
+    const msg = data.concat(new Array(ecCount).fill(0));
+    for (let i = 0; i < data.length; i++) {
+      const factor = msg[i];
+      if (!factor) continue;
+      for (let j = 0; j < gen.length; j++) msg[i + j] ^= gfMul(gen[j], factor);
+    }
+    return msg.slice(data.length);
+  };
+
+  const dataBlocks = [];
+  const ecBlocks = [];
+  let offset = 0;
+  for (const block of RS_BLOCKS) {
+    const d = dataCodewords.slice(offset, offset + block.data);
+    offset += block.data;
+    dataBlocks.push(d);
+    ecBlocks.push(rsRemainder(d, block.total - block.data));
+  }
+  const codewords = [];
+  const maxData = Math.max(...dataBlocks.map((b) => b.length));
+  for (let i = 0; i < maxData; i++) for (const block of dataBlocks) if (i < block.length) codewords.push(block[i]);
+  const maxEc = Math.max(...ecBlocks.map((b) => b.length));
+  for (let i = 0; i < maxEc; i++) for (const block of ecBlocks) if (i < block.length) codewords.push(block[i]);
+
+  const bchDigit = (n) => { let d = 0; while (n) { d++; n >>>= 1; } return d; };
+  const bchTypeInfo = (data) => {
+    let d = data << 10;
+    const g = 0x537;
+    while (bchDigit(d) - bchDigit(g) >= 0) d ^= g << (bchDigit(d) - bchDigit(g));
+    return ((data << 10) | d) ^ 0x5412;
+  };
+  const bchTypeNumber = (data) => {
+    let d = data << 12;
+    const g = 0x1f25;
+    while (bchDigit(d) - bchDigit(g) >= 0) d ^= g << (bchDigit(d) - bchDigit(g));
+    return (data << 12) | d;
+  };
+
+  const buildMatrix = (maskPattern) => {
+    const modules = Array.from({ length: MODULE_COUNT }, () => Array(MODULE_COUNT).fill(null));
+    const finder = (row, col) => {
+      for (let r = -1; r <= 7; r++) for (let c = -1; c <= 7; c++) {
+        const rr = row + r, cc = col + c;
+        if (rr < 0 || rr >= MODULE_COUNT || cc < 0 || cc >= MODULE_COUNT) continue;
+        modules[rr][cc] =
+          (r >= 0 && r <= 6 && (c === 0 || c === 6)) ||
+          (c >= 0 && c <= 6 && (r === 0 || r === 6)) ||
+          (r >= 2 && r <= 4 && c >= 2 && c <= 4);
+      }
+    };
+    finder(0, 0); finder(MODULE_COUNT - 7, 0); finder(0, MODULE_COUNT - 7);
+
+    for (const row of ALIGNMENT) for (const col of ALIGNMENT) {
+      if (modules[row][col] !== null) continue;
+      for (let r = -2; r <= 2; r++) for (let c = -2; c <= 2; c++) {
+        modules[row + r][col + c] = Math.max(Math.abs(r), Math.abs(c)) !== 1;
+      }
+    }
+    for (let i = 8; i < MODULE_COUNT - 8; i++) {
+      if (modules[i][6] === null) modules[i][6] = i % 2 === 0;
+      if (modules[6][i] === null) modules[6][i] = i % 2 === 0;
+    }
+
+    const versionBits = bchTypeNumber(VERSION);
+    for (let i = 0; i < 18; i++) {
+      const bit = ((versionBits >> i) & 1) === 1;
+      modules[Math.floor(i / 3)][(i % 3) + MODULE_COUNT - 11] = bit;
+      modules[(i % 3) + MODULE_COUNT - 11][Math.floor(i / 3)] = bit;
+    }
+
+    const formatBits = bchTypeInfo((1 << 3) | maskPattern); // L = 1
+    for (let i = 0; i < 15; i++) {
+      const bit = ((formatBits >> i) & 1) === 1;
+      let r;
+      if (i < 6) r = i;
+      else if (i < 8) r = i + 1;
+      else r = MODULE_COUNT - 15 + i;
+      modules[r][8] = bit;
+
+      let c;
+      if (i < 8) c = MODULE_COUNT - i - 1;
+      else if (i < 9) c = 15 - i;
+      else c = 15 - i - 1;
+      modules[8][c] = bit;
+    }
+    modules[MODULE_COUNT - 8][8] = true;
+
+    const mask = (r, c) => {
+      switch (maskPattern) {
+        case 0: return (r + c) % 2 === 0;
+        case 1: return r % 2 === 0;
+        case 2: return c % 3 === 0;
+        case 3: return (r + c) % 3 === 0;
+        case 4: return (Math.floor(r / 2) + Math.floor(c / 3)) % 2 === 0;
+        case 5: return (r * c) % 2 + (r * c) % 3 === 0;
+        case 6: return ((r * c) % 2 + (r * c) % 3) % 2 === 0;
+        default: return ((r * c) % 3 + (r + c) % 2) % 2 === 0;
+      }
+    };
+
+    let row = MODULE_COUNT - 1;
+    let inc = -1;
+    let bitIndex = 7;
+    let byteIndex = 0;
+    for (let col = MODULE_COUNT - 1; col > 0; col -= 2) {
+      if (col === 6) col--;
+      while (true) {
+        for (let c = 0; c < 2; c++) {
+          const cc = col - c;
+          if (modules[row][cc] !== null) continue;
+          let dark = false;
+          if (byteIndex < codewords.length) dark = ((codewords[byteIndex] >>> bitIndex) & 1) === 1;
+          if (mask(row, cc)) dark = !dark;
+          modules[row][cc] = dark;
+          bitIndex--;
+          if (bitIndex < 0) { byteIndex++; bitIndex = 7; }
+        }
+        row += inc;
+        if (row < 0 || row >= MODULE_COUNT) { row -= inc; inc = -inc; break; }
+      }
+    }
+    return modules;
+  };
+
+  const lostPoint = (m) => {
+    let score = 0;
+    for (let r = 0; r < MODULE_COUNT; r++) for (let c = 0; c < MODULE_COUNT; c++) {
+      let same = 0;
+      const dark = m[r][c];
+      for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
+        if ((!dr && !dc) || r + dr < 0 || r + dr >= MODULE_COUNT || c + dc < 0 || c + dc >= MODULE_COUNT) continue;
+        if (m[r + dr][c + dc] === dark) same++;
+      }
+      if (same > 5) score += 3 + same - 5;
+    }
+    for (let r = 0; r < MODULE_COUNT - 1; r++) for (let c = 0; c < MODULE_COUNT - 1; c++) {
+      const count = [m[r][c], m[r + 1][c], m[r][c + 1], m[r + 1][c + 1]].filter(Boolean).length;
+      if (count === 0 || count === 4) score += 3;
+    }
+    for (let r = 0; r < MODULE_COUNT; r++) for (let c = 0; c < MODULE_COUNT - 6; c++) {
+      if (m[r][c] && !m[r][c+1] && m[r][c+2] && m[r][c+3] && m[r][c+4] && !m[r][c+5] && m[r][c+6]) score += 40;
+    }
+    for (let c = 0; c < MODULE_COUNT; c++) for (let r = 0; r < MODULE_COUNT - 6; r++) {
+      if (m[r][c] && !m[r+1][c] && m[r+2][c] && m[r+3][c] && m[r+4][c] && !m[r+5][c] && m[r+6][c]) score += 40;
+    }
+    const darkCount = m.flat().filter(Boolean).length;
+    score += Math.floor(Math.abs(100 * darkCount / (MODULE_COUNT * MODULE_COUNT) - 50) / 5) * 10;
+    return score;
+  };
+
+  let best = null, bestScore = Infinity;
+  for (let mask = 0; mask < 8; mask++) {
+    const matrix = buildMatrix(mask);
+    const score = lostPoint(matrix);
+    if (score < bestScore) { best = matrix; bestScore = score; }
+  }
+  const quiet = 4;
+  const size = MODULE_COUNT + quiet * 2;
+  const cells = [];
+  for (let r = 0; r < MODULE_COUNT; r++) for (let c = 0; c < MODULE_COUNT; c++) {
+    if (best[r][c]) cells.push(`<rect x="${c + quiet}" y="${r + quiet}" width="1" height="1"/>`);
+  }
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="white"/><g fill="black">${cells.join("")}</g></svg>`;
+  return `data:image/svg+xml;base64,${Buffer.from(svg, "utf8").toString("base64")}`;
+}
+
+async function encryptLegacyTotpSecrets() {
+  const result = await pool.query(
+    `SELECT id, totp_secret FROM users
+     WHERE totp_secret IS NOT NULL AND totp_secret <> '' AND totp_secret NOT LIKE 'enc:v1:%'`
+  );
+  if (!result.rows.length) return;
+  for (const row of result.rows) {
+    await pool.query("UPDATE users SET totp_secret = $1 WHERE id = $2", [encryptField(row.totp_secret), row.id]);
+  }
+  console.log(`Encrypted ${result.rows.length} legacy authenticator secret(s) at rest.`);
+}
+
 function hashField(value) {
   return crypto.createHash("sha256").update(String(value)).digest("hex");
 }
@@ -2424,11 +2674,11 @@ app.post("/admin/totp/setup", authenticate, async (req, res) => {
   try {
     if (!req.user.isAdmin) return res.status(403).json({ error: "Admin access required" });
     const secret = generateTotpSecret();
-    await pool.query("UPDATE users SET totp_secret = $1 WHERE id = $2", [secret, req.user.id]);
+    await pool.query("UPDATE users SET totp_secret = $1 WHERE id = $2", [encryptField(secret), req.user.id]);
     const label = encodeURIComponent(`Stallyard:${req.user.username}`);
     const issuer = encodeURIComponent("Stallyard");
     const otpauthUrl = `otpauth://totp/${label}?secret=${secret}&issuer=${issuer}&algorithm=SHA1&digits=6&period=30`;
-    const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(otpauthUrl)}`;
+    const qrCodeUrl = makeLocalTotpQrDataUrl(otpauthUrl);
     res.json({ secret, otpauthUrl, qrCodeUrl });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2443,7 +2693,7 @@ app.post("/admin/totp/confirm", authenticate, async (req, res) => {
     if (!result.rows.length || !result.rows[0].totp_secret) {
       return res.status(400).json({ error: "Start setup again — no pending authenticator secret found" });
     }
-    if (!verifyTotpCode(result.rows[0].totp_secret, code)) {
+    if (!verifyTotpCode(decryptTotpSecret(result.rows[0].totp_secret), code)) {
       return res.status(400).json({ error: "That code doesn't match — check your authenticator app and try again" });
     }
     const updated = await pool.query(
@@ -2485,7 +2735,7 @@ app.post("/admin/reauth/verify", authenticate, authRateLimit, async (req, res) =
     const result = await pool.query("SELECT email, totp_secret FROM users WHERE id = $1", [req.user.id]);
     if (!result.rows.length) return res.status(404).json({ error: "Account not found" });
 
-    if (!result.rows[0].totp_secret || !verifyTotpCode(result.rows[0].totp_secret, code)) {
+    if (!result.rows[0].totp_secret || !verifyTotpCode(decryptTotpSecret(result.rows[0].totp_secret), code)) {
       return res.status(400).json({ error: "That code doesn't match — check your authenticator app and try again" });
     }
     if (!result.rows[0].email) {
@@ -3441,7 +3691,7 @@ app.post("/login/verify-2fa", authRateLimit, async (req, res) => {
     const user = result.rows[0];
 
     if (user.is_admin) {
-      if (!user.totp_secret || !verifyTotpCode(user.totp_secret, code)) {
+      if (!user.totp_secret || !verifyTotpCode(decryptTotpSecret(user.totp_secret), code)) {
         return res.status(400).json({ error: "That code doesn't match — check your authenticator app and try again" });
       }
       if (!user.email) {
@@ -7666,6 +7916,7 @@ const PORT = process.env.PORT || 3000;
 async function startServer() {
   try {
     await applyPendingMigrations();
+    await encryptLegacyTotpSecrets();
     await backfillMissingDeliveryTokens();
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
