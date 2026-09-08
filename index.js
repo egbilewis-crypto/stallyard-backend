@@ -1016,14 +1016,29 @@ app.post("/password-reset/send", authRateLimit, async (req, res) => {
     if (!process.env.RESEND_API_KEY) {
       return res.status(500).json({ error: "Password reset isn't configured yet" });
     }
+
     const key = username.trim().toLowerCase();
-    const result = await pool.query("SELECT email FROM users WHERE username = $1", [key]);
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "We couldn't find an account with that username" });
+    const genericResponse = {
+      success: true,
+      message: "If that account is eligible for public password recovery, a reset code will be sent to its email address.",
+    };
+
+    // Public recovery must never reveal whether a username exists or whether it
+    // belongs to an administrator. Admin recovery is handled only through the
+    // dedicated Super Admin temporary-password flow.
+    const result = await pool.query(
+      "SELECT id, email, is_admin FROM users WHERE username = $1",
+      [key]
+    );
+    if (result.rows.length === 0 || result.rows[0].is_admin) {
+      passwordResetCodes.delete(key);
+      return res.json(genericResponse);
     }
-    const email = result.rows[0].email;
+
+    const { id: userId, email } = result.rows[0];
     if (!email) {
-      return res.status(400).json({ error: "This account has no email on file — contact support to recover it" });
+      passwordResetCodes.delete(key);
+      return res.json(genericResponse);
     }
 
     const code = generateSecurityCode();
@@ -1042,9 +1057,10 @@ app.post("/password-reset/send", authRateLimit, async (req, res) => {
     if (!resendRes.ok) {
       return res.status(400).json({ error: data.message || "Couldn't send that email — try again" });
     }
-    passwordResetCodes.set(key, { code, sentAt: Date.now() });
+
+    passwordResetCodes.set(key, { code, sentAt: Date.now(), userId });
     const maskedEmail = email.replace(/^(.{1,2}).*(@.*)$/, (m, a, b) => `${a}***${b}`);
-    res.json({ success: true, maskedEmail });
+    res.json({ ...genericResponse, maskedEmail });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1057,15 +1073,30 @@ app.post("/password-reset/verify-code", codeRateLimit, async (req, res) => {
     const key = username.trim().toLowerCase();
     const stored = passwordResetCodes.get(key);
     if (!stored || Date.now() - stored.sentAt > PASSWORD_RESET_CODE_TTL_MS) {
+      passwordResetCodes.delete(key);
       return res.status(400).json({ error: "That code has expired — request a new one" });
     }
     if (stored.code !== String(code).trim()) {
       return res.status(400).json({ error: "That code doesn't match — check and try again" });
     }
+
+    // Re-check account status from PostgreSQL at verification time. This closes
+    // the door if an account was promoted to admin after the code was issued.
+    const userResult = await pool.query(
+      "SELECT id, is_admin FROM users WHERE id = $1 AND username = $2",
+      [stored.userId, key]
+    );
+    if (userResult.rows.length === 0 || userResult.rows[0].is_admin) {
+      passwordResetCodes.delete(key);
+      return res.status(400).json({ error: "That reset request is no longer valid" });
+    }
+
     passwordResetCodes.delete(key);
-    const userResult = await pool.query("SELECT id FROM users WHERE username = $1", [key]);
-    if (userResult.rows.length === 0) return res.status(404).json({ error: "Account not found" });
-    const resetToken = jwt.sign({ type: "password_reset", userId: userResult.rows[0].id }, JWT_SECRET, { expiresIn: "10m" });
+    const resetToken = jwt.sign(
+      { type: "password_reset", userId: userResult.rows[0].id },
+      JWT_SECRET,
+      { expiresIn: "10m" }
+    );
     res.json({ resetToken });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1086,12 +1117,29 @@ app.post("/password-reset/confirm", authRateLimit, async (req, res) => {
     if (decoded.type !== "password_reset") {
       return res.status(401).json({ error: "Invalid reset token" });
     }
+
+    // Public reset tokens can never reset an administrator, even if the account
+    // changed roles after the token was issued.
+    const account = await pool.query("SELECT id, is_admin FROM users WHERE id = $1", [decoded.userId]);
+    if (account.rows.length === 0) return res.status(404).json({ error: "Account not found" });
+    if (account.rows[0].is_admin) {
+      return res.status(403).json({ error: "This reset session is not valid" });
+    }
+
     const passwordHash = await bcrypt.hash(newPassword, 10);
     const result = await pool.query(
-      "UPDATE users SET password_hash = $1 WHERE id = $2 RETURNING id",
+      `UPDATE users
+       SET password_hash = $1,
+           token_version = COALESCE(token_version, 0) + 1
+       WHERE id = $2 AND COALESCE(is_admin, false) = false
+       RETURNING id`,
       [passwordHash, decoded.userId]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: "Account not found" });
+    if (result.rows.length === 0) return res.status(400).json({ error: "This reset session is not valid" });
+
+    // Every pre-reset JWT is now invalid because token_version advanced. Clear
+    // any cookie in this browser as well so the client immediately reflects it.
+    clearAuthCookie(res);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
