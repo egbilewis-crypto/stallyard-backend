@@ -1852,27 +1852,51 @@ const USER_ADMIN_SAFE_FIELDS = `${USER_PUBLIC_FIELDS}, two_factor_enabled, admin
 
 app.get("/users", async (req, res) => {
   try {
-    const requester = getRequester(req);
+    const authHeader = req.headers.authorization || "";
+    const hasBearerToken = authHeader.startsWith("Bearer ");
     let fields = USER_PUBLIC_FIELDS;
 
-    // Do not trust the JWT's old isAdmin claim for deciding whether private
-    // member records can be returned. Re-check the account against PostgreSQL,
-    // including suspension and token_version, on every privileged directory read.
-    if (requester?.id) {
+    // /users is public for storefront/profile discovery, but a caller that
+    // presents a token must not get any privileged behavior from stale JWT
+    // claims. Revalidate the account against PostgreSQL every time before
+    // exposing admin-only directory fields.
+    if (hasBearerToken) {
+      const requester = getRequester(req);
+      if (!requester?.id) {
+        return res.status(401).json({ error: "Your session is no longer valid — log in again" });
+      }
+
       const authCheck = await pool.query(
         `SELECT is_admin, is_suspended, token_version, admin_role, two_factor_enabled
          FROM users WHERE id = $1`,
         [requester.id]
       );
-      if (authCheck.rows.length) {
-        const current = authCheck.rows[0];
-        const tokenIsCurrent = (requester.tokenVersion || 0) === (current.token_version || 0);
-        if (current.is_admin && !current.is_suspended && tokenIsCurrent) {
-          const role = current.admin_role || "super_admin";
-          const canReviewSellerPrivateData =
-            current.two_factor_enabled && (role === "super_admin" || role === "seller_verification");
-          fields = canReviewSellerPrivateData ? USER_FULL_FIELDS : USER_ADMIN_SAFE_FIELDS;
+      if (!authCheck.rows.length) {
+        return res.status(401).json({ error: "Account no longer exists" });
+      }
+
+      const current = authCheck.rows[0];
+      if (current.is_suspended) {
+        return res.status(403).json({ error: "This account has been suspended" });
+      }
+      if ((requester.tokenVersion || 0) !== (current.token_version || 0)) {
+        return res.status(401).json({ error: "Your session was signed out from another device — log in again" });
+      }
+
+      if (current.is_admin) {
+        // A revoked admin token can never reach this branch because both the
+        // current DB role and token_version are checked above. Full seller
+        // verification documents additionally require mandatory admin 2FA and
+        // the specific role that needs those documents.
+        const role = current.admin_role || "super_admin";
+        if (!current.two_factor_enabled) {
+          return res.status(403).json({
+            error: "Two-factor authentication is required for admin accounts",
+            code: "2FA_REQUIRED",
+          });
         }
+        const canReviewSellerPrivateData = role === "super_admin" || role === "seller_verification";
+        fields = canReviewSellerPrivateData ? USER_FULL_FIELDS : USER_ADMIN_SAFE_FIELDS;
       }
     }
 
