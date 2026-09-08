@@ -263,6 +263,30 @@ const smsCheckRateLimit = rateLimit({
   keyFn: (req) => `${getClientIp(req) || "unknown"}:phone:${normalizePhoneForRateLimit(req.body?.phone) || "missing"}`,
 });
 
+// Image uploads are authenticated but still cost bandwidth, moderation calls, and
+// Supabase Storage. Layer burst and daily limits so a compromised account cannot
+// hammer the upload endpoint or run up storage costs. These limits still allow
+// two full 12-photo listings plus a few retries within 15 minutes.
+const imageUploadUserBurstRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  message: "You've uploaded a lot of images recently — wait 15 minutes before uploading more.",
+  keyFn: (req) => `user:${req.user?.id || "unknown"}`,
+});
+const imageUploadIpBurstRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  message: "Too many image uploads from this connection — wait 15 minutes and try again.",
+  keyFn: (req) => `ip:${getClientIp(req) || "unknown"}`,
+});
+const imageUploadUserDailyRateLimit = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000,
+  max: 120,
+  message: "Daily image upload limit reached — try again tomorrow or contact support if you need help.",
+  keyFn: (req) => `user:${req.user?.id || "unknown"}`,
+});
+const MAX_IMAGE_UPLOAD_BYTES = 8 * 1024 * 1024;
+
 async function isVpnOrProxy(ip) {
   if (!ip || ip === "::1" || ip === "127.0.0.1") return false;
   const cached = vpnCheckCache.get(ip);
@@ -2964,7 +2988,7 @@ async function moderateListingImagesAsync(listingId, imageUrls) {
   }
 }
 
-app.post("/uploads/image", authenticate, async (req, res) => {
+app.post("/uploads/image", authenticate, imageUploadIpBurstRateLimit, imageUploadUserBurstRateLimit, imageUploadUserDailyRateLimit, async (req, res) => {
   try {
     const { dataUrl, folder } = req.body;
     if (!dataUrl) return res.status(400).json({ error: "Missing image data" });
@@ -2996,6 +3020,9 @@ app.post("/uploads/image", authenticate, async (req, res) => {
     }
     if (!imageBuffer.length) {
       return res.status(400).json({ error: "Image is empty" });
+    }
+    if (imageBuffer.length > MAX_IMAGE_UPLOAD_BYTES) {
+      return res.status(413).json({ error: "Image is too large — maximum upload size is 8 MB" });
     }
 
     const extension = mimeType === "image/png" ? "png" : mimeType === "image/webp" ? "webp" : mimeType === "image/avif" ? "avif" : "jpg";
