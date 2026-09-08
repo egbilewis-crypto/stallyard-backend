@@ -139,12 +139,29 @@ if (!JWT_SECRET && process.env.NODE_ENV !== "production") {
   console.warn("Development warning: JWT_SECRET is not set; authenticated routes will not work.");
 }
 
-function signToken(user) {
-  return jwt.sign(
-    { id: user.id, username: user.username, isAdmin: !!user.is_admin, tokenVersion: user.token_version || 0 },
-    JWT_SECRET,
-    { expiresIn: user.is_admin ? "24h" : "30d" }
-  );
+const ADMIN_SERVER_SESSION_MS = 30 * 60 * 1000;
+const ADMIN_SESSION_CLOCK_SKEW_MS = 5 * 60 * 1000;
+const ADMIN_REAUTH_ALLOWED_PATHS = new Set([
+  "/admin/reauth",
+  "/admin/reauth/verify",
+  "/admin/reauth/verify-email",
+  "/session/me",
+  "/logout",
+]);
+
+function signToken(user, options = {}) {
+  const isAdmin = !!user.is_admin;
+  const payload = {
+    id: user.id,
+    username: user.username,
+    isAdmin,
+    tokenVersion: user.token_version || 0,
+  };
+  if (isAdmin) {
+    const verifiedAt = Number(options.adminVerifiedAt ?? user.adminVerifiedAt ?? 0);
+    if (Number.isFinite(verifiedAt) && verifiedAt > 0) payload.adminVerifiedAt = verifiedAt;
+  }
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: isAdmin ? "24h" : "30d" });
 }
 
 const AUTH_COOKIE_NAME = "stallyard_session";
@@ -166,8 +183,8 @@ function parseCookies(req) {
   return out;
 }
 
-function setAuthCookie(res, user) {
-  const token = signToken(user);
+function setAuthCookie(res, user, options = {}) {
+  const token = signToken(user, options);
   const production = process.env.NODE_ENV === "production";
   const parts = [
     `${AUTH_COOKIE_NAME}=${encodeURIComponent(token)}`,
@@ -176,8 +193,9 @@ function setAuthCookie(res, user) {
     production ? "Secure" : "",
     production ? "SameSite=None" : "SameSite=Lax",
   ].filter(Boolean);
-  // Marketplace sessions persist for 30 days. Admin sessions are browser-session
-  // cookies; the existing 30-minute admin unlock gate still applies in the UI.
+  // Marketplace sessions persist for 30 days. Admin cookies remain browser-session
+  // cookies, while the backend independently enforces a 30-minute privileged
+  // admin window using the adminVerifiedAt claim.
   if (!user.is_admin) parts.push(`Max-Age=${30 * 24 * 60 * 60}`);
   res.setHeader("Set-Cookie", parts.join("; "));
 }
@@ -233,6 +251,25 @@ async function authenticate(req, res, next) {
       twoFactorEnabled: !!result.rows[0].two_factor_enabled,
       country: result.rows[0].country || "",
     };
+
+    if (req.user.isAdmin) {
+      const verifiedAt = Number(requester.adminVerifiedAt || 0);
+      const age = verifiedAt ? Date.now() - verifiedAt : Number.POSITIVE_INFINITY;
+      const invalidFutureTimestamp = verifiedAt > Date.now() + ADMIN_SESSION_CLOCK_SKEW_MS;
+      const expired = !verifiedAt || invalidFutureTimestamp || age > ADMIN_SERVER_SESSION_MS;
+      req.user.adminVerifiedAt = verifiedAt || null;
+      req.user.adminSessionExpired = expired;
+
+      // Admin identity may remain signed in at the browser level so it can
+      // complete the mandatory password -> TOTP -> email re-auth flow, but no
+      // privileged endpoint is usable after 30 minutes until that flow succeeds.
+      if (expired && !ADMIN_REAUTH_ALLOWED_PATHS.has(req.path)) {
+        return res.status(401).json({
+          error: "Your 30-minute admin session expired — complete admin re-authentication to continue.",
+          code: "ADMIN_SESSION_EXPIRED",
+        });
+      }
+    }
     next();
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -241,6 +278,12 @@ async function authenticate(req, res, next) {
 
 function requireAdmin(req, res, next) {
   if (!req.user?.isAdmin) return res.status(403).json({ error: "Admin access required" });
+  if (req.user.adminSessionExpired) {
+    return res.status(401).json({
+      error: "Your 30-minute admin session expired — complete admin re-authentication to continue.",
+      code: "ADMIN_SESSION_EXPIRED",
+    });
+  }
   if (!req.user.twoFactorEnabled) {
     return res.status(403).json({ error: "Two-factor authentication is required for admin accounts — enable it to continue.", code: "2FA_REQUIRED" });
   }
@@ -1875,7 +1918,7 @@ app.patch("/profile/change-password", authenticate, authRateLimit, async (req, r
        WHERE id = $2 RETURNING ${USER_RETURNING_FIELDS}`,
       [newHash, req.user.id]
     );
-    setAuthCookie(res, updated.rows[0]);
+    setAuthCookie(res, updated.rows[0], req.user.isAdmin ? { adminVerifiedAt: req.user.adminVerifiedAt } : {});
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1890,7 +1933,7 @@ app.post("/profile/sign-out-other-devices", authenticate, async (req, res) => {
       [req.user.id]
     );
     if (!result.rows.length) return res.status(404).json({ error: "Account not found" });
-    setAuthCookie(res, result.rows[0]);
+    setAuthCookie(res, result.rows[0], req.user.isAdmin ? { adminVerifiedAt: req.user.adminVerifiedAt } : {});
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2250,8 +2293,18 @@ app.post("/admin/reauth/verify-email", authenticate, authRateLimit, async (req, 
     }
     twoFactorCodes.delete(req.user.id);
     totpVerifiedMarkers.delete(req.user.id);
-    logAdminAction(req.user.id, "admin_reauth_completed", "Completed password + authenticator + email re-authentication for the admin panel");
-    res.json({ success: true });
+
+    const refreshed = await pool.query(
+      `SELECT ${USER_RETURNING_FIELDS} FROM users WHERE id = $1`,
+      [req.user.id]
+    );
+    if (!refreshed.rows.length || !refreshed.rows[0].is_admin) {
+      clearAuthCookie(res);
+      return res.status(403).json({ error: "Admin access is no longer active" });
+    }
+    setAuthCookie(res, refreshed.rows[0], { adminVerifiedAt: Date.now() });
+    logAdminAction(req.user.id, "admin_reauth_completed", "Completed password + authenticator + email re-authentication; refreshed the server-enforced 30-minute admin session");
+    res.json({ success: true, adminSessionExpiresInMs: ADMIN_SERVER_SESSION_MS });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -3271,8 +3324,8 @@ app.post("/login/verify-2fa-email", authRateLimit, async (req, res) => {
         `Completed three-step admin login from ${ip || "unknown IP"}; previous admin sessions were revoked`
       );
     }
-    setAuthCookie(res, sessionUser);
-    res.json({ user: sessionUser });
+    setAuthCookie(res, sessionUser, { adminVerifiedAt: Date.now() });
+    res.json({ user: sessionUser, adminSessionExpiresInMs: ADMIN_SERVER_SESSION_MS });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -3333,8 +3386,8 @@ app.post("/admin/temporary-password/complete", authRateLimit, async (req, res) =
     const userAgent = req.headers["user-agent"] || "";
     await pool.query("INSERT INTO login_history (user_id, ip, user_agent) VALUES ($1, $2, $3)", [user.id, ip, userAgent]);
     logAdminAction(user.id, "admin_temporary_password_completed", `Set a new permanent password after temporary-password recovery from ${ip || "unknown IP"}`);
-    setAuthCookie(res, user);
-    res.json({ user });
+    setAuthCookie(res, user, { adminVerifiedAt: Date.now() });
+    res.json({ user, adminSessionExpiresInMs: ADMIN_SERVER_SESSION_MS });
   } catch (err) {
     if (err.code === "42703") {
       return res.status(409).json({ error: "Run the temporary admin password migration first", code: "MIGRATION_REQUIRED" });
