@@ -2733,6 +2733,15 @@ app.post("/admin/reauth", authenticate, authRateLimit, async (req, res) => {
         code: "ADMIN_MFA_REQUIRED",
       });
     }
+    const reauthChallenge = crypto.randomBytes(32).toString("hex");
+    await setSecurityState(
+      "admin-reauth-challenge",
+      Number(req.user.id),
+      { challenge: reauthChallenge, passwordVerifiedAt: Date.now() },
+      TOTP_VERIFIED_MARKER_TTL_MS
+    );
+    await deleteSecurityState("admin-reauth-totp", Number(req.user.id));
+    await deleteSecurityState("admin-reauth-email", Number(req.user.id));
     res.json({ twoFactorRequired: true, method: "totp" });
   } catch (err) {
     sendInternalError(res, err);
@@ -2743,6 +2752,10 @@ app.post("/admin/reauth/verify", authenticate, authRateLimit, async (req, res) =
   try {
     if (!req.user.isAdmin) return res.status(403).json({ error: "Admin access required" });
     const { code } = req.body;
+    const challengeState = await getSecurityState("admin-reauth-challenge", Number(req.user.id));
+    if (!challengeState?.challenge) {
+      return res.status(400).json({ error: "Your password step expired — start admin re-authentication again" });
+    }
     const result = await pool.query("SELECT email, totp_secret FROM users WHERE id = $1", [req.user.id]);
     if (!result.rows.length) return res.status(404).json({ error: "Account not found" });
 
@@ -2770,8 +2783,18 @@ app.post("/admin/reauth/verify", authenticate, authRateLimit, async (req, res) =
     if (!resendRes.ok) {
       return res.status(400).json({ error: "Couldn't send the email step's code — try again" });
     }
-    await setSecurityState("2fa-email", req.user.id, { code: emailCode }, TWO_FACTOR_CODE_TTL_MS);
-    await setSecurityState("totp-verified", req.user.id, { verified: true }, TOTP_VERIFIED_MARKER_TTL_MS);
+    await setSecurityState(
+      "admin-reauth-email",
+      Number(req.user.id),
+      { code: emailCode, challenge: challengeState.challenge },
+      TWO_FACTOR_CODE_TTL_MS
+    );
+    await setSecurityState(
+      "admin-reauth-totp",
+      Number(req.user.id),
+      { verified: true, challenge: challengeState.challenge },
+      TOTP_VERIFIED_MARKER_TTL_MS
+    );
     res.json({ emailStepRequired: true });
   } catch (err) {
     sendInternalError(res, err);
@@ -2782,19 +2805,22 @@ app.post("/admin/reauth/verify-email", authenticate, authRateLimit, async (req, 
   try {
     if (!req.user.isAdmin) return res.status(403).json({ error: "Admin access required" });
     const { code } = req.body;
-    const marker = await getSecurityState("totp-verified", req.user.id);
-    if (!marker) {
-      return res.status(400).json({ error: "Your authenticator step expired — start over" });
-    }
-    const stored = await getSecurityState("2fa-email", req.user.id);
-    if (!stored) {
-      return res.status(400).json({ error: "That email code has expired — start over" });
+    const challengeState = await getSecurityState("admin-reauth-challenge", Number(req.user.id));
+    const marker = await getSecurityState("admin-reauth-totp", Number(req.user.id));
+    const stored = await getSecurityState("admin-reauth-email", Number(req.user.id));
+    if (!challengeState?.challenge || !marker?.challenge || !stored?.challenge ||
+        marker.challenge !== challengeState.challenge || stored.challenge !== challengeState.challenge) {
+      await deleteSecurityState("admin-reauth-challenge", Number(req.user.id));
+      await deleteSecurityState("admin-reauth-totp", Number(req.user.id));
+      await deleteSecurityState("admin-reauth-email", Number(req.user.id));
+      return res.status(400).json({ error: "Your admin authentication sequence expired — start over" });
     }
     if (stored.code !== String(code || "").trim()) {
       return res.status(400).json({ error: "That code doesn't match" });
     }
-    await deleteSecurityState("2fa-email", req.user.id);
-    await deleteSecurityState("totp-verified", req.user.id);
+    await deleteSecurityState("admin-reauth-challenge", Number(req.user.id));
+    await deleteSecurityState("admin-reauth-totp", Number(req.user.id));
+    await deleteSecurityState("admin-reauth-email", Number(req.user.id));
 
     const refreshed = await pool.query(
       `SELECT ${USER_RETURNING_FIELDS} FROM users WHERE id = $1`,
@@ -3533,9 +3559,7 @@ app.post("/admin/login", authRateLimit, async (req, res) => {
     if ((!passwordMatches && !temporaryPasswordMatches) || !user.is_admin) {
       return res.status(401).json({ error: "Username or password doesn't match" });
     }
-    if (temporaryPasswordMatches) {
-      await setSecurityState("admin-temp-login", Number(user.id), { expiresAt: tempExpiry }, Math.max(1000, tempExpiry - Date.now()));
-    } else {
+    if (!temporaryPasswordMatches) {
       await deleteSecurityState("admin-temp-login", Number(user.id));
       if (user.admin_temp_password_hash && tempExpiry && tempExpiry <= Date.now()) {
         pool.query(
@@ -3570,8 +3594,26 @@ app.post("/admin/login", authRateLimit, async (req, res) => {
       return res.status(500).json({ error: "Admin email verification isn't configured — contact support" });
     }
 
-    // Password is step 1. The existing verify-2fa endpoint performs TOTP
-    // (step 2), then sends the email code required for step 3.
+    // Password is step 1. Bind the remaining MFA steps to a short-lived,
+    // cryptographically random server-side challenge. A new successful
+    // password step invalidates any older in-progress admin login sequence.
+    const adminLoginChallenge = crypto.randomBytes(32).toString("hex");
+    await deleteSecurityState("admin-login-totp", Number(user.id));
+    await deleteSecurityState("admin-login-email", Number(user.id));
+    await setSecurityState(
+      "admin-login-challenge",
+      Number(user.id),
+      { challenge: adminLoginChallenge, passwordVerifiedAt: Date.now(), temporaryPassword: temporaryPasswordMatches === true },
+      TOTP_VERIFIED_MARKER_TTL_MS
+    );
+    if (temporaryPasswordMatches) {
+      await setSecurityState(
+        "admin-temp-login",
+        Number(user.id),
+        { expiresAt: tempExpiry, challenge: adminLoginChallenge },
+        Math.max(1000, Math.min(TOTP_VERIFIED_MARKER_TTL_MS, tempExpiry - Date.now()))
+      );
+    }
     res.json({ twoFactorRequired: true, userId: user.id, method: "totp" });
   } catch (err) {
     sendInternalError(res, err);
@@ -3702,6 +3744,17 @@ app.post("/login/verify-2fa", authRateLimit, async (req, res) => {
     const user = result.rows[0];
 
     if (user.is_admin) {
+      if (user.is_suspended) {
+        await deleteSecurityState("admin-login-challenge", Number(user.id));
+        await deleteSecurityState("admin-login-totp", Number(user.id));
+        await deleteSecurityState("admin-login-email", Number(user.id));
+        await deleteSecurityState("admin-temp-login", Number(user.id));
+        return res.status(403).json({ error: "This account has been suspended" });
+      }
+      const loginChallenge = await getSecurityState("admin-login-challenge", Number(user.id));
+      if (!loginChallenge?.challenge) {
+        return res.status(400).json({ error: "Your password step expired — start admin sign-in again" });
+      }
       if (!user.totp_secret || !verifyTotpCode(decryptTotpSecret(user.totp_secret), code)) {
         return res.status(400).json({ error: "That code doesn't match — check your authenticator app and try again" });
       }
@@ -3726,8 +3779,18 @@ app.post("/login/verify-2fa", authRateLimit, async (req, res) => {
       if (!resendRes.ok) {
         return res.status(400).json({ error: "Couldn't send the email step's code — try again" });
       }
-      await setSecurityState("2fa-email", Number(userId), { code: emailCode }, TWO_FACTOR_CODE_TTL_MS);
-      await setSecurityState("totp-verified", Number(userId), { verified: true }, TOTP_VERIFIED_MARKER_TTL_MS);
+      await setSecurityState(
+        "admin-login-email",
+        Number(userId),
+        { code: emailCode, challenge: loginChallenge.challenge },
+        TWO_FACTOR_CODE_TTL_MS
+      );
+      await setSecurityState(
+        "admin-login-totp",
+        Number(userId),
+        { verified: true, challenge: loginChallenge.challenge },
+        TOTP_VERIFIED_MARKER_TTL_MS
+      );
       return res.json({ emailStepRequired: true, userId: user.id });
     }
 
@@ -3758,32 +3821,67 @@ app.post("/login/verify-2fa-email", authRateLimit, async (req, res) => {
     const { userId, code } = req.body;
     if (!userId || !code) return res.status(400).json({ error: "Missing userId or code" });
 
-    const marker = await getSecurityState("totp-verified", Number(userId));
-    if (!marker) {
-      return res.status(400).json({ error: "Your authenticator step expired — log in again from the start" });
-    }
-    const stored = await getSecurityState("2fa-email", Number(userId));
-    if (!stored) {
-      return res.status(400).json({ error: "That email code has expired — log in again to get a new one" });
-    }
-    if (stored.code !== String(code).trim()) {
-      return res.status(400).json({ error: "That code doesn't match — check and try again" });
-    }
-    await deleteSecurityState("2fa-email", Number(userId));
-    await deleteSecurityState("totp-verified", Number(userId));
-
-    const result = await pool.query(
+    const preflight = await pool.query(
       `SELECT ${USER_RETURNING_FIELDS}
        FROM users WHERE id = $1`,
       [userId]
     );
+    if (preflight.rows.length === 0) return res.status(404).json({ error: "Account not found" });
+    const preflightUser = preflight.rows[0];
+
+    let marker;
+    let stored;
+    let activeAdminChallenge = null;
+    if (preflightUser.is_admin) {
+      if (preflightUser.is_suspended) {
+        await deleteSecurityState("admin-login-challenge", Number(userId));
+        await deleteSecurityState("admin-login-totp", Number(userId));
+        await deleteSecurityState("admin-login-email", Number(userId));
+        await deleteSecurityState("admin-temp-login", Number(userId));
+        return res.status(403).json({ error: "This account has been suspended" });
+      }
+      activeAdminChallenge = await getSecurityState("admin-login-challenge", Number(userId));
+      marker = await getSecurityState("admin-login-totp", Number(userId));
+      stored = await getSecurityState("admin-login-email", Number(userId));
+      if (!activeAdminChallenge?.challenge || !marker?.challenge || !stored?.challenge ||
+          marker.challenge !== activeAdminChallenge.challenge || stored.challenge !== activeAdminChallenge.challenge) {
+        await deleteSecurityState("admin-login-challenge", Number(userId));
+        await deleteSecurityState("admin-login-totp", Number(userId));
+        await deleteSecurityState("admin-login-email", Number(userId));
+        await deleteSecurityState("admin-temp-login", Number(userId));
+        return res.status(400).json({ error: "Your admin authentication sequence expired — start sign-in again" });
+      }
+    } else {
+      marker = await getSecurityState("totp-verified", Number(userId));
+      stored = await getSecurityState("2fa-email", Number(userId));
+      if (!marker) {
+        return res.status(400).json({ error: "Your authenticator step expired — log in again from the start" });
+      }
+      if (!stored) {
+        return res.status(400).json({ error: "That email code has expired — log in again to get a new one" });
+      }
+    }
+    if (stored.code !== String(code).trim()) {
+      return res.status(400).json({ error: "That code doesn't match — check and try again" });
+    }
+    if (preflightUser.is_admin) {
+      await deleteSecurityState("admin-login-challenge", Number(userId));
+      await deleteSecurityState("admin-login-totp", Number(userId));
+      await deleteSecurityState("admin-login-email", Number(userId));
+    } else {
+      await deleteSecurityState("2fa-email", Number(userId));
+      await deleteSecurityState("totp-verified", Number(userId));
+    }
+
+    const result = preflight;
     if (result.rows.length === 0) return res.status(404).json({ error: "Account not found" });
     const user = result.rows[0];
     const ip = getClientIp(req);
     const userAgent = req.headers["user-agent"] || "";
 
     const tempMarker = user.is_admin ? await getSecurityState("admin-temp-login", Number(user.id)) : null;
-    if (tempMarker && tempMarker.expiresAt > Date.now()) {
+    if (tempMarker && tempMarker.expiresAt > Date.now() &&
+        activeAdminChallenge?.challenge && tempMarker.challenge === activeAdminChallenge.challenge) {
       await deleteSecurityState("admin-temp-login", Number(user.id));
       const passwordChangeToken = jwt.sign(
         { type: "admin_temp_password_change", userId: user.id },
