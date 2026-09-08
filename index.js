@@ -6935,6 +6935,3 @@ async function startServer() {
 }
 
 startServer();
-    if (!isNigeriaCountry(shippingAddress?.country)) {
-      return res.status(400).json({ error: "Delivery is available to Nigerian addresses only" });
-    }
