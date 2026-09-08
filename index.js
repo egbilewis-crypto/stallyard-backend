@@ -296,6 +296,30 @@ function logAdminAction(adminId, action, details) {
 
 const codeRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 8, message: "Too many attempts — please wait 15 minutes and try again." });
 
+// Payout-bank changes are especially sensitive because they control where seller
+// money is sent. Protect both code issuance and verification independently from
+// the general authentication limiter.
+const bankChangeSendUserRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 3,
+  message: "Too many bank-change confirmation codes requested — wait 15 minutes and try again.",
+  keyFn: (req) => `bank-change-send:user:${req.user?.id || "unknown"}`,
+});
+const bankChangeSendIpRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 6,
+  message: "Too many bank-change confirmation requests from this connection — wait 15 minutes and try again.",
+  keyFn: (req) => `bank-change-send:ip:${getClientIp(req) || "unknown"}`,
+});
+const bankChangeConfirmRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  message: "Too many bank-change code attempts — wait 15 minutes and request a new code.",
+  keyFn: (req) => `bank-change-confirm:${req.user?.id || "unknown"}:${getClientIp(req) || "unknown"}`,
+});
+const BANK_CHANGE_RESEND_COOLDOWN_MS = 60 * 1000;
+const BANK_CHANGE_MAX_CODE_ATTEMPTS = 5;
+
 // Security-sensitive one-time codes must use a cryptographically secure RNG.
 // randomInt is uniform over 100000-999999 and avoids Math.random(), which is
 // not suitable for authentication, password-reset, or payout-verification codes.
@@ -4971,7 +4995,12 @@ async function verifyAndSaveBankDetails(userId, bankCode, accountNumber) {
   return { recipientCode: recipientData.data.recipient_code };
 }
 
-app.post("/sellers/bank-details", authenticate, async (req, res) => {
+app.post(
+  "/sellers/bank-details",
+  authenticate,
+  bankChangeSendIpRateLimit,
+  bankChangeSendUserRateLimit,
+  async (req, res) => {
   try {
     const { userId, bankCode, accountNumber, adminOverrideReason } = req.body;
 
@@ -5044,6 +5073,17 @@ app.post("/sellers/bank-details", authenticate, async (req, res) => {
     if (!process.env.RESEND_API_KEY) {
       return res.status(500).json({ error: "Bank-change confirmation isn't configured yet" });
     }
+
+    const existingPendingChange = pendingBankChanges.get(req.user.id);
+    if (existingPendingChange && Date.now() - existingPendingChange.sentAt < BANK_CHANGE_RESEND_COOLDOWN_MS) {
+      const retryAfterSeconds = Math.max(1, Math.ceil((BANK_CHANGE_RESEND_COOLDOWN_MS - (Date.now() - existingPendingChange.sentAt)) / 1000));
+      res.setHeader("Retry-After", String(retryAfterSeconds));
+      return res.status(429).json({
+        error: `A bank-change code was just sent — wait ${retryAfterSeconds} seconds before requesting another one.`,
+        retryAfterSeconds,
+      });
+    }
+
     const code = generateSecurityCode();
     const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
     const resendRes = await fetch("https://api.resend.com/emails", {
@@ -5059,24 +5099,55 @@ app.post("/sellers/bank-details", authenticate, async (req, res) => {
     if (!resendRes.ok) {
       return res.status(400).json({ error: "Couldn't send a confirmation code — try again" });
     }
-    pendingBankChanges.set(Number(userId), { code, sentAt: Date.now(), bankCode, accountNumber });
+    pendingBankChanges.set(req.user.id, {
+      code,
+      sentAt: Date.now(),
+      bankCode,
+      accountNumber,
+      failedAttempts: 0,
+    });
     res.json({ confirmationRequired: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post("/sellers/bank-details/confirm", authenticate, async (req, res) => {
+app.post(
+  "/sellers/bank-details/confirm",
+  authenticate,
+  bankChangeConfirmRateLimit,
+  async (req, res) => {
   try {
-    const { code } = req.body;
-    if (!code) return res.status(400).json({ error: "Enter the code we emailed you" });
+    const submittedCode = String(req.body?.code || "").trim();
+    if (!/^\d{6}$/.test(submittedCode)) {
+      return res.status(400).json({ error: "Enter the 6-digit code we emailed you" });
+    }
+
     const pending = pendingBankChanges.get(req.user.id);
     if (!pending || Date.now() - pending.sentAt > BANK_CHANGE_CODE_TTL_MS) {
+      pendingBankChanges.delete(req.user.id);
       return res.status(400).json({ error: "That code has expired — start the change again" });
     }
-    if (pending.code !== String(code).trim()) {
-      return res.status(400).json({ error: "That code doesn't match — check and try again" });
+
+    const expectedBuffer = Buffer.from(String(pending.code));
+    const submittedBuffer = Buffer.from(submittedCode);
+    const codeMatches = expectedBuffer.length === submittedBuffer.length &&
+      crypto.timingSafeEqual(expectedBuffer, submittedBuffer);
+
+    if (!codeMatches) {
+      pending.failedAttempts = Number(pending.failedAttempts || 0) + 1;
+      if (pending.failedAttempts >= BANK_CHANGE_MAX_CODE_ATTEMPTS) {
+        pendingBankChanges.delete(req.user.id);
+        return res.status(429).json({
+          error: "Too many incorrect bank-change codes — start the bank change again to receive a new code.",
+        });
+      }
+      return res.status(400).json({
+        error: "That code doesn't match — check and try again",
+        attemptsRemaining: BANK_CHANGE_MAX_CODE_ATTEMPTS - pending.failedAttempts,
+      });
     }
+
     pendingBankChanges.delete(req.user.id);
     const result = await verifyAndSaveBankDetails(req.user.id, pending.bankCode, pending.accountNumber);
     if (result.error) return res.status(result.status).json({ error: result.error });
