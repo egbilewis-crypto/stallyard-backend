@@ -630,19 +630,12 @@ app.get("/db-check", async (req, res) => {
   }
 });
 
-function requireMigrationKey(req, res, next) {
-  if (!process.env.MIGRATION_KEY) {
-    return res.status(500).send("MIGRATION_KEY isn't set in Railway — add it under Variables before running migrations.");
-  }
-  if (req.query.key !== process.env.MIGRATION_KEY) {
-    return res.status(403).send("Missing or incorrect ?key= — check MIGRATION_KEY in Railway's Variables tab.");
-  }
-  next();
-}
-
-app.get("/migrate/members-extra", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+// Database schema migrations are versioned and applied automatically at backend startup.
+// This replaces the old public /migrate/... URLs and keeps migration secrets out of browser history/logs.
+// Each migration is idempotent, and schema_migrations records completed versions so later deploys only run new work.
+const SCHEMA_MIGRATIONS = [
+  { version: 1, name: "members-extra", statements: [
+    `
       ALTER TABLE users
         ADD COLUMN IF NOT EXISTS account_type TEXT DEFAULT 'personal',
         ADD COLUMN IF NOT EXISTS id_type TEXT DEFAULT '',
@@ -651,16 +644,10 @@ app.get("/migrate/members-extra", requireMigrationKey, async (req, res) => {
         ADD COLUMN IF NOT EXISTS license_photos JSONB DEFAULT '[]'::jsonb,
         ADD COLUMN IF NOT EXISTS id_verification_exempt BOOLEAN DEFAULT false,
         ADD COLUMN IF NOT EXISTS has_applied_to_sell BOOLEAN DEFAULT false
-    `);
-    res.send("Migration complete: members-extra columns added.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/follows", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 2, name: "follows", statements: [
+    `
       CREATE TABLE IF NOT EXISTS follows (
         id SERIAL PRIMARY KEY,
         follower_username TEXT NOT NULL,
@@ -668,16 +655,10 @@ app.get("/migrate/follows", requireMigrationKey, async (req, res) => {
         created_at TIMESTAMP DEFAULT NOW(),
         UNIQUE (follower_username, followed_username)
       )
-    `);
-    res.send("Migration complete: follows table created.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/listings-extra", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 3, name: "listings-extra", statements: [
+    `
       ALTER TABLE listings
         ADD COLUMN IF NOT EXISTS emoji TEXT DEFAULT '📦',
         ADD COLUMN IF NOT EXISTS fit_make TEXT DEFAULT '',
@@ -691,16 +672,10 @@ app.get("/migrate/listings-extra", requireMigrationKey, async (req, res) => {
         ADD COLUMN IF NOT EXISTS auction_end_time TIMESTAMP,
         ADD COLUMN IF NOT EXISTS bid_history JSONB DEFAULT '[]'::jsonb,
         ADD COLUMN IF NOT EXISTS highest_bidder_username TEXT
-    `);
-    res.send("Migration complete: listings-extra columns added.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/orders-wallet", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 4, name: "orders-wallet", statements: [
+    `
       ALTER TABLE orders
         ADD COLUMN IF NOT EXISTS buyer_username TEXT,
         ADD COLUMN IF NOT EXISTS shipping_address JSONB DEFAULT '{}'::jsonb,
@@ -710,8 +685,8 @@ app.get("/migrate/orders-wallet", requireMigrationKey, async (req, res) => {
         ADD COLUMN IF NOT EXISTS commission_amount NUMERIC DEFAULT 0,
         ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'held',
         ADD COLUMN IF NOT EXISTS is_disputed BOOLEAN DEFAULT false
-    `);
-    await pool.query(`
+    `,
+    `
       CREATE TABLE IF NOT EXISTS order_items (
         id SERIAL PRIMARY KEY,
         order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
@@ -728,8 +703,8 @@ app.get("/migrate/orders-wallet", requireMigrationKey, async (req, res) => {
         tracking_number TEXT DEFAULT '',
         created_at TIMESTAMP DEFAULT NOW()
       )
-    `);
-    await pool.query(`
+    `,
+    `
       CREATE TABLE IF NOT EXISTS withdrawals (
         id SERIAL PRIMARY KEY,
         seller_id INTEGER NOT NULL REFERENCES users(id),
@@ -741,51 +716,33 @@ app.get("/migrate/orders-wallet", requireMigrationKey, async (req, res) => {
         requested_at TIMESTAMP DEFAULT NOW(),
         processed_at TIMESTAMP
       )
-    `);
-    res.send("Migration complete: orders-wallet columns and tables added.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/signup-stages", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 5, name: "signup-stages", statements: [
+    `
       ALTER TABLE users
         ADD COLUMN IF NOT EXISTS is_email_verified BOOLEAN DEFAULT false,
         ADD COLUMN IF NOT EXISTS profile_complete BOOLEAN DEFAULT false
-    `);
-    await pool.query(`ALTER TABLE users ALTER COLUMN phone DROP NOT NULL`);
-    res.send("Migration complete: signup-stages columns added, phone made optional.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/seller-verification", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+    `ALTER TABLE users ALTER COLUMN phone DROP NOT NULL`,
+  ] },
+  { version: 6, name: "seller-verification", statements: [
+    `
       ALTER TABLE users
         ADD COLUMN IF NOT EXISTS verification_status TEXT DEFAULT 'none',
         ADD COLUMN IF NOT EXISTS bank_statement_url TEXT,
         ADD COLUMN IF NOT EXISTS rejection_reason TEXT
-    `);
-    await pool.query(`
+    `,
+    `
       UPDATE users SET verification_status =
         CASE WHEN is_approved THEN 'approved'
              WHEN has_applied_to_sell THEN 'pending'
              ELSE 'none' END
       WHERE verification_status IS NULL OR verification_status = 'none'
-    `);
-    res.send("Migration complete: verification_status, bank_statement_url, rejection_reason columns added.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/listings-extra-fields", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 7, name: "listings-extra-fields", statements: [
+    `
       ALTER TABLE listings
         ADD COLUMN IF NOT EXISTS quantity INTEGER,
         ADD COLUMN IF NOT EXISTS sku TEXT DEFAULT '',
@@ -794,59 +751,35 @@ app.get("/migrate/listings-extra-fields", requireMigrationKey, async (req, res) 
         ADD COLUMN IF NOT EXISTS shipping_methods JSONB DEFAULT '[]'::jsonb,
         ADD COLUMN IF NOT EXISTS return_policy TEXT DEFAULT '',
         ADD COLUMN IF NOT EXISTS vin TEXT DEFAULT ''
-    `);
-    res.send("Migration complete: quantity, sku, brand, state, shipping_methods, return_policy, vin columns added to listings.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/order-management", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 8, name: "order-management", statements: [
+    `
       ALTER TABLE order_items
         ADD COLUMN IF NOT EXISTS carrier TEXT DEFAULT '',
         ADD COLUMN IF NOT EXISTS buyer_confirmed_at TIMESTAMP
-    `);
-    res.send("Migration complete: carrier and buyer_confirmed_at columns added to order_items.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/proof-of-delivery", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 9, name: "proof-of-delivery", statements: [
+    `
       ALTER TABLE order_items
         ADD COLUMN IF NOT EXISTS proof_of_delivery_url TEXT DEFAULT ''
-    `);
-    res.send("Migration complete: proof_of_delivery_url column added to order_items.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/delivery-token", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 10, name: "delivery-token", statements: [
+    `
       ALTER TABLE order_items
         ADD COLUMN IF NOT EXISTS delivery_token TEXT,
         ADD COLUMN IF NOT EXISTS delivery_token_generated_at TIMESTAMP
-    `);
-    res.send("Migration complete: delivery_token and delivery_token_generated_at columns added to order_items.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/message-features", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 11, name: "message-features", statements: [
+    `
       ALTER TABLE messages
         ADD COLUMN IF NOT EXISTS image_url TEXT,
         ADD COLUMN IF NOT EXISTS order_id INTEGER
-    `);
-    await pool.query(`
+    `,
+    `
       CREATE TABLE IF NOT EXISTS message_reports (
         id SERIAL PRIMARY KEY,
         message_id INTEGER NOT NULL,
@@ -857,16 +790,10 @@ app.get("/migrate/message-features", requireMigrationKey, async (req, res) => {
         created_at TIMESTAMP DEFAULT NOW(),
         resolved_at TIMESTAMP
       )
-    `);
-    res.send("Migration complete: message image/order columns added, message_reports table created.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/returns", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 12, name: "returns", statements: [
+    `
       ALTER TABLE order_items
         ADD COLUMN IF NOT EXISTS return_status TEXT,
         ADD COLUMN IF NOT EXISTS return_reason TEXT,
@@ -874,21 +801,15 @@ app.get("/migrate/returns", requireMigrationKey, async (req, res) => {
         ADD COLUMN IF NOT EXISTS return_requested_at TIMESTAMP,
         ADD COLUMN IF NOT EXISTS return_tracking_number TEXT,
         ADD COLUMN IF NOT EXISTS return_evidence_urls JSONB DEFAULT '[]'::jsonb
-    `);
-    res.send("Migration complete: return_status and related columns added to order_items.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/review-features", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 13, name: "review-features", statements: [
+    `
       ALTER TABLE reviews
         ADD COLUMN IF NOT EXISTS seller_response TEXT,
         ADD COLUMN IF NOT EXISTS seller_response_at TIMESTAMP
-    `);
-    await pool.query(`
+    `,
+    `
       CREATE TABLE IF NOT EXISTS review_reports (
         id SERIAL PRIMARY KEY,
         review_id INTEGER NOT NULL,
@@ -898,30 +819,18 @@ app.get("/migrate/review-features", requireMigrationKey, async (req, res) => {
         created_at TIMESTAMP DEFAULT NOW(),
         resolved_at TIMESTAMP
       )
-    `);
-    res.send("Migration complete: seller_response columns added to reviews, review_reports table created.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/store-profile", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 14, name: "store-profile", statements: [
+    `
       ALTER TABLE users
         ADD COLUMN IF NOT EXISTS avatar_url TEXT,
         ADD COLUMN IF NOT EXISTS store_bio TEXT,
         ADD COLUMN IF NOT EXISTS store_policies TEXT
-    `);
-    res.send("Migration complete: avatar_url, store_bio, store_policies columns added to users.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/notifications", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 15, name: "notifications", statements: [
+    `
       CREATE TABLE IF NOT EXISTS notifications (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -930,20 +839,14 @@ app.get("/migrate/notifications", requireMigrationKey, async (req, res) => {
         read BOOLEAN DEFAULT false,
         created_at TIMESTAMP DEFAULT NOW()
       )
-    `);
-    await pool.query(`
+    `,
+    `
       ALTER TABLE order_items
         ADD COLUMN IF NOT EXISTS ship_reminder_sent_at TIMESTAMP
-    `);
-    res.send("Migration complete: notifications table created, ship_reminder_sent_at added to order_items.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/login-history", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 16, name: "login-history", statements: [
+    `
       CREATE TABLE IF NOT EXISTS login_history (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -951,38 +854,20 @@ app.get("/migrate/login-history", requireMigrationKey, async (req, res) => {
         user_agent TEXT,
         created_at TIMESTAMP DEFAULT NOW()
       )
-    `);
-    res.send("Migration complete: login_history table created.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/two-factor", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 17, name: "two-factor", statements: [
+    `
       ALTER TABLE users ADD COLUMN IF NOT EXISTS two_factor_enabled BOOLEAN DEFAULT false
-    `);
-    res.send("Migration complete: two_factor_enabled column added to users.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/totp", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 18, name: "totp", statements: [
+    `
       ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret TEXT
-    `);
-    res.send("Migration complete: totp_secret column added to users.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/addresses", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 19, name: "addresses", statements: [
+    `
       CREATE TABLE IF NOT EXISTS user_addresses (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -995,39 +880,27 @@ app.get("/migrate/addresses", requireMigrationKey, async (req, res) => {
         is_default BOOLEAN DEFAULT false,
         created_at TIMESTAMP DEFAULT NOW()
       )
-    `);
-    await pool.query(`
+    `,
+    `
       CREATE INDEX IF NOT EXISTS idx_user_addresses_user_id ON user_addresses(user_id)
-    `);
-    res.send("Migration complete: user_addresses table created.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/paystack-checkout", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 20, name: "paystack-checkout", statements: [
+    `
       ALTER TABLE orders
         ADD COLUMN IF NOT EXISTS paystack_reference TEXT,
         ADD COLUMN IF NOT EXISTS payment_channel TEXT,
         ADD COLUMN IF NOT EXISTS payment_card_type TEXT,
         ADD COLUMN IF NOT EXISTS payment_bank TEXT,
         ADD COLUMN IF NOT EXISTS payment_last4 TEXT
-    `);
-    await pool.query(`
+    `,
+    `
       CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_paystack_reference
       ON orders(paystack_reference) WHERE paystack_reference IS NOT NULL
-    `);
-    res.send("Migration complete: Paystack payment-tracking columns added to orders.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/refunds", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 21, name: "refunds", statements: [
+    `
       ALTER TABLE orders
         ADD COLUMN IF NOT EXISTS refund_status TEXT,
         ADD COLUMN IF NOT EXISTS paystack_refund_id BIGINT,
@@ -1035,42 +908,24 @@ app.get("/migrate/refunds", requireMigrationKey, async (req, res) => {
         ADD COLUMN IF NOT EXISTS refund_requested_at TIMESTAMP,
         ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMP,
         ADD COLUMN IF NOT EXISTS refund_failure_reason TEXT
-    `);
-    res.send("Migration complete: refund tracking columns added to orders.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/refund-management", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 22, name: "refund-management", statements: [
+    `
       ALTER TABLE orders
         ADD COLUMN IF NOT EXISTS refund_reason TEXT,
         ADD COLUMN IF NOT EXISTS refund_requested_by INTEGER REFERENCES users(id)
-    `);
-    res.send("Migration complete: refund management reason and requesting-admin fields added.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/partial-refunds", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 23, name: "partial-refunds", statements: [
+    `
       ALTER TABLE orders
         ADD COLUMN IF NOT EXISTS refund_type TEXT,
         ADD COLUMN IF NOT EXISTS refund_amount NUMERIC DEFAULT 0
-    `);
-    res.send("Migration complete: partial-refund tracking fields added to orders.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/saved-cards", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 24, name: "saved-cards", statements: [
+    `
       CREATE TABLE IF NOT EXISTS saved_cards (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1084,73 +939,37 @@ app.get("/migrate/saved-cards", requireMigrationKey, async (req, res) => {
         is_default BOOLEAN DEFAULT false,
         created_at TIMESTAMP DEFAULT NOW()
       )
-    `);
-    await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS authorization_code_hash TEXT`);
-    await pool.query(`DROP INDEX IF EXISTS idx_saved_cards_user_auth`);
-    await pool.query(`
+    `,
+    `ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS authorization_code_hash TEXT`,
+    `DROP INDEX IF EXISTS idx_saved_cards_user_auth`,
+    `
       CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_cards_user_auth_hash
       ON saved_cards(user_id, authorization_code_hash) WHERE authorization_code_hash IS NOT NULL
-    `);
-    res.send("Migration complete: saved_cards table created.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/ships-to-usa", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`ALTER TABLE listings ADD COLUMN IF NOT EXISTS ships_to_usa BOOLEAN DEFAULT false`);
-    res.send("Migration complete: ships_to_usa column added to listings.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/tax-rate", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`ALTER TABLE site_settings ADD COLUMN IF NOT EXISTS tax_rate NUMERIC DEFAULT 0`);
-    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS tax_amount NUMERIC DEFAULT 0`);
-    res.send("Migration complete: tax_rate added to site_settings, tax_amount added to orders.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/flagged-images", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`ALTER TABLE listings ADD COLUMN IF NOT EXISTS flagged_images JSONB DEFAULT '[]'::jsonb`);
-    res.send("Migration complete: flagged_images column added to listings.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/hidden-images", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`ALTER TABLE listings ADD COLUMN IF NOT EXISTS hidden_image_urls JSONB DEFAULT '[]'::jsonb`);
-    res.send("Migration complete: hidden_image_urls column added to listings.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/phone-verified", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 25, name: "ships-to-usa", statements: [
+    `ALTER TABLE listings ADD COLUMN IF NOT EXISTS ships_to_usa BOOLEAN DEFAULT false`,
+  ] },
+  { version: 26, name: "tax-rate", statements: [
+    `ALTER TABLE site_settings ADD COLUMN IF NOT EXISTS tax_rate NUMERIC DEFAULT 0`,
+    `ALTER TABLE orders ADD COLUMN IF NOT EXISTS tax_amount NUMERIC DEFAULT 0`,
+  ] },
+  { version: 27, name: "flagged-images", statements: [
+    `ALTER TABLE listings ADD COLUMN IF NOT EXISTS flagged_images JSONB DEFAULT '[]'::jsonb`,
+  ] },
+  { version: 28, name: "hidden-images", statements: [
+    `ALTER TABLE listings ADD COLUMN IF NOT EXISTS hidden_image_urls JSONB DEFAULT '[]'::jsonb`,
+  ] },
+  { version: 29, name: "phone-verified", statements: [
+    `
       ALTER TABLE users ADD COLUMN IF NOT EXISTS is_phone_verified BOOLEAN DEFAULT false
-    `);
-    res.send("Migration complete: is_phone_verified column added to users.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/sessions", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 30, name: "sessions", statements: [
+    `
       ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER DEFAULT 0
-    `);
-    await pool.query(`
+    `,
+    `
       CREATE TABLE IF NOT EXISTS account_reports (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1159,19 +978,13 @@ app.get("/migrate/sessions", requireMigrationKey, async (req, res) => {
         created_at TIMESTAMP DEFAULT NOW(),
         resolved_at TIMESTAMP
       )
-    `);
-    res.send("Migration complete: token_version added to users, account_reports table created.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/seller-performance", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 31, name: "seller-performance", statements: [
+    `
       ALTER TABLE order_items ADD COLUMN IF NOT EXISTS shipped_at TIMESTAMP
-    `);
-    await pool.query(`
+    `,
+    `
       CREATE TABLE IF NOT EXISTS seller_warnings (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1179,16 +992,10 @@ app.get("/migrate/seller-performance", requireMigrationKey, async (req, res) => 
         message TEXT NOT NULL,
         created_at TIMESTAMP DEFAULT NOW()
       )
-    `);
-    res.send("Migration complete: shipped_at added to order_items, seller_warnings table created.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/buyer-risk", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 32, name: "buyer-risk", statements: [
+    `
       CREATE TABLE IF NOT EXISTS payment_attempts (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1200,20 +1007,14 @@ app.get("/migrate/buyer-risk", requireMigrationKey, async (req, res) => {
         message TEXT DEFAULT '',
         created_at TIMESTAMP DEFAULT NOW()
       )
-    `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_payment_attempts_user_id ON payment_attempts(user_id)`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_payment_attempts_reference ON payment_attempts(reference)`);
-    res.send("Migration complete: payment_attempts table created for buyer-risk review.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/admin-roles", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_role TEXT`);
-    await pool.query(`UPDATE users SET admin_role = 'super_admin' WHERE is_admin = true AND admin_role IS NULL`);
-    await pool.query(`
+    `,
+    `CREATE INDEX IF NOT EXISTS idx_payment_attempts_user_id ON payment_attempts(user_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_payment_attempts_reference ON payment_attempts(reference)`,
+  ] },
+  { version: 33, name: "admin-roles", statements: [
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_role TEXT`,
+    `UPDATE users SET admin_role = 'super_admin' WHERE is_admin = true AND admin_role IS NULL`,
+    `
       CREATE TABLE IF NOT EXISTS admin_audit_log (
         id SERIAL PRIMARY KEY,
         admin_id INTEGER REFERENCES users(id),
@@ -1221,16 +1022,10 @@ app.get("/migrate/admin-roles", requireMigrationKey, async (req, res) => {
         details TEXT,
         created_at TIMESTAMP DEFAULT NOW()
       )
-    `);
-    res.send("Migration complete: admin_role added to users (existing admins set to super_admin), admin_audit_log table created.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/admin-staff-management", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 34, name: "admin-staff-management", statements: [
+    `
       CREATE TABLE IF NOT EXISTS admin_role_history (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1240,49 +1035,31 @@ app.get("/migrate/admin-staff-management", requireMigrationKey, async (req, res)
         reason TEXT DEFAULT '',
         created_at TIMESTAMP DEFAULT NOW()
       )
-    `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_admin_role_history_user_id ON admin_role_history(user_id, created_at DESC)`);
-    res.send("Migration complete: admin_role_history table created for staff management.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/admin-temporary-passwords", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+    `CREATE INDEX IF NOT EXISTS idx_admin_role_history_user_id ON admin_role_history(user_id, created_at DESC)`,
+  ] },
+  { version: 35, name: "admin-temporary-passwords", statements: [
+    `
       ALTER TABLE users
         ADD COLUMN IF NOT EXISTS admin_temp_password_hash TEXT,
         ADD COLUMN IF NOT EXISTS admin_temp_password_expires_at TIMESTAMP,
         ADD COLUMN IF NOT EXISTS admin_temp_password_created_at TIMESTAMP,
         ADD COLUMN IF NOT EXISTS admin_temp_password_created_by INTEGER REFERENCES users(id)
-    `);
-    res.send("Migration complete: temporary admin password fields added.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/site-settings", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 36, name: "site-settings", statements: [
+    `
       CREATE TABLE IF NOT EXISTS site_settings (
         id INTEGER PRIMARY KEY DEFAULT 1,
         commission_rate NUMERIC DEFAULT 0.05,
         auth_image TEXT DEFAULT '',
         CHECK (id = 1)
       )
-    `);
-    await pool.query(`INSERT INTO site_settings (id, commission_rate) VALUES (1, 0.05) ON CONFLICT (id) DO NOTHING`);
-    res.send("Migration complete: site_settings table created (commission rate is now real, was previously hardcoded and disconnected from the admin UI).");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/dispute-cases", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+    `INSERT INTO site_settings (id, commission_rate) VALUES (1, 0.05) ON CONFLICT (id) DO NOTHING`,
+  ] },
+  { version: 37, name: "dispute-cases", statements: [
+    `
       CREATE TABLE IF NOT EXISTS dispute_cases (
         id SERIAL PRIMARY KEY,
         order_id INTEGER NOT NULL UNIQUE REFERENCES orders(id) ON DELETE CASCADE,
@@ -1300,26 +1077,19 @@ app.get("/migrate/dispute-cases", requireMigrationKey, async (req, res) => {
         updated_at TIMESTAMP DEFAULT NOW(),
         resolved_at TIMESTAMP
       )
-    `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_dispute_cases_status ON dispute_cases(status)`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_dispute_cases_order_id ON dispute_cases(order_id)`);
-    // Backfill any legacy disputed orders so they immediately appear in the new case dashboard.
-    await pool.query(`
+    `,
+    `CREATE INDEX IF NOT EXISTS idx_dispute_cases_status ON dispute_cases(status)`,
+    `CREATE INDEX IF NOT EXISTS idx_dispute_cases_order_id ON dispute_cases(order_id)`,
+    `
       INSERT INTO dispute_cases (order_id, opened_by_id, reason, status, opened_at, updated_at)
       SELECT id, buyer_id, 'Legacy dispute — add case details during review', 'open', created_at, NOW()
       FROM orders
       WHERE COALESCE(is_disputed, false) = true
       ON CONFLICT (order_id) DO NOTHING
-    `);
-    res.send("Migration complete: dispute_cases table created and legacy disputes backfilled.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/help-support", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 38, name: "help-support", statements: [
+    `
       CREATE TABLE IF NOT EXISTS banners (
         id SERIAL PRIMARY KEY,
         message TEXT NOT NULL,
@@ -1330,8 +1100,8 @@ app.get("/migrate/help-support", requireMigrationKey, async (req, res) => {
         video_url TEXT DEFAULT '',
         created_at TIMESTAMP DEFAULT NOW()
       )
-    `);
-    await pool.query(`
+    `,
+    `
       CREATE TABLE IF NOT EXISTS help_articles (
         id SERIAL PRIMARY KEY,
         title TEXT NOT NULL,
@@ -1339,29 +1109,29 @@ app.get("/migrate/help-support", requireMigrationKey, async (req, res) => {
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
       )
-    `);
-    await pool.query(`
+    `,
+    `
       CREATE TABLE IF NOT EXISTS help_faqs (
         id SERIAL PRIMARY KEY,
         question TEXT NOT NULL,
         answer TEXT NOT NULL,
         created_at TIMESTAMP DEFAULT NOW()
       )
-    `);
-    await pool.query(`
+    `,
+    `
       CREATE TABLE IF NOT EXISTS marketplace_policies (
         category TEXT PRIMARY KEY,
         body TEXT DEFAULT '',
         updated_at TIMESTAMP DEFAULT NOW()
       )
-    `);
-    await pool.query(`
+    `,
+    `
       INSERT INTO marketplace_policies (category, body) VALUES
         ('seller_rules', ''), ('prohibited_items', ''), ('fees', ''),
         ('payment_rules', ''), ('shipping_rules', ''), ('returns_disputes', '')
       ON CONFLICT (category) DO NOTHING
-    `);
-    await pool.query(`
+    `,
+    `
       CREATE TABLE IF NOT EXISTS support_tickets (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1370,8 +1140,8 @@ app.get("/migrate/help-support", requireMigrationKey, async (req, res) => {
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
       )
-    `);
-    await pool.query(`
+    `,
+    `
       CREATE TABLE IF NOT EXISTS support_ticket_messages (
         id SERIAL PRIMARY KEY,
         ticket_id INTEGER NOT NULL REFERENCES support_tickets(id) ON DELETE CASCADE,
@@ -1379,16 +1149,10 @@ app.get("/migrate/help-support", requireMigrationKey, async (req, res) => {
         body TEXT NOT NULL,
         created_at TIMESTAMP DEFAULT NOW()
       )
-    `);
-    res.send("Migration complete: banners, help_articles, help_faqs, marketplace_policies, support_tickets, support_ticket_messages tables created.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/cart-watchlist", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 39, name: "cart-watchlist", statements: [
+    `
       CREATE TABLE IF NOT EXISTS cart_items (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1397,8 +1161,8 @@ app.get("/migrate/cart-watchlist", requireMigrationKey, async (req, res) => {
         offer_price NUMERIC,
         UNIQUE (user_id, listing_id)
       )
-    `);
-    await pool.query(`
+    `,
+    `
       CREATE TABLE IF NOT EXISTS watchlist_items (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1406,16 +1170,10 @@ app.get("/migrate/cart-watchlist", requireMigrationKey, async (req, res) => {
         created_at TIMESTAMP DEFAULT NOW(),
         UNIQUE (user_id, listing_id)
       )
-    `);
-    res.send("Migration complete: cart_items and watchlist_items tables added.");
-  } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
-  }
-});
-
-app.get("/migrate/admin-notes", requireMigrationKey, async (req, res) => {
-  try {
-    await pool.query(`
+    `,
+  ] },
+  { version: 40, name: "admin-notes", statements: [
+    `
       CREATE TABLE IF NOT EXISTS admin_notes (
         id SERIAL PRIMARY KEY,
         entity_type TEXT NOT NULL,
@@ -1425,12 +1183,78 @@ app.get("/migrate/admin-notes", requireMigrationKey, async (req, res) => {
         created_at TIMESTAMP DEFAULT NOW(),
         CHECK (entity_type IN ('member', 'listing', 'order', 'dispute', 'support_ticket'))
       )
-    `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_admin_notes_entity ON admin_notes(entity_type, entity_id, created_at DESC)`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_admin_notes_admin ON admin_notes(admin_id, created_at DESC)`);
-    res.send("Migration complete: admin_notes table created.");
+    `,
+    `CREATE INDEX IF NOT EXISTS idx_admin_notes_entity ON admin_notes(entity_type, entity_id, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_admin_notes_admin ON admin_notes(admin_id, created_at DESC)`,
+  ] },
+];
+
+async function ensureMigrationTable(client = pool) {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      applied_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+}
+
+async function applyPendingMigrations() {
+  const client = await pool.connect();
+  try {
+    await ensureMigrationTable(client);
+    const appliedResult = await client.query("SELECT version FROM schema_migrations ORDER BY version");
+    const applied = new Set(appliedResult.rows.map((r) => Number(r.version)));
+    const pending = SCHEMA_MIGRATIONS.filter((m) => !applied.has(m.version));
+
+    if (pending.length === 0) {
+      console.log("Database schema is current — no migrations pending.");
+      return { applied: [], pending: 0 };
+    }
+
+    const completed = [];
+    for (const migration of pending) {
+      await client.query("BEGIN");
+      try {
+        for (const statement of migration.statements) {
+          await client.query(statement);
+        }
+        await client.query(
+          "INSERT INTO schema_migrations (version, name) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING",
+          [migration.version, migration.name]
+        );
+        await client.query("COMMIT");
+        completed.push(migration.name);
+        console.log(`Applied database migration ${migration.version}: ${migration.name}`);
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw new Error(`Migration ${migration.version} (${migration.name}) failed: ${err.message}`);
+      }
+    }
+    return { applied: completed, pending: 0 };
+  } finally {
+    client.release();
+  }
+}
+
+// Super Admin can inspect migration status from the secured admin API.
+// There is deliberately no endpoint that accepts a migration key in a URL.
+app.get("/admin/schema-status", authenticate, requirePermission("role_assignment"), async (req, res) => {
+  try {
+    await ensureMigrationTable();
+    const appliedResult = await pool.query("SELECT version, name, applied_at FROM schema_migrations ORDER BY version");
+    const appliedVersions = new Set(appliedResult.rows.map((r) => Number(r.version)));
+    const pending = SCHEMA_MIGRATIONS
+      .filter((m) => !appliedVersions.has(m.version))
+      .map((m) => ({ version: m.version, name: m.name }));
+    res.json({
+      current: pending.length === 0,
+      totalMigrations: SCHEMA_MIGRATIONS.length,
+      applied: appliedResult.rows,
+      pending,
+    });
   } catch (err) {
-    res.status(500).send(`Migration failed: ${err.message}`);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -6946,10 +6770,21 @@ async function sendShipReminders() {
     console.error("Ship reminder check failed:", err.message);
   }
 }
-setInterval(sendShipReminders, 60 * 60 * 1000).unref();
-sendShipReminders();
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+
+async function startServer() {
+  try {
+    await applyPendingMigrations();
+    app.listen(PORT, () => {
+      console.log(`Server running on port ${PORT}`);
+      setInterval(sendShipReminders, 60 * 60 * 1000).unref();
+      sendShipReminders();
+    });
+  } catch (err) {
+    // Fail the deployment instead of starting against a half-migrated schema.
+    console.error("Database migration failed; backend will not start:", err.message);
+    process.exit(1);
+  }
+}
+
+startServer();
