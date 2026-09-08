@@ -392,6 +392,13 @@ function generateSecurityCode() {
   return crypto.randomInt(100000, 1000000).toString();
 }
 
+// Generate a unique, unpredictable Paystack transaction reference.
+// This value is created server-side and is also the primary key for the
+// checkout intent, so never accept a client-supplied payment reference.
+function generateCheckoutReference() {
+  return `STL-${Date.now()}-${crypto.randomBytes(12).toString("hex")}`;
+}
+
 function normalizePhoneForRateLimit(phone) {
   return String(phone || "").replace(/[^0-9]/g, "");
 }
