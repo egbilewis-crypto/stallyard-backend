@@ -863,10 +863,8 @@ async function checkPhoneNumber(phone) {
   }
 }
 
-const termiiPinIds = new Map();
 const TERMII_PIN_TTL_MS = 10 * 60 * 1000;
 
-const verifiedPhones = new Map();
 const PHONE_VERIFIED_TTL_MS = 30 * 60 * 1000;
 
 app.post("/phone-verify/send", smsSendIpRateLimit, smsSendPhoneRateLimit, async (req, res) => {
@@ -899,7 +897,7 @@ app.post("/phone-verify/send", smsSendIpRateLimit, smsSendPhoneRateLimit, async 
     if (!termiiRes.ok || !data.pinId) {
       return res.status(400).json({ error: data.message || "Couldn't send that code — check the phone number and try again" });
     }
-    termiiPinIds.set(phone, { pinId: data.pinId, sentAt: Date.now() });
+    await setSecurityState("phone-otp", phone, { pinId: data.pinId }, TERMII_PIN_TTL_MS);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -914,8 +912,8 @@ app.post("/phone-verify/check", smsCheckRateLimit, async (req, res) => {
       return res.status(500).json({ error: "SMS verification isn't configured yet" });
     }
 
-    const stored = termiiPinIds.get(phone);
-    if (!stored || Date.now() - stored.sentAt > TERMII_PIN_TTL_MS) {
+    const stored = await getSecurityState("phone-otp", phone);
+    if (!stored) {
       return res.status(400).json({ error: "That code has expired — request a new one" });
     }
 
@@ -934,8 +932,8 @@ app.post("/phone-verify/check", smsCheckRateLimit, async (req, res) => {
     }
     const valid = data.verified === "True" || data.verified === true;
     if (valid) {
-      termiiPinIds.delete(phone);
-      verifiedPhones.set(phone, Date.now());
+      await deleteSecurityState("phone-otp", phone);
+      await setSecurityState("phone-verified", phone, { verified: true }, PHONE_VERIFIED_TTL_MS);
     }
     res.json({ valid });
   } catch (err) {
@@ -943,10 +941,8 @@ app.post("/phone-verify/check", smsCheckRateLimit, async (req, res) => {
   }
 });
 
-const emailCodes = new Map();
 const EMAIL_CODE_TTL_MS = 15 * 60 * 1000;
 
-const verifiedEmails = new Map();
 const EMAIL_VERIFIED_TTL_MS = 30 * 60 * 1000;
 
 app.post("/email-verify/send", codeRateLimit, async (req, res) => {
@@ -977,7 +973,7 @@ app.post("/email-verify/send", codeRateLimit, async (req, res) => {
     if (!resendRes.ok) {
       return res.status(400).json({ error: data.message || "Couldn't send that email — check the address and try again" });
     }
-    emailCodes.set(email.toLowerCase(), { code, sentAt: Date.now() });
+    await setSecurityState("email-otp", email.toLowerCase(), { code }, EMAIL_CODE_TTL_MS);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -989,14 +985,14 @@ app.post("/email-verify/check", codeRateLimit, async (req, res) => {
     const { email, code } = req.body;
     if (!email || !code) return res.status(400).json({ error: "Missing email or code" });
 
-    const stored = emailCodes.get(email.toLowerCase());
-    if (!stored || Date.now() - stored.sentAt > EMAIL_CODE_TTL_MS) {
+    const stored = await getSecurityState("email-otp", email.toLowerCase());
+    if (!stored) {
       return res.status(400).json({ error: "That code has expired — request a new one" });
     }
     const valid = stored.code === String(code).trim();
     if (valid) {
-      emailCodes.delete(email.toLowerCase());
-      verifiedEmails.set(email.toLowerCase(), Date.now());
+      await deleteSecurityState("email-otp", email.toLowerCase());
+      await setSecurityState("email-verified", email.toLowerCase(), { verified: true }, EMAIL_VERIFIED_TTL_MS);
     }
     res.json({ valid });
   } catch (err) {
@@ -1004,21 +1000,16 @@ app.post("/email-verify/check", codeRateLimit, async (req, res) => {
   }
 });
 
-const passwordResetCodes = new Map();
 const PASSWORD_RESET_CODE_TTL_MS = 15 * 60 * 1000;
 
 // Tracks an admin who used a Super-Admin-issued temporary password for step 1.
 // The temporary password itself is stored only as a bcrypt hash in PostgreSQL;
 // this short-lived marker only carries the recovery state through TOTP + email.
-const adminTemporaryLoginMarkers = new Map();
 const ADMIN_TEMP_PASSWORD_TTL_MS = 10 * 60 * 1000;
 
-const twoFactorCodes = new Map();
 const TWO_FACTOR_CODE_TTL_MS = 10 * 60 * 1000;
 
-const twoFactorEnableCodes = new Map();
 
-const totpVerifiedMarkers = new Map();
 const TOTP_VERIFIED_MARKER_TTL_MS = 10 * 60 * 1000;
 
 const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -1438,13 +1429,13 @@ app.post("/password-reset/send", authRateLimit, async (req, res) => {
       [key]
     );
     if (result.rows.length === 0 || result.rows[0].is_admin) {
-      passwordResetCodes.delete(key);
+      await deleteSecurityState("password-reset", key);
       return res.json(genericResponse);
     }
 
     const { id: userId, email } = result.rows[0];
     if (!email) {
-      passwordResetCodes.delete(key);
+      await deleteSecurityState("password-reset", key);
       return res.json(genericResponse);
     }
 
@@ -1465,7 +1456,7 @@ app.post("/password-reset/send", authRateLimit, async (req, res) => {
       return res.status(400).json({ error: data.message || "Couldn't send that email — try again" });
     }
 
-    passwordResetCodes.set(key, { code, sentAt: Date.now(), userId });
+    await setSecurityState("password-reset", key, { code, userId }, PASSWORD_RESET_CODE_TTL_MS);
     const maskedEmail = email.replace(/^(.{1,2}).*(@.*)$/, (m, a, b) => `${a}***${b}`);
     res.json({ ...genericResponse, maskedEmail });
   } catch (err) {
@@ -1478,9 +1469,9 @@ app.post("/password-reset/verify-code", codeRateLimit, async (req, res) => {
     const { username, code } = req.body;
     if (!username || !code) return res.status(400).json({ error: "Missing username or code" });
     const key = username.trim().toLowerCase();
-    const stored = passwordResetCodes.get(key);
-    if (!stored || Date.now() - stored.sentAt > PASSWORD_RESET_CODE_TTL_MS) {
-      passwordResetCodes.delete(key);
+    const stored = await getSecurityState("password-reset", key);
+    if (!stored) {
+      await deleteSecurityState("password-reset", key);
       return res.status(400).json({ error: "That code has expired — request a new one" });
     }
     if (stored.code !== String(code).trim()) {
@@ -1494,11 +1485,11 @@ app.post("/password-reset/verify-code", codeRateLimit, async (req, res) => {
       [stored.userId, key]
     );
     if (userResult.rows.length === 0 || userResult.rows[0].is_admin) {
-      passwordResetCodes.delete(key);
+      await deleteSecurityState("password-reset", key);
       return res.status(400).json({ error: "That reset request is no longer valid" });
     }
 
-    passwordResetCodes.delete(key);
+    await deleteSecurityState("password-reset", key);
     const resetToken = jwt.sign(
       { type: "password_reset", userId: userResult.rows[0].id },
       JWT_SECRET,
@@ -2274,8 +2265,8 @@ app.post("/signup", authRateLimit, async (req, res) => {
     if (password.length < 8) {
       return res.status(400).json({ error: "Password must be at least 8 characters" });
     }
-    const verifiedAt = verifiedEmails.get(email.toLowerCase());
-    if (!verifiedAt || Date.now() - verifiedAt > EMAIL_VERIFIED_TTL_MS) {
+    const verifiedEmail = await getSecurityState("email-verified", email.toLowerCase());
+    if (!verifiedEmail) {
       return res.status(400).json({ error: "Verify your email before creating an account" });
     }
 
@@ -2301,7 +2292,7 @@ app.post("/signup", authRateLimit, async (req, res) => {
       [username, email, passwordHash, displayName || username, isFirstUser, isFirstUser]
     );
 
-    verifiedEmails.delete(email.toLowerCase());
+    await deleteSecurityState("email-verified", email.toLowerCase());
     if (!result.rows[0].is_admin) setAuthCookie(res, result.rows[0]);
     res.status(201).json({ user: result.rows[0] });
   } catch (err) {
@@ -2641,7 +2632,7 @@ app.post("/profile/two-factor/enable/send", authenticate, async (req, res) => {
     if (!resendRes.ok) {
       return res.status(400).json({ error: "Couldn't send your code — try again" });
     }
-    twoFactorEnableCodes.set(req.user.id, { code, sentAt: Date.now() });
+    await setSecurityState("2fa-enable", req.user.id, { code }, TWO_FACTOR_CODE_TTL_MS);
     res.json({ sent: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2654,14 +2645,14 @@ app.post("/profile/two-factor/enable/verify", authenticate, async (req, res) => 
       return res.status(400).json({ error: "Admin accounts use an authenticator app — see /admin/totp/setup" });
     }
     const { code } = req.body;
-    const stored = twoFactorEnableCodes.get(req.user.id);
-    if (!stored || Date.now() - stored.sentAt > TWO_FACTOR_CODE_TTL_MS) {
+    const stored = await getSecurityState("2fa-enable", req.user.id);
+    if (!stored) {
       return res.status(400).json({ error: "That code has expired — request a new one" });
     }
     if (stored.code !== String(code || "").trim()) {
       return res.status(400).json({ error: "That code doesn't match" });
     }
-    twoFactorEnableCodes.delete(req.user.id);
+    await deleteSecurityState("2fa-enable", req.user.id);
     const result = await pool.query(
       "UPDATE users SET two_factor_enabled = true WHERE id = $1 RETURNING two_factor_enabled",
       [req.user.id]
@@ -2762,8 +2753,8 @@ app.post("/admin/reauth/verify", authenticate, authRateLimit, async (req, res) =
     if (!resendRes.ok) {
       return res.status(400).json({ error: "Couldn't send the email step's code — try again" });
     }
-    twoFactorCodes.set(req.user.id, { code: emailCode, sentAt: Date.now() });
-    totpVerifiedMarkers.set(req.user.id, Date.now());
+    await setSecurityState("2fa-email", req.user.id, { code: emailCode }, TWO_FACTOR_CODE_TTL_MS);
+    await setSecurityState("totp-verified", req.user.id, { verified: true }, TOTP_VERIFIED_MARKER_TTL_MS);
     res.json({ emailStepRequired: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2774,19 +2765,19 @@ app.post("/admin/reauth/verify-email", authenticate, authRateLimit, async (req, 
   try {
     if (!req.user.isAdmin) return res.status(403).json({ error: "Admin access required" });
     const { code } = req.body;
-    const marker = totpVerifiedMarkers.get(req.user.id);
-    if (!marker || Date.now() - marker > TOTP_VERIFIED_MARKER_TTL_MS) {
+    const marker = await getSecurityState("totp-verified", req.user.id);
+    if (!marker) {
       return res.status(400).json({ error: "Your authenticator step expired — start over" });
     }
-    const stored = twoFactorCodes.get(req.user.id);
-    if (!stored || Date.now() - stored.sentAt > TWO_FACTOR_CODE_TTL_MS) {
+    const stored = await getSecurityState("2fa-email", req.user.id);
+    if (!stored) {
       return res.status(400).json({ error: "That email code has expired — start over" });
     }
     if (stored.code !== String(code || "").trim()) {
       return res.status(400).json({ error: "That code doesn't match" });
     }
-    twoFactorCodes.delete(req.user.id);
-    totpVerifiedMarkers.delete(req.user.id);
+    await deleteSecurityState("2fa-email", req.user.id);
+    await deleteSecurityState("totp-verified", req.user.id);
 
     const refreshed = await pool.query(
       `SELECT ${USER_RETURNING_FIELDS} FROM users WHERE id = $1`,
@@ -2811,11 +2802,11 @@ app.patch("/profile/verify-email", authenticate, async (req, res) => {
       return res.status(400).json({ error: "Add an email to your account first" });
     }
     const email = check.rows[0].email.toLowerCase();
-    const verifiedAt = verifiedEmails.get(email);
-    if (!verifiedAt || Date.now() - verifiedAt > EMAIL_VERIFIED_TTL_MS) {
+    const verifiedEmail = await getSecurityState("email-verified", email);
+    if (!verifiedEmail) {
       return res.status(400).json({ error: "Verify the code we sent first" });
     }
-    verifiedEmails.delete(email);
+    await deleteSecurityState("email-verified", email);
     await pool.query("UPDATE users SET is_email_verified = true WHERE id = $1", [req.user.id]);
     res.json({ success: true });
   } catch (err) {
@@ -2827,11 +2818,11 @@ app.patch("/profile/verify-phone", authenticate, async (req, res) => {
   try {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ error: "Missing phone number" });
-    const verifiedAt = verifiedPhones.get(phone);
-    if (!verifiedAt || Date.now() - verifiedAt > PHONE_VERIFIED_TTL_MS) {
+    const verifiedPhone = await getSecurityState("phone-verified", phone);
+    if (!verifiedPhone) {
       return res.status(400).json({ error: "Verify the code we sent first" });
     }
-    verifiedPhones.delete(phone);
+    await deleteSecurityState("phone-verified", phone);
     await pool.query("UPDATE users SET phone = $1, is_phone_verified = true WHERE id = $2", [phone, req.user.id]);
     res.json({ success: true });
   } catch (err) {
@@ -3187,7 +3178,7 @@ app.post("/admin/staff/:id/reset-password", authenticate, requirePermission("rol
       return res.status(400).json({ error: resendData.message || "Couldn't send the password reset email" });
     }
 
-    passwordResetCodes.set(target.username.trim().toLowerCase(), { code, sentAt: Date.now() });
+    await setSecurityState("password-reset", target.username.trim().toLowerCase(), { code, userId: targetId, adminIssued: true }, PASSWORD_RESET_CODE_TTL_MS, client);
     await client.query(
       "UPDATE users SET token_version = COALESCE(token_version, 0) + 1 WHERE id = $1",
       [targetId]
@@ -3526,9 +3517,9 @@ app.post("/admin/login", authRateLimit, async (req, res) => {
       return res.status(401).json({ error: "Username or password doesn't match" });
     }
     if (temporaryPasswordMatches) {
-      adminTemporaryLoginMarkers.set(Number(user.id), { expiresAt: tempExpiry });
+      await setSecurityState("admin-temp-login", Number(user.id), { expiresAt: tempExpiry }, Math.max(1000, tempExpiry - Date.now()));
     } else {
-      adminTemporaryLoginMarkers.delete(Number(user.id));
+      await deleteSecurityState("admin-temp-login", Number(user.id));
       if (user.admin_temp_password_hash && tempExpiry && tempExpiry <= Date.now()) {
         pool.query(
           `UPDATE users SET admin_temp_password_hash = NULL, admin_temp_password_expires_at = NULL,
@@ -3662,7 +3653,7 @@ app.post("/login", authRateLimit, async (req, res) => {
       if (!resendRes.ok) {
         return res.status(400).json({ error: "Couldn't send your login code — try again" });
       }
-      twoFactorCodes.set(user.id, { code, sentAt: Date.now() });
+      await setSecurityState("2fa-email", user.id, { code }, TWO_FACTOR_CODE_TTL_MS);
       return res.json({ twoFactorRequired: true, userId: user.id, method: "email" });
     }
 
@@ -3718,19 +3709,19 @@ app.post("/login/verify-2fa", authRateLimit, async (req, res) => {
       if (!resendRes.ok) {
         return res.status(400).json({ error: "Couldn't send the email step's code — try again" });
       }
-      twoFactorCodes.set(Number(userId), { code: emailCode, sentAt: Date.now() });
-      totpVerifiedMarkers.set(Number(userId), Date.now());
+      await setSecurityState("2fa-email", Number(userId), { code: emailCode }, TWO_FACTOR_CODE_TTL_MS);
+      await setSecurityState("totp-verified", Number(userId), { verified: true }, TOTP_VERIFIED_MARKER_TTL_MS);
       return res.json({ emailStepRequired: true, userId: user.id });
     }
 
-    const stored = twoFactorCodes.get(Number(userId));
-    if (!stored || Date.now() - stored.sentAt > TWO_FACTOR_CODE_TTL_MS) {
+    const stored = await getSecurityState("2fa-email", Number(userId));
+    if (!stored) {
       return res.status(400).json({ error: "That code has expired — log in again to get a new one" });
     }
     if (stored.code !== String(code).trim()) {
       return res.status(400).json({ error: "That code doesn't match — check and try again" });
     }
-    twoFactorCodes.delete(Number(userId));
+    await deleteSecurityState("2fa-email", Number(userId));
 
     delete user.totp_secret;
     const ip = getClientIp(req);
@@ -3750,19 +3741,19 @@ app.post("/login/verify-2fa-email", authRateLimit, async (req, res) => {
     const { userId, code } = req.body;
     if (!userId || !code) return res.status(400).json({ error: "Missing userId or code" });
 
-    const marker = totpVerifiedMarkers.get(Number(userId));
-    if (!marker || Date.now() - marker > TOTP_VERIFIED_MARKER_TTL_MS) {
+    const marker = await getSecurityState("totp-verified", Number(userId));
+    if (!marker) {
       return res.status(400).json({ error: "Your authenticator step expired — log in again from the start" });
     }
-    const stored = twoFactorCodes.get(Number(userId));
-    if (!stored || Date.now() - stored.sentAt > TWO_FACTOR_CODE_TTL_MS) {
+    const stored = await getSecurityState("2fa-email", Number(userId));
+    if (!stored) {
       return res.status(400).json({ error: "That email code has expired — log in again to get a new one" });
     }
     if (stored.code !== String(code).trim()) {
       return res.status(400).json({ error: "That code doesn't match — check and try again" });
     }
-    twoFactorCodes.delete(Number(userId));
-    totpVerifiedMarkers.delete(Number(userId));
+    await deleteSecurityState("2fa-email", Number(userId));
+    await deleteSecurityState("totp-verified", Number(userId));
 
     const result = await pool.query(
       `SELECT ${USER_RETURNING_FIELDS}
@@ -3774,9 +3765,9 @@ app.post("/login/verify-2fa-email", authRateLimit, async (req, res) => {
     const ip = getClientIp(req);
     const userAgent = req.headers["user-agent"] || "";
 
-    const tempMarker = user.is_admin ? adminTemporaryLoginMarkers.get(Number(user.id)) : null;
+    const tempMarker = user.is_admin ? await getSecurityState("admin-temp-login", Number(user.id)) : null;
     if (tempMarker && tempMarker.expiresAt > Date.now()) {
-      adminTemporaryLoginMarkers.delete(Number(user.id));
+      await deleteSecurityState("admin-temp-login", Number(user.id));
       const passwordChangeToken = jwt.sign(
         { type: "admin_temp_password_change", userId: user.id },
         JWT_SECRET,
@@ -3789,7 +3780,7 @@ app.post("/login/verify-2fa-email", authRateLimit, async (req, res) => {
         username: user.username,
       });
     }
-    adminTemporaryLoginMarkers.delete(Number(user.id));
+    await deleteSecurityState("admin-temp-login", Number(user.id));
 
     // Admin accounts are deliberately single-session. Only after all three
     // admin authentication steps succeed do we advance token_version. This
