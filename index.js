@@ -2201,6 +2201,18 @@ const SCHEMA_MIGRATIONS = [
     `CREATE INDEX IF NOT EXISTS idx_security_ephemeral_state_expires ON security_ephemeral_state(expires_at)`,
     `CREATE INDEX IF NOT EXISTS idx_security_ephemeral_state_namespace ON security_ephemeral_state(namespace, expires_at)`,
   ] },
+  { version: 46, name: "homepage-ads", statements: [
+    `
+      CREATE TABLE IF NOT EXISTS homepage_ads (
+        slot INTEGER PRIMARY KEY CHECK (slot BETWEEN 1 AND 3),
+        image_url TEXT NOT NULL DEFAULT '',
+        link_url TEXT NOT NULL DEFAULT '',
+        updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+        updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL
+      )
+    `,
+    `INSERT INTO homepage_ads (slot) VALUES (1), (2), (3) ON CONFLICT (slot) DO NOTHING`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -7538,6 +7550,76 @@ app.get("/login-history/mine", authenticate, async (req, res) => {
       [req.user.id]
     );
     res.json({ history: result.rows });
+  } catch (err) {
+    sendInternalError(res, err);
+  }
+});
+
+
+// Homepage promotional ads. Public visitors only receive the three safe display
+// fields; only the Super Admin can change an image or destination hyperlink.
+app.get("/homepage-ads", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT slot, image_url, link_url, updated_at FROM homepage_ads ORDER BY slot ASC"
+    );
+    const bySlot = new Map(result.rows.map((row) => [Number(row.slot), row]));
+    const ads = [1, 2, 3].map((slot) => bySlot.get(slot) || {
+      slot,
+      image_url: "",
+      link_url: "",
+      updated_at: null,
+    });
+    res.json({ ads });
+  } catch (err) {
+    sendInternalError(res, err);
+  }
+});
+
+app.put("/admin/homepage-ads/:slot", authenticate, requireAdmin, async (req, res) => {
+  try {
+    if (req.user.adminRole && req.user.adminRole !== "super_admin") {
+      return res.status(403).json({ error: "Only the Super Admin can manage homepage ads" });
+    }
+    const slot = Number(req.params.slot);
+    if (![1, 2, 3].includes(slot)) {
+      return res.status(400).json({ error: "Invalid homepage ad slot" });
+    }
+
+    const imageUrl = String(req.body?.imageUrl || "").trim();
+    const linkUrl = String(req.body?.linkUrl || "").trim();
+
+    if (imageUrl) {
+      try {
+        const parsedImage = new URL(imageUrl);
+        if (parsedImage.protocol !== "https:") throw new Error("unsafe image protocol");
+      } catch {
+        return res.status(400).json({ error: "Ad image must use a valid HTTPS URL" });
+      }
+    }
+
+    if (linkUrl && !linkUrl.startsWith("/")) {
+      try {
+        const parsedLink = new URL(linkUrl);
+        if (!["https:", "http:"].includes(parsedLink.protocol)) throw new Error("unsafe link protocol");
+      } catch {
+        return res.status(400).json({ error: "Use a valid http(s) link or a Stallyard path beginning with /" });
+      }
+    }
+
+    const result = await pool.query(
+      `INSERT INTO homepage_ads (slot, image_url, link_url, updated_at, updated_by)
+       VALUES ($1, $2, $3, NOW(), $4)
+       ON CONFLICT (slot) DO UPDATE SET
+         image_url = EXCLUDED.image_url,
+         link_url = EXCLUDED.link_url,
+         updated_at = NOW(),
+         updated_by = EXCLUDED.updated_by
+       RETURNING slot, image_url, link_url, updated_at`,
+      [slot, imageUrl, linkUrl, req.user.id]
+    );
+    logAdminAction(req.user.id, "homepage_ad_updated", `Updated homepage ad slot #${slot}`);
+    res.json({ ad: result.rows[0] });
   } catch (err) {
     sendInternalError(res, err);
   }
