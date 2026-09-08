@@ -1210,6 +1210,9 @@ const SCHEMA_MIGRATIONS = [
     `UPDATE payment_attempts SET currency = 'NGN' WHERE currency IS NULL OR UPPER(currency) <> 'NGN'`,
     `ALTER TABLE listings DROP COLUMN IF EXISTS ships_to_usa`,
   ] },
+  { version: 42, name: "canonical-active-listing-status", statements: [
+    `UPDATE listings SET status = 'active' WHERE status = 'approved'`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -3015,6 +3018,10 @@ app.post("/listings", authenticate, rejectAdminMarketplaceUse, requireNigeriaMar
       return res.status(403).json({ error: "Your seller account must be approved before you can list items." });
     }
 
+    // "active" is the one canonical live listing status across browse, checkout, and moderation.
+    // Approved sellers may create a draft or publish live; legacy client value "approved" is treated as live.
+    const listingStatus = status === "draft" ? "draft" : "active";
+
     const result = await pool.query(
       `INSERT INTO listings (
          owner_id, title, description, price, category, condition, shipping_fee,
@@ -3027,7 +3034,7 @@ app.post("/listings", authenticate, rejectAdminMarketplaceUse, requireNigeriaMar
       [
         ownerId, title, description || "", price, category || "Other", condition || "New", shippingFee || 0,
         emoji || "📦", fitMake || "", fitModel || "", fitYear || "", JSON.stringify(images || []),
-        listingType || "fixed", "NGN", status || "pending",
+        listingType || "fixed", "NGN", listingStatus,
         auctionEndTime ? new Date(auctionEndTime) : null,
         quantity === "" || quantity === undefined || quantity === null ? null : Number(quantity),
         sku || "", brand || "", state || "", JSON.stringify(shippingMethods || []),
@@ -3194,6 +3201,13 @@ app.patch("/listings/:id", authenticate, async (req, res) => {
         const raw = req.body[key];
         if (key === "quantity") {
           values.push(raw === "" || raw === undefined || raw === null ? null : Number(raw));
+        } else if (key === "status") {
+          const normalizedStatus = raw === "approved" ? "active" : raw;
+          const allowedStatuses = new Set(["draft", "pending", "active", "paused", "sold", "rejected", "removed"]);
+          if (!allowedStatuses.has(normalizedStatus)) {
+            return res.status(400).json({ error: "Invalid listing status" });
+          }
+          values.push(normalizedStatus);
         } else {
           values.push(LISTING_JSON_FIELDS.has(key) ? JSON.stringify(raw) : raw);
         }
@@ -3424,7 +3438,7 @@ app.post("/checkout", authenticate, rejectAdminMarketplaceUse, requireNigeriaMar
       }
 
       const listingResult = await client.query(
-        "SELECT * FROM listings WHERE id = $1 AND status = 'approved' FOR UPDATE",
+        "SELECT * FROM listings WHERE id = $1 AND status = 'active' FOR UPDATE",
         [cartItem.listingId]
       );
       if (listingResult.rows.length === 0) {
@@ -3529,7 +3543,7 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
     for (const cartItem of cartItems) {
       const qty = Number(cartItem.qty);
       const listingResult = await client.query(
-        "SELECT * FROM listings WHERE id = $1 AND status = 'approved' FOR UPDATE",
+        "SELECT * FROM listings WHERE id = $1 AND status = 'active' FOR UPDATE",
         [cartItem.listingId]
       );
       if (listingResult.rows.length === 0) {
@@ -3655,7 +3669,7 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, requir
         return res.status(400).json({ error: "Each cart item needs a valid listingId and a positive quantity" });
       }
       const listingResult = await pool.query(
-        "SELECT * FROM listings WHERE id = $1 AND status = 'approved'",
+        "SELECT * FROM listings WHERE id = $1 AND status = 'active'",
         [cartItem.listingId]
       );
       if (listingResult.rows.length === 0) {
@@ -3759,7 +3773,7 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
         return res.status(400).json({ error: "Each cart item needs a valid listingId and a positive quantity" });
       }
       const listingResult = await pool.query(
-        "SELECT * FROM listings WHERE id = $1 AND status = 'approved'",
+        "SELECT * FROM listings WHERE id = $1 AND status = 'active'",
         [cartItem.listingId]
       );
       if (listingResult.rows.length === 0) {
