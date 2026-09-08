@@ -4,6 +4,7 @@ const bcrypt = require("bcrypt");
 const fetch = require("node-fetch");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
 
 const app = express();
 
@@ -230,6 +231,13 @@ function logAdminAction(adminId, action, details) {
 
 const codeRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 8, message: "Too many attempts — please wait 15 minutes and try again." });
 
+// Security-sensitive one-time codes must use a cryptographically secure RNG.
+// randomInt is uniform over 100000-999999 and avoids Math.random(), which is
+// not suitable for authentication, password-reset, or payout-verification codes.
+function generateSecurityCode() {
+  return crypto.randomInt(100000, 1000000).toString();
+}
+
 function normalizePhoneForRateLimit(phone) {
   return String(phone || "").replace(/[^0-9]/g, "");
 }
@@ -405,7 +413,7 @@ app.post("/email-verify/send", codeRateLimit, async (req, res) => {
       return res.status(500).json({ error: "Email verification isn't configured yet" });
     }
 
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const code = generateSecurityCode();
     const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
 
     const resendRes = await fetch("https://api.resend.com/emails", {
@@ -469,7 +477,6 @@ const twoFactorEnableCodes = new Map();
 const totpVerifiedMarkers = new Map();
 const TOTP_VERIFIED_MARKER_TTL_MS = 10 * 60 * 1000;
 
-const crypto = require("crypto");
 const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
 function base32Encode(buffer) {
@@ -586,7 +593,7 @@ app.post("/password-reset/send", authRateLimit, async (req, res) => {
       return res.status(400).json({ error: "This account has no email on file — contact support to recover it" });
     }
 
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const code = generateSecurityCode();
     const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
     const resendRes = await fetch("https://api.resend.com/emails", {
       method: "POST",
@@ -1689,7 +1696,7 @@ app.post("/profile/two-factor/enable/send", authenticate, async (req, res) => {
     if (!process.env.RESEND_API_KEY) {
       return res.status(500).json({ error: "Two-factor isn't configured — contact support" });
     }
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const code = generateSecurityCode();
     const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
     const resendRes = await fetch("https://api.resend.com/emails", {
       method: "POST",
@@ -1810,7 +1817,7 @@ app.post("/admin/reauth/verify", authenticate, authRateLimit, async (req, res) =
     if (!process.env.RESEND_API_KEY) {
       return res.status(500).json({ error: "Email step isn't configured — contact support" });
     }
-    const emailCode = Math.floor(100000 + Math.random() * 900000).toString();
+    const emailCode = generateSecurityCode();
     const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
     const resendRes = await fetch("https://api.resend.com/emails", {
       method: "POST",
@@ -2222,7 +2229,7 @@ app.post("/admin/staff/:id/reset-password", authenticate, requirePermission("rol
       return res.status(400).json({ error: "This admin account has no email on file" });
     }
 
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const code = generateSecurityCode();
     const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
     const resendRes = await fetch("https://api.resend.com/emails", {
       method: "POST",
@@ -2674,7 +2681,7 @@ app.post("/login", authRateLimit, async (req, res) => {
       if (!process.env.RESEND_API_KEY) {
         return res.status(500).json({ error: "Two-factor login isn't configured yet" });
       }
-      const code = Math.floor(100000 + Math.random() * 900000).toString();
+      const code = generateSecurityCode();
       const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
       const resendRes = await fetch("https://api.resend.com/emails", {
         method: "POST",
@@ -2729,7 +2736,7 @@ app.post("/login/verify-2fa", authRateLimit, async (req, res) => {
       if (!process.env.RESEND_API_KEY) {
         return res.status(500).json({ error: "Email step isn't configured — contact support" });
       }
-      const emailCode = Math.floor(100000 + Math.random() * 900000).toString();
+      const emailCode = generateSecurityCode();
       const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
       const resendRes = await fetch("https://api.resend.com/emails", {
         method: "POST",
@@ -5283,7 +5290,7 @@ app.post("/sellers/bank-details", authenticate, async (req, res) => {
     if (!process.env.RESEND_API_KEY) {
       return res.status(500).json({ error: "Bank-change confirmation isn't configured yet" });
     }
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const code = generateSecurityCode();
     const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
     const resendRes = await fetch("https://api.resend.com/emails", {
       method: "POST",
