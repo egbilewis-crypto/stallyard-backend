@@ -82,7 +82,7 @@ async function authenticate(req, res, next) {
   if (!requester) return res.status(401).json({ error: "Sign in required" });
   try {
     const result = await pool.query(
-      "SELECT is_admin, is_suspended, token_version, admin_role, two_factor_enabled FROM users WHERE id = $1",
+      "SELECT is_admin, is_suspended, token_version, admin_role, two_factor_enabled, country FROM users WHERE id = $1",
       [requester.id]
     );
     if (result.rows.length === 0) {
@@ -100,6 +100,7 @@ async function authenticate(req, res, next) {
       isAdmin: !!result.rows[0].is_admin,
       adminRole: result.rows[0].admin_role || null,
       twoFactorEnabled: !!result.rows[0].two_factor_enabled,
+      country: result.rows[0].country || "",
     };
     next();
   } catch (err) {
@@ -124,6 +125,21 @@ function rejectAdminMarketplaceUse(req, res, next) {
     return res.status(403).json({
       error: "Admin accounts are staff-only and cannot use buyer or seller marketplace features.",
       code: "ADMIN_STAFF_ONLY",
+    });
+  }
+  next();
+}
+
+function isNigeriaCountry(value) {
+  return ["nigeria", "ng"].includes(String(value || "").trim().toLowerCase());
+}
+
+function requireNigeriaMarketplaceUser(req, res, next) {
+  if (req.user?.isAdmin) return next();
+  if (!isNigeriaCountry(req.user?.country)) {
+    return res.status(403).json({
+      error: "Stallyard marketplace transactions are available in Nigeria only. Complete your profile with Nigeria as your country of residence.",
+      code: "NIGERIA_ONLY",
     });
   }
   next();
@@ -666,7 +682,7 @@ const SCHEMA_MIGRATIONS = [
         ADD COLUMN IF NOT EXISTS fit_year TEXT DEFAULT '',
         ADD COLUMN IF NOT EXISTS images JSONB DEFAULT '[]'::jsonb,
         ADD COLUMN IF NOT EXISTS listing_type TEXT DEFAULT 'fixed',
-        ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'USD',
+        ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'NGN',
         ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending',
         ADD COLUMN IF NOT EXISTS is_featured BOOLEAN DEFAULT false,
         ADD COLUMN IF NOT EXISTS auction_end_time TIMESTAMP,
@@ -1187,6 +1203,13 @@ const SCHEMA_MIGRATIONS = [
     `CREATE INDEX IF NOT EXISTS idx_admin_notes_entity ON admin_notes(entity_type, entity_id, created_at DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_admin_notes_admin ON admin_notes(admin_id, created_at DESC)`,
   ] },
+  { version: 41, name: "nigeria-only-cleanup", statements: [
+    `ALTER TABLE listings ALTER COLUMN currency SET DEFAULT 'NGN'`,
+    `UPDATE listings SET currency = 'NGN' WHERE currency IS NULL OR UPPER(currency) <> 'NGN'`,
+    `UPDATE orders SET currency = 'NGN' WHERE currency IS NULL OR UPPER(currency) <> 'NGN'`,
+    `UPDATE payment_attempts SET currency = 'NGN' WHERE currency IS NULL OR UPPER(currency) <> 'NGN'`,
+    `ALTER TABLE listings DROP COLUMN IF EXISTS ships_to_usa`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -1312,10 +1335,9 @@ app.patch("/profile/complete", authenticate, async (req, res) => {
       idType, idCountry, licenseNumber, licensePhotos, idVerificationExempt,
     } = req.body;
 
-    const usAliases = ["united states", "united states of america", "usa", "us", "u.s.", "u.s.a."];
-    const isUS = usAliases.includes((country || "").trim().toLowerCase());
-    if (isUS) {
-      return res.status(403).json({ error: "US sign-ups are coming soon — Stallyard is Nigeria-only for now" });
+    const normalizedCountry = (country || "").trim().toLowerCase();
+    if (normalizedCountry && !isNigeriaCountry(normalizedCountry)) {
+      return res.status(403).json({ error: "Stallyard is available in Nigeria only" });
     }
 
     if (phone) {
@@ -1326,8 +1348,7 @@ app.patch("/profile/complete", authenticate, async (req, res) => {
     }
 
     const hasCore = firstName && lastName && country;
-    const skipId = isUS;
-    const hasId = skipId || !!idVerificationExempt || (idType && licenseNumber);
+    const hasId = !!idVerificationExempt || (idType && licenseNumber);
     const nowComplete = !!(hasCore && (accountType === "personal" || hasId));
 
     const result = await pool.query(
@@ -1445,6 +1466,9 @@ app.post("/addresses", authenticate, rejectAdminMarketplaceUse, async (req, res)
     if (!street || !city || !country) {
       return res.status(400).json({ error: "Street, city, and country are required" });
     }
+    if (!isNigeriaCountry(country)) {
+      return res.status(400).json({ error: "Stallyard shipping addresses must be in Nigeria" });
+    }
     const existingCount = await pool.query("SELECT COUNT(*) FROM user_addresses WHERE user_id = $1", [req.user.id]);
     const shouldBeDefault = !!isDefault || Number(existingCount.rows[0].count) === 0;
     if (shouldBeDefault) {
@@ -1470,6 +1494,10 @@ app.patch("/addresses/:id", authenticate, async (req, res) => {
     }
     const { label, street, city, state, zip, country } = req.body;
     const current = existing.rows[0];
+    const nextCountry = country ?? current.country;
+    if (!isNigeriaCountry(nextCountry)) {
+      return res.status(400).json({ error: "Stallyard shipping addresses must be in Nigeria" });
+    }
     const result = await pool.query(
       `UPDATE user_addresses SET label = $1, street = $2, city = $3, state = $4, zip = $5, country = $6
        WHERE id = $7 RETURNING *`,
@@ -1815,7 +1843,7 @@ app.patch("/profile/verify-phone", authenticate, async (req, res) => {
   }
 });
 
-app.post("/profile/apply-to-sell", authenticate, async (req, res) => {
+app.post("/profile/apply-to-sell", authenticate, requireNigeriaMarketplaceUser, async (req, res) => {
   try {
     const { bankStatementUrl } = req.body;
     const result = await pool.query(
@@ -2962,7 +2990,7 @@ app.post("/uploads/image", authenticate, async (req, res) => {
 // in GET /listings. Fetching them here and merging them into the response
 // keeps a freshly published listing consistent with what a page refresh
 // would show, instead of silently missing its owner until then.
-app.post("/listings", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+app.post("/listings", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, async (req, res) => {
   try {
     const {
       title, description, price, category, condition, shippingFee,
@@ -2999,7 +3027,7 @@ app.post("/listings", authenticate, rejectAdminMarketplaceUse, async (req, res) 
       [
         ownerId, title, description || "", price, category || "Other", condition || "New", shippingFee || 0,
         emoji || "📦", fitMake || "", fitModel || "", fitYear || "", JSON.stringify(images || []),
-        listingType || "fixed", currency || "NGN", status || "pending",
+        listingType || "fixed", "NGN", status || "pending",
         auctionEndTime ? new Date(auctionEndTime) : null,
         quantity === "" || quantity === undefined || quantity === null ? null : Number(quantity),
         sku || "", brand || "", state || "", JSON.stringify(shippingMethods || []),
@@ -3050,7 +3078,6 @@ function publicListingRow(row) {
     shipping_methods: row.shipping_methods,
     return_policy: row.return_policy,
     vin: row.vin,
-    ships_to_usa: row.ships_to_usa,
     seller_name: row.seller_name,
     owner_username: row.owner_username,
     created_at: row.created_at,
@@ -3372,10 +3399,13 @@ async function getTaxRate() {
   }
 }
 
-app.post("/checkout", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+app.post("/checkout", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, async (req, res) => {
   const client = await pool.connect();
   try {
     const { items, shippingAddress, currency } = req.body;
+    if (!isNigeriaCountry(shippingAddress?.country)) {
+      return res.status(400).json({ error: "Delivery is available to Nigerian addresses only" });
+    }
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "Cart is empty" });
     }
@@ -3426,7 +3456,7 @@ app.post("/checkout", authenticate, rejectAdminMarketplaceUse, async (req, res) 
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'held')
        RETURNING *`,
       [
-        req.user.id, req.user.username, total, currency || "NGN",
+        req.user.id, req.user.username, total, "NGN",
         JSON.stringify(shippingAddress || {}), subtotal, shippingTotal,
         commissionRate, commissionAmount,
       ]
@@ -3469,9 +3499,8 @@ app.post("/checkout", authenticate, rejectAdminMarketplaceUse, async (req, res) 
   }
 });
 
-function formatMoneyServer(amount, currency) {
-  const symbol = currency === "NGN" ? "₦" : "$";
-  return `${symbol}${Number(amount || 0).toFixed(2)}`;
+function formatMoneyServer(amount) {
+  return `₦${Number(amount || 0).toFixed(2)}`;
 }
 
 function generateDeliveryTokenValue() {
@@ -3530,7 +3559,7 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'held', $11, $12, $13, $14, $15)
        RETURNING *`,
       [
-        meta.buyerId, meta.buyerUsername, total, meta.currency || "NGN",
+        meta.buyerId, meta.buyerUsername, total, "NGN",
         JSON.stringify(meta.shippingAddress || {}), subtotal, shippingTotal,
         commissionRate, commissionAmount, taxAmount,
         reference, paystackData.channel || null, authorization.card_type || null,
@@ -3605,9 +3634,12 @@ async function recordPaymentAttempt(userId, { reference = null, method = "checko
   }
 }
 
-app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, async (req, res) => {
   try {
     const { items, shippingAddress, currency, saveCard } = req.body;
+    if (!isNigeriaCountry(shippingAddress?.country)) {
+      return res.status(400).json({ error: "Delivery is available to Nigerian addresses only" });
+    }
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "Cart is empty" });
     }
@@ -3654,24 +3686,24 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, async 
       body: JSON.stringify({
         email,
         amount: Math.round(total * 100),
-        currency: currency || "NGN",
+        currency: "NGN",
         callback_url: "https://stallyard.com/order-confirmation",
         metadata: {
           buyerId: req.user.id,
           buyerUsername: req.user.username,
           items: items.map((i) => ({ listingId: i.listingId, qty: Number(i.qty) })),
           shippingAddress: shippingAddress || {},
-          currency: currency || "NGN",
+          currency: "NGN",
           saveCard: !!saveCard,
         },
       }),
     });
     const paystackData = await paystackRes.json();
     if (!paystackData.status) {
-      await recordPaymentAttempt(req.user.id, { method: "checkout_initialize", status: "failed", amount: total, currency: currency || "NGN", message: paystackData.message || "Paystack error" });
+      await recordPaymentAttempt(req.user.id, { method: "checkout_initialize", status: "failed", amount: total, currency: "NGN", message: paystackData.message || "Paystack error" });
       return res.status(500).json({ error: paystackData.message || "Paystack error" });
     }
-    await recordPaymentAttempt(req.user.id, { reference: paystackData.data.reference, method: "checkout_initialize", status: "initialized", amount: total, currency: currency || "NGN" });
+    await recordPaymentAttempt(req.user.id, { reference: paystackData.data.reference, method: "checkout_initialize", status: "initialized", amount: total, currency: "NGN" });
     res.json({ authorizationUrl: paystackData.data.authorization_url, reference: paystackData.data.reference });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -3699,9 +3731,12 @@ app.get("/checkout/verify/:reference", authenticate, async (req, res) => {
   }
 });
 
-app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, async (req, res) => {
   try {
     const { items, shippingAddress, currency, cardId } = req.body;
+    if (!isNigeriaCountry(shippingAddress?.country)) {
+      return res.status(400).json({ error: "Delivery is available to Nigerian addresses only" });
+    }
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "Cart is empty" });
     }
@@ -3753,23 +3788,23 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
       body: JSON.stringify({
         email,
         amount: Math.round(total * 100),
-        currency: currency || "NGN",
+        currency: "NGN",
         authorization_code: authorizationCode,
         metadata: {
           buyerId: req.user.id,
           buyerUsername: req.user.username,
           items: items.map((i) => ({ listingId: i.listingId, qty: Number(i.qty) })),
           shippingAddress: shippingAddress || {},
-          currency: currency || "NGN",
+          currency: "NGN",
         },
       }),
     });
     const chargeData = await chargeRes.json();
     if (!chargeData.status || chargeData.data.status !== "success") {
-      await recordPaymentAttempt(req.user.id, { reference: chargeData.data?.reference || null, method: "saved_card", status: "failed", amount: total, currency: currency || "NGN", message: chargeData.data?.gateway_response || chargeData.message || "Payment failed" });
+      await recordPaymentAttempt(req.user.id, { reference: chargeData.data?.reference || null, method: "saved_card", status: "failed", amount: total, currency: "NGN", message: chargeData.data?.gateway_response || chargeData.message || "Payment failed" });
       return res.status(400).json({ error: chargeData.data?.gateway_response || chargeData.message || "Payment failed" });
     }
-    await recordPaymentAttempt(req.user.id, { reference: chargeData.data.reference, method: "saved_card", status: "success", amount: total, currency: currency || "NGN" });
+    await recordPaymentAttempt(req.user.id, { reference: chargeData.data.reference, method: "saved_card", status: "success", amount: total, currency: "NGN" });
     const { order } = await finalizeOrderFromPaystackCharge(chargeData.data.reference, chargeData.data);
     res.json({ order });
   } catch (err) {
@@ -4784,7 +4819,7 @@ app.post("/order-items/:id/redeem-delivery-token", authenticate, codeRateLimit, 
   }
 });
 
-app.post("/checkout/single-item-payment", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+app.post("/checkout/single-item-payment", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, async (req, res) => {
   try {
     const { listingId, email } = req.body;
 
@@ -5927,7 +5962,7 @@ app.get("/admin/reconciliation/orders/:id/verify-paystack", authenticate, requir
     const paystackAmount = Math.round((Number(tx.amount) || 0)) / 100;
     const expectedAmount = Math.round((Number(order.total) || 0) * 100) / 100;
     const amountMatches = Math.abs(paystackAmount - expectedAmount) <= 0.01;
-    const currencyMatches = String(tx.currency || "").toUpperCase() === String(order.currency || "NGN").toUpperCase();
+    const currencyMatches = String(tx.currency || "").toUpperCase() === "NGN";
     const paymentSucceeded = tx.status === "success";
     res.json({
       orderId: order.id,
@@ -5935,7 +5970,7 @@ app.get("/admin/reconciliation/orders/:id/verify-paystack", authenticate, requir
       checkedAt: new Date().toISOString(),
       matches: amountMatches && currencyMatches && paymentSucceeded,
       checks: { amountMatches, currencyMatches, paymentSucceeded },
-      stallyard: { amount: expectedAmount, currency: order.currency || "NGN", paymentStatus: order.payment_status },
+      stallyard: { amount: expectedAmount, currency: "NGN", paymentStatus: order.payment_status },
       paystack: { amount: paystackAmount, currency: tx.currency || null, status: tx.status || null, paidAt: tx.paid_at || null, channel: tx.channel || null },
     });
   } catch (err) {
@@ -6900,3 +6935,6 @@ async function startServer() {
 }
 
 startServer();
+    if (!isNigeriaCountry(shippingAddress?.country)) {
+      return res.status(400).json({ error: "Delivery is available to Nigerian addresses only" });
+    }
