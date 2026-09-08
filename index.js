@@ -399,6 +399,211 @@ function generateCheckoutReference() {
   return `STL-${Date.now()}-${crypto.randomBytes(12).toString("hex")}`;
 }
 
+function formatMoneyServer(amount) {
+  return `₦${Number(amount || 0).toFixed(2)}`;
+}
+
+function generateDeliveryTokenValue() {
+  // Cryptographically strong 10-digit delivery code generated once payment succeeds.
+  return crypto.randomInt(1000000000, 10000000000).toString();
+}
+
+async function createCheckoutIntent({ reference, buyerId, buyerUsername, buyerEmail, amountKobo, items, shippingAddress, saveCard = false }) {
+  await pool.query(
+    `INSERT INTO checkout_intents (
+       reference, buyer_id, buyer_username, buyer_email, amount_kobo, currency,
+       items, shipping_address, save_card, status
+     ) VALUES ($1, $2, $3, $4, $5, 'NGN', $6, $7, $8, 'initialized')`,
+    [
+      reference, Number(buyerId), String(buyerUsername), String(buyerEmail).trim().toLowerCase(),
+      Number(amountKobo), JSON.stringify(items || []), JSON.stringify(shippingAddress || {}), !!saveCard,
+    ]
+  );
+}
+
+async function loadCheckoutIntent(reference, client = pool) {
+  const result = await client.query("SELECT * FROM checkout_intents WHERE reference = $1", [reference]);
+  return result.rows[0] || null;
+}
+
+function assertPaystackMatchesCheckoutIntent(intent, paystackData) {
+  if (!intent) throw new Error("Payment integrity check failed: checkout intent not found");
+  if (!paystackData || paystackData.status !== "success") {
+    throw new Error("Payment integrity check failed: Paystack transaction is not successful");
+  }
+
+  const actualReference = String(paystackData.reference || "");
+  if (actualReference !== String(intent.reference)) {
+    throw new Error("Payment integrity check failed: transaction reference does not match");
+  }
+
+  const actualAmountKobo = Number(paystackData.amount);
+  if (!Number.isSafeInteger(actualAmountKobo) || actualAmountKobo !== Number(intent.amount_kobo)) {
+    throw new Error("Payment integrity check failed: amount paid does not match the checkout total");
+  }
+
+  const actualCurrency = String(paystackData.currency || "").toUpperCase();
+  if (actualCurrency !== "NGN" || actualCurrency !== String(intent.currency || "").toUpperCase()) {
+    throw new Error("Payment integrity check failed: currency does not match NGN checkout");
+  }
+
+  const actualEmail = String(paystackData.customer?.email || "").trim().toLowerCase();
+  const expectedEmail = String(intent.buyer_email || "").trim().toLowerCase();
+  if (!actualEmail || actualEmail !== expectedEmail) {
+    throw new Error("Payment integrity check failed: Paystack customer does not match the buyer");
+  }
+
+  const metadataBuyerId = Number(paystackData.metadata?.buyerId);
+  if (paystackData.metadata?.buyerId != null && metadataBuyerId !== Number(intent.buyer_id)) {
+    throw new Error("Payment integrity check failed: payment metadata buyer does not match");
+  }
+}
+
+async function markCheckoutIntent(reference, status, failureReason = null, client = pool) {
+  await client.query(
+    `UPDATE checkout_intents
+     SET status = $1, failure_reason = $2, finalized_at = CASE WHEN $1 = 'finalized' THEN NOW() ELSE finalized_at END
+     WHERE reference = $3`,
+    [status, failureReason ? String(failureReason).slice(0, 1000) : null, reference]
+  );
+}
+
+async function finalizeOrderFromPaystackCharge(reference, paystackData) {
+  const existing = await pool.query("SELECT * FROM orders WHERE paystack_reference = $1", [reference]);
+  if (existing.rows.length) {
+    const itemsResult = await pool.query("SELECT * FROM order_items WHERE order_id = $1 ORDER BY id ASC", [existing.rows[0].id]);
+    return { order: existing.rows[0], items: itemsResult.rows, alreadyFinalized: true };
+  }
+
+  const intent = await loadCheckoutIntent(reference);
+  assertPaystackMatchesCheckoutIntent(intent, paystackData);
+  const cartItems = Array.isArray(intent.items) ? intent.items : [];
+  if (!cartItems.length) throw new Error("Payment integrity check failed: checkout intent has no items");
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    let subtotal = 0;
+    let shippingTotal = 0;
+    const resolvedItems = [];
+    for (const cartItem of cartItems) {
+      const qty = Number(cartItem.qty);
+      const listingResult = await client.query(
+        "SELECT * FROM listings WHERE id = $1 AND status = 'active' FOR UPDATE",
+        [cartItem.listingId]
+      );
+      if (listingResult.rows.length === 0) {
+        throw new Error(`Paid listing ${cartItem.listingId} is no longer available — payment requires manual review`);
+      }
+      const listing = listingResult.rows[0];
+      const price = Number(cartItem.unitPrice);
+      const shippingFee = Number(cartItem.shippingFee) || 0;
+      if (!(price > 0)) throw new Error("Payment integrity check failed: invalid item price snapshot");
+      subtotal += price * qty;
+      shippingTotal += shippingFee * qty;
+      resolvedItems.push({ listing, qty, price, shippingFee });
+    }
+
+    const commissionRate = await getCommissionRate();
+    const commissionAmount = Math.round(subtotal * commissionRate * 100) / 100;
+    const taxRate = await getTaxRate();
+    const taxAmount = Math.round(subtotal * taxRate * 100) / 100;
+    const total = Math.round((subtotal + shippingTotal + taxAmount) * 100) / 100;
+    const recomputedAmountKobo = Math.round(total * 100);
+    if (recomputedAmountKobo !== Number(intent.amount_kobo)) {
+      throw new Error("Payment integrity check failed: stored checkout total no longer matches item snapshot");
+    }
+    const authorization = paystackData.authorization || {};
+
+    const orderResult = await client.query(
+      `INSERT INTO orders (
+         buyer_id, buyer_username, total, currency, shipping_address, subtotal,
+         shipping_total, commission_rate, commission_amount, tax_amount, payment_status,
+         paystack_reference, payment_channel, payment_card_type, payment_bank, payment_last4
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'held', $11, $12, $13, $14, $15)
+       RETURNING *`,
+      [
+        intent.buyer_id, intent.buyer_username, total, "NGN",
+        JSON.stringify(intent.shipping_address || {}), subtotal, shippingTotal,
+        commissionRate, commissionAmount, taxAmount,
+        reference, paystackData.channel || null, authorization.card_type || null,
+        authorization.bank || null, authorization.last4 || null,
+      ]
+    );
+    const order = orderResult.rows[0];
+
+    const insertedItems = [];
+    for (const { listing, qty, price, shippingFee } of resolvedItems) {
+      const sellerResult = await client.query("SELECT username, display_name FROM users WHERE id = $1", [listing.owner_id]);
+      const seller = sellerResult.rows[0];
+      const itemResult = await client.query(
+        `INSERT INTO order_items (
+           order_id, listing_id, title, emoji, price, qty, shipping_fee,
+           seller_id, seller_username, seller_name, fulfillment_status,
+           delivery_token, delivery_token_generated_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'new', $11, NOW())
+         RETURNING *`,
+        [
+          order.id, listing.id, listing.title, listing.emoji, price, qty, shippingFee,
+          listing.owner_id, seller?.username, seller?.display_name, generateDeliveryTokenValue(),
+        ]
+      );
+      insertedItems.push(itemResult.rows[0]);
+      await client.query("UPDATE listings SET status = 'sold' WHERE id = $1", [listing.id]);
+      createNotification(
+        listing.owner_id,
+        "sale",
+        `New sale: ${listing.title} (${qty}x) — ${formatMoneyServer(price * qty, order.currency)}. Payment is held until delivery is confirmed.`
+      );
+    }
+
+    await client.query("COMMIT");
+
+    await markCheckoutIntent(reference, "finalized", null);
+
+    if (intent.save_card && authorization.reusable && authorization.authorization_code) {
+      try {
+        await pool.query(
+          `INSERT INTO saved_cards (user_id, authorization_code, authorization_code_hash, card_type, last4, bank, exp_month, exp_year, is_default)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+             NOT EXISTS (SELECT 1 FROM saved_cards WHERE user_id = $1))
+           ON CONFLICT (user_id, authorization_code_hash) DO NOTHING`,
+          [
+            intent.buyer_id, encryptField(authorization.authorization_code), hashField(authorization.authorization_code),
+            authorization.card_type || null, authorization.last4 || null, authorization.bank || null,
+            authorization.exp_month || null, authorization.exp_year || null,
+          ]
+        );
+      } catch (err) {
+        console.error("Couldn't save card for future checkout:", err.message);
+      }
+    }
+    return { order: { ...order, items: insertedItems }, items: insertedItems, alreadyFinalized: false };
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function recordPaymentAttempt(userId, { reference = null, method = "checkout", status, amount = 0, currency = "NGN", message = "" }) {
+  try {
+    await pool.query(
+      `INSERT INTO payment_attempts (user_id, reference, method, status, amount, currency, message)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [userId, reference, method, status, amount, currency, String(message || "").slice(0, 1000)]
+    );
+  } catch (err) {
+    // The buyer-risk migration may not have been run yet; checkout must never fail because telemetry failed.
+    if (err.code !== "42P01") console.error("Couldn't record payment attempt:", err.message);
+  }
+}
+
+
 function normalizePhoneForRateLimit(phone) {
   return String(phone || "").replace(/[^0-9]/g, "");
 }
