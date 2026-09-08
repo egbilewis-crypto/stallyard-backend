@@ -451,8 +451,8 @@ function generateDeliveryTokenValue() {
   return crypto.randomInt(1000000000, 10000000000).toString();
 }
 
-async function createCheckoutIntent({ reference, buyerId, buyerUsername, buyerEmail, amountKobo, items, shippingAddress, saveCard = false }) {
-  await pool.query(
+async function createCheckoutIntent({ reference, buyerId, buyerUsername, buyerEmail, amountKobo, items, shippingAddress, saveCard = false }, client = pool) {
+  await client.query(
     `INSERT INTO checkout_intents (
        reference, buyer_id, buyer_username, buyer_email, amount_kobo, currency,
        items, shipping_address, save_card, status
@@ -462,6 +462,77 @@ async function createCheckoutIntent({ reference, buyerId, buyerUsername, buyerEm
       Number(amountKobo), JSON.stringify(items || []), JSON.stringify(shippingAddress || {}), !!saveCard,
     ]
   );
+}
+
+const CHECKOUT_RESERVATION_MINUTES = 15;
+
+async function reserveCheckoutListings(client, { buyerId, reference, items }) {
+  const listingIds = [...new Set((items || []).map((item) => Number(item.listingId)))].filter(Number.isInteger).sort((a, b) => a - b);
+  if (!listingIds.length) throw new Error("Checkout has no valid listings to reserve");
+
+  for (const listingId of listingIds) {
+    // Lock the listing row so two checkout transactions cannot reserve it simultaneously.
+    const listingResult = await client.query(
+      "SELECT id, status FROM listings WHERE id = $1 FOR UPDATE",
+      [listingId]
+    );
+    if (!listingResult.rows.length || listingResult.rows[0].status !== "active") {
+      const err = new Error(`Listing ${listingId} isn't available`);
+      err.code = "LISTING_UNAVAILABLE";
+      throw err;
+    }
+
+    // Expired reservations never block a new buyer.
+    await client.query(
+      "DELETE FROM listing_checkout_reservations WHERE listing_id = $1 AND expires_at <= NOW()",
+      [listingId]
+    );
+
+    const existing = await client.query(
+      "SELECT buyer_id, reference, expires_at FROM listing_checkout_reservations WHERE listing_id = $1 FOR UPDATE",
+      [listingId]
+    );
+    if (existing.rows.length) {
+      const err = new Error("One or more items are temporarily reserved by another checkout. Please try again shortly.");
+      err.code = "LISTING_RESERVED";
+      err.listingId = listingId;
+      throw err;
+    }
+
+    await client.query(
+      `INSERT INTO listing_checkout_reservations (listing_id, buyer_id, reference, expires_at)
+       VALUES ($1, $2, $3, NOW() + ($4 * INTERVAL '1 minute'))`,
+      [listingId, Number(buyerId), reference, CHECKOUT_RESERVATION_MINUTES]
+    );
+  }
+}
+
+async function releaseCheckoutReservations(reference, client = pool) {
+  await client.query("DELETE FROM listing_checkout_reservations WHERE reference = $1", [reference]);
+}
+
+async function assertCheckoutReservationsOwned(client, intent) {
+  const listingIds = [...new Set((Array.isArray(intent.items) ? intent.items : []).map((item) => Number(item.listingId)))].filter(Number.isInteger).sort((a, b) => a - b);
+  if (!listingIds.length) throw new Error("Payment integrity check failed: checkout intent has no reservable listings");
+
+  const reservations = await client.query(
+    `SELECT listing_id, buyer_id, reference, expires_at
+     FROM listing_checkout_reservations
+     WHERE listing_id = ANY($1::int[])
+     FOR UPDATE`,
+    [listingIds]
+  );
+  const byListing = new Map(reservations.rows.map((row) => [Number(row.listing_id), row]));
+
+  for (const listingId of listingIds) {
+    const reservation = byListing.get(listingId);
+    if (!reservation || String(reservation.reference) !== String(intent.reference) || Number(reservation.buyer_id) !== Number(intent.buyer_id)) {
+      throw new Error(`Paid listing ${listingId} is no longer reserved for this checkout — payment requires manual review`);
+    }
+    if (new Date(reservation.expires_at).getTime() <= Date.now()) {
+      throw new Error(`Paid listing ${listingId} reservation expired — payment requires manual review`);
+    }
+  }
 }
 
 async function loadCheckoutIntent(reference, client = pool) {
@@ -526,6 +597,7 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    await assertCheckoutReservationsOwned(client, intent);
 
     let subtotal = 0;
     let shippingTotal = 0;
@@ -603,6 +675,7 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
       );
     }
 
+    await releaseCheckoutReservations(reference, client);
     await client.query("COMMIT");
 
     await markCheckoutIntent(reference, "finalized", null);
@@ -1746,6 +1819,19 @@ const SCHEMA_MIGRATIONS = [
     `,
     `CREATE INDEX IF NOT EXISTS idx_checkout_intents_buyer ON checkout_intents(buyer_id, created_at DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_checkout_intents_status ON checkout_intents(status, created_at DESC)`,
+  ] },
+  { version: 44, name: "checkout-listing-reservations", statements: [
+    `
+      CREATE TABLE IF NOT EXISTS listing_checkout_reservations (
+        listing_id INTEGER PRIMARY KEY REFERENCES listings(id) ON DELETE CASCADE,
+        buyer_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        reference TEXT NOT NULL REFERENCES checkout_intents(reference) ON DELETE CASCADE,
+        expires_at TIMESTAMP NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `,
+    `CREATE INDEX IF NOT EXISTS idx_listing_checkout_reservations_reference ON listing_checkout_reservations(reference)`,
+    `CREATE INDEX IF NOT EXISTS idx_listing_checkout_reservations_expires ON listing_checkout_reservations(expires_at)`,
   ] },
 ];
 
@@ -4048,10 +4134,27 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, requir
 
     const reference = generateCheckoutReference();
     const amountKobo = Math.round(total * 100);
-    await createCheckoutIntent({
-      reference, buyerId: req.user.id, buyerUsername: req.user.username, buyerEmail: email,
-      amountKobo, items: itemSnapshots, shippingAddress, saveCard: !!saveCard,
-    });
+    const reservationClient = await pool.connect();
+    try {
+      await reservationClient.query("BEGIN");
+      await createCheckoutIntent({
+        reference, buyerId: req.user.id, buyerUsername: req.user.username, buyerEmail: email,
+        amountKobo, items: itemSnapshots, shippingAddress, saveCard: !!saveCard,
+      }, reservationClient);
+      await reserveCheckoutListings(reservationClient, { buyerId: req.user.id, reference, items: itemSnapshots });
+      await reservationClient.query("COMMIT");
+    } catch (reservationErr) {
+      await reservationClient.query("ROLLBACK");
+      if (reservationErr.code === "LISTING_RESERVED") {
+        return res.status(409).json({ error: reservationErr.message, code: "LISTING_RESERVED" });
+      }
+      if (reservationErr.code === "LISTING_UNAVAILABLE") {
+        return res.status(409).json({ error: reservationErr.message, code: "LISTING_UNAVAILABLE" });
+      }
+      throw reservationErr;
+    } finally {
+      reservationClient.release();
+    }
 
     const paystackRes = await fetch("https://api.paystack.co/transaction/initialize", {
       method: "POST",
@@ -4078,11 +4181,13 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, requir
     const paystackData = await paystackRes.json();
     if (!paystackData.status) {
       await markCheckoutIntent(reference, "failed", paystackData.message || "Paystack initialization failed");
+      await releaseCheckoutReservations(reference);
       await recordPaymentAttempt(req.user.id, { reference, method: "checkout_initialize", status: "failed", amount: total, currency: "NGN", message: paystackData.message || "Paystack error" });
       return res.status(500).json({ error: paystackData.message || "Paystack error" });
     }
     if (String(paystackData.data?.reference || "") !== reference) {
       await markCheckoutIntent(reference, "failed", "Paystack returned a different reference");
+      await releaseCheckoutReservations(reference);
       return res.status(502).json({ error: "Payment initialization integrity check failed — please try again" });
     }
     await recordPaymentAttempt(req.user.id, { reference, method: "checkout_initialize", status: "initialized", amount: total, currency: "NGN" });
@@ -4177,10 +4282,27 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
 
     const reference = generateCheckoutReference();
     const amountKobo = Math.round(total * 100);
-    await createCheckoutIntent({
-      reference, buyerId: req.user.id, buyerUsername: req.user.username, buyerEmail: email,
-      amountKobo, items: itemSnapshots, shippingAddress, saveCard: false,
-    });
+    const reservationClient = await pool.connect();
+    try {
+      await reservationClient.query("BEGIN");
+      await createCheckoutIntent({
+        reference, buyerId: req.user.id, buyerUsername: req.user.username, buyerEmail: email,
+        amountKobo, items: itemSnapshots, shippingAddress, saveCard: false,
+      }, reservationClient);
+      await reserveCheckoutListings(reservationClient, { buyerId: req.user.id, reference, items: itemSnapshots });
+      await reservationClient.query("COMMIT");
+    } catch (reservationErr) {
+      await reservationClient.query("ROLLBACK");
+      if (reservationErr.code === "LISTING_RESERVED") {
+        return res.status(409).json({ error: reservationErr.message, code: "LISTING_RESERVED" });
+      }
+      if (reservationErr.code === "LISTING_UNAVAILABLE") {
+        return res.status(409).json({ error: reservationErr.message, code: "LISTING_UNAVAILABLE" });
+      }
+      throw reservationErr;
+    } finally {
+      reservationClient.release();
+    }
 
     const chargeRes = await fetch("https://api.paystack.co/transaction/charge_authorization", {
       method: "POST",
@@ -4206,6 +4328,7 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
     const chargeData = await chargeRes.json();
     if (!chargeData.status || chargeData.data.status !== "success") {
       await markCheckoutIntent(reference, "failed", chargeData.data?.gateway_response || chargeData.message || "Payment failed");
+      await releaseCheckoutReservations(reference);
       await recordPaymentAttempt(req.user.id, { reference, method: "saved_card", status: "failed", amount: total, currency: "NGN", message: chargeData.data?.gateway_response || chargeData.message || "Payment failed" });
       return res.status(400).json({ error: chargeData.data?.gateway_response || chargeData.message || "Payment failed" });
     }
