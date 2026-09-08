@@ -187,7 +187,7 @@ function getClientIp(req) {
   return req.ip;
 }
 
-function rateLimit({ windowMs, max, message }) {
+function rateLimit({ windowMs, max, message, keyFn }) {
   const hits = new Map();
   setInterval(() => {
     const cutoff = Date.now() - windowMs;
@@ -196,7 +196,7 @@ function rateLimit({ windowMs, max, message }) {
     }
   }, Math.max(windowMs, 60000)).unref();
   return (req, res, next) => {
-    const key = getClientIp(req) || "unknown";
+    const key = keyFn ? keyFn(req) : (getClientIp(req) || "unknown");
     const now = Date.now();
     const entry = hits.get(key);
     if (!entry || now - entry.start > windowMs) {
@@ -229,6 +229,31 @@ function logAdminAction(adminId, action, details) {
 }
 
 const codeRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 8, message: "Too many attempts — please wait 15 minutes and try again." });
+
+function normalizePhoneForRateLimit(phone) {
+  return String(phone || "").replace(/[^0-9]/g, "");
+}
+
+// SMS is a paid, abuse-sensitive channel, so protect it twice:
+// 1) per IP, which limits one client from spraying many numbers; and
+// 2) per phone number, which prevents repeatedly charging Stallyard to SMS the same person.
+const smsSendIpRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: "Too many SMS code requests from this connection — wait 15 minutes and try again.",
+});
+const smsSendPhoneRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 3,
+  message: "Too many SMS codes were requested for this phone number — wait 15 minutes and try again.",
+  keyFn: (req) => `phone:${normalizePhoneForRateLimit(req.body?.phone) || "missing"}`,
+});
+const smsCheckRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  message: "Too many verification attempts — wait 15 minutes and request a new code.",
+  keyFn: (req) => `${getClientIp(req) || "unknown"}:phone:${normalizePhoneForRateLimit(req.body?.phone) || "missing"}`,
+});
 
 async function isVpnOrProxy(ip) {
   if (!ip || ip === "::1" || ip === "127.0.0.1") return false;
@@ -292,7 +317,7 @@ const TERMII_PIN_TTL_MS = 10 * 60 * 1000;
 const verifiedPhones = new Map();
 const PHONE_VERIFIED_TTL_MS = 30 * 60 * 1000;
 
-app.post("/phone-verify/send", async (req, res) => {
+app.post("/phone-verify/send", smsSendIpRateLimit, smsSendPhoneRateLimit, async (req, res) => {
   try {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ error: "Missing phone number" });
@@ -329,7 +354,7 @@ app.post("/phone-verify/send", async (req, res) => {
   }
 });
 
-app.post("/phone-verify/check", async (req, res) => {
+app.post("/phone-verify/check", smsCheckRateLimit, async (req, res) => {
   try {
     const { phone, code } = req.body;
     if (!phone || !code) return res.status(400).json({ error: "Missing phone number or code" });
