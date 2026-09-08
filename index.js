@@ -3020,7 +3020,95 @@ app.post("/listings", authenticate, rejectAdminMarketplaceUse, async (req, res) 
   }
 });
 
+function publicListingRow(row) {
+  const hidden = Array.isArray(row.hidden_image_urls) ? row.hidden_image_urls : [];
+  const images = (Array.isArray(row.images) ? row.images : []).filter((url) => !hidden.includes(url));
+  return {
+    id: row.id,
+    owner_id: row.owner_id,
+    title: row.title,
+    description: row.description,
+    price: row.price,
+    category: row.category,
+    condition: row.condition,
+    shipping_fee: row.shipping_fee,
+    emoji: row.emoji,
+    fit_make: row.fit_make,
+    fit_model: row.fit_model,
+    fit_year: row.fit_year,
+    images,
+    listing_type: row.listing_type,
+    currency: row.currency,
+    status: row.status,
+    is_featured: row.is_featured,
+    auction_end_time: row.auction_end_time,
+    highest_bidder_username: null,
+    quantity: row.quantity,
+    sku: row.sku,
+    brand: row.brand,
+    state: row.state,
+    shipping_methods: row.shipping_methods,
+    return_policy: row.return_policy,
+    vin: row.vin,
+    ships_to_usa: row.ships_to_usa,
+    seller_name: row.seller_name,
+    owner_username: row.owner_username,
+    created_at: row.created_at,
+  };
+}
+
+// Public listing discovery is enforced here on the server. Anonymous callers
+// only receive active listings belonging to approved, unsuspended sellers.
+// A signed-in marketplace user additionally receives their own listings in all
+// statuses so drafts/pending items still appear in My Stall. Moderation-only
+// fields are never exposed for somebody else's listing.
 app.get("/listings", async (req, res) => {
+  try {
+    let validUserId = null;
+    const requester = getRequester(req);
+    if (requester) {
+      const session = await pool.query(
+        `SELECT id, is_suspended, token_version
+         FROM users WHERE id = $1`,
+        [requester.id]
+      );
+      if (session.rows.length && !session.rows[0].is_suspended) {
+        const currentVersion = session.rows[0].token_version || 0;
+        if ((requester.tokenVersion || 0) === currentVersion) validUserId = session.rows[0].id;
+      }
+    }
+
+    const result = await pool.query(
+      `SELECT listings.*, users.display_name AS seller_name, users.username AS owner_username,
+              users.is_approved AS seller_is_approved, users.is_suspended AS seller_is_suspended
+       FROM listings
+       JOIN users ON listings.owner_id = users.id
+       WHERE (
+         listings.status = 'active'
+         AND users.is_approved = true
+         AND users.is_suspended = false
+       )
+       OR ($1::integer IS NOT NULL AND listings.owner_id = $1)
+       ORDER BY listings.created_at DESC`,
+      [validUserId]
+    );
+
+    const rows = result.rows.map((row) => {
+      if (validUserId && row.owner_id === validUserId) {
+        const { seller_is_approved, seller_is_suspended, ...ownRow } = row;
+        return ownRow;
+      }
+      return publicListingRow(row);
+    });
+    res.json({ listings: rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Staff moderation gets a separate protected endpoint. This keeps drafts,
+// rejected/removed listings and moderation metadata out of the public API.
+app.get("/admin/listings", authenticate, requirePermission("listing_moderation"), async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT listings.*, users.display_name AS seller_name, users.username AS owner_username
