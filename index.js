@@ -3589,13 +3589,14 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
       const itemResult = await client.query(
         `INSERT INTO order_items (
            order_id, listing_id, title, emoji, price, qty, shipping_fee,
-           seller_id, seller_username, seller_name, fulfillment_status
+           seller_id, seller_username, seller_name, fulfillment_status,
+           delivery_token, delivery_token_generated_at
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'new')
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'new', $11, NOW())
          RETURNING *`,
         [
           order.id, listing.id, listing.title, listing.emoji, price, qty, shippingFee,
-          listing.owner_id, seller?.username, seller?.display_name,
+          listing.owner_id, seller?.username, seller?.display_name, generateDeliveryTokenValue(),
         ]
       );
       insertedItems.push(itemResult.rows[0]);
@@ -6915,6 +6916,30 @@ app.patch("/notifications/mark-all-read", authenticate, async (req, res) => {
   }
 });
 
+async function backfillMissingDeliveryTokens() {
+  // Orders finalized before automatic token creation may be missing the buyer's
+  // delivery code. Only backfill still-held, unconfirmed paid orders.
+  const result = await pool.query(
+    `SELECT oi.id
+     FROM order_items oi
+     JOIN orders o ON o.id = oi.order_id
+     WHERE o.payment_status = 'held'
+       AND oi.buyer_confirmed_at IS NULL
+       AND (oi.delivery_token IS NULL OR oi.delivery_token = '')`
+  );
+  for (const row of result.rows) {
+    await pool.query(
+      `UPDATE order_items
+       SET delivery_token = $1, delivery_token_generated_at = NOW()
+       WHERE id = $2 AND (delivery_token IS NULL OR delivery_token = '')`,
+      [generateDeliveryTokenValue(), row.id]
+    );
+  }
+  if (result.rows.length) {
+    console.log(`Backfilled delivery tokens for ${result.rows.length} held order item(s).`);
+  }
+}
+
 async function sendShipReminders() {
   try {
     const result = await pool.query(
@@ -6936,6 +6961,7 @@ const PORT = process.env.PORT || 3000;
 async function startServer() {
   try {
     await applyPendingMigrations();
+    await backfillMissingDeliveryTokens();
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
       setInterval(sendShipReminders, 60 * 60 * 1000).unref();
