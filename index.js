@@ -191,7 +191,7 @@ function setAuthCookie(res, user, options = {}) {
     "Path=/",
     "HttpOnly",
     production ? "Secure" : "",
-    production ? "SameSite=None" : "SameSite=Lax",
+    "SameSite=Lax",
   ].filter(Boolean);
   // Marketplace sessions persist for 30 days. Admin cookies remain browser-session
   // cookies, while the backend independently enforces a 30-minute privileged
@@ -207,7 +207,7 @@ function clearAuthCookie(res) {
     "Path=/",
     "HttpOnly",
     production ? "Secure" : "",
-    production ? "SameSite=None" : "SameSite=Lax",
+    "SameSite=Lax",
     "Max-Age=0",
   ].filter(Boolean);
   res.setHeader("Set-Cookie", parts.join("; "));
@@ -4554,7 +4554,7 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, requir
   }
 });
 
-app.get("/checkout/verify/:reference", authenticate, async (req, res) => {
+app.post("/checkout/verify/:reference", authenticate, async (req, res) => {
   try {
     if (!process.env.PAYSTACK_SECRET_KEY) {
       return res.status(500).json({ error: "Payments aren't configured — contact support" });
