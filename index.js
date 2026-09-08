@@ -5187,22 +5187,67 @@ async function verifyAndSaveBankDetails(userId, bankCode, accountNumber) {
 
 app.post("/sellers/bank-details", authenticate, async (req, res) => {
   try {
-    const { userId, bankCode, accountNumber } = req.body;
+    const { userId, bankCode, accountNumber, adminOverrideReason } = req.body;
 
     if (!userId || !bankCode || !accountNumber) {
       return res.status(400).json({ error: "Missing userId, bankCode, or accountNumber" });
     }
-    if (req.user.id !== Number(userId) && !req.user.isAdmin) {
-      return res.status(403).json({ error: "You can only set your own bank details" });
+
+    const targetUserId = Number(userId);
+    if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
+      return res.status(400).json({ error: "Invalid seller userId" });
     }
 
-    const existing = await pool.query("SELECT account_number, email FROM users WHERE id = $1", [userId]);
+    const isOwnBankAccount = req.user.id === targetUserId;
+    const isAdminOverride = !isOwnBankAccount;
+
+    // Changing where ANOTHER seller's payout money goes is a finance action.
+    // Do not treat every admin as trusted for this: listing moderators,
+    // seller-verification staff, support staff, etc. must never be able to
+    // redirect a seller's payouts.
+    if (isAdminOverride && !hasPermission(req.user, "finance")) {
+      return res.status(403).json({ error: "Finance Admin or Super Admin access is required to change another seller's bank details" });
+    }
+
+    if (isAdminOverride && String(adminOverrideReason || "").trim().length < 10) {
+      return res.status(400).json({ error: "Enter an admin override reason of at least 10 characters" });
+    }
+
+    const existing = await pool.query(
+      "SELECT account_number, email, username, display_name, is_admin, is_approved FROM users WHERE id = $1",
+      [targetUserId]
+    );
     if (existing.rows.length === 0) return res.status(404).json({ error: "User not found" });
+
+    // Admin override is only for marketplace sellers, never another staff
+    // account. Staff/admin identities are deliberately separated from seller
+    // identities in Stallyard.
+    if (isAdminOverride && existing.rows[0].is_admin) {
+      return res.status(400).json({ error: "Admin/staff accounts cannot receive seller payout bank overrides" });
+    }
+    if (isAdminOverride && !existing.rows[0].is_approved) {
+      return res.status(400).json({ error: "Bank overrides are only available for approved sellers" });
+    }
+
     const hadAccountBefore = !!existing.rows[0].account_number;
 
-    if (!hadAccountBefore || (req.user.isAdmin && req.user.id !== Number(userId))) {
-      const result = await verifyAndSaveBankDetails(userId, bankCode, accountNumber);
+    if (!hadAccountBefore || isAdminOverride) {
+      const result = await verifyAndSaveBankDetails(targetUserId, bankCode, accountNumber);
       if (result.error) return res.status(result.status).json({ error: result.error });
+
+      if (isAdminOverride) {
+        logAdminAction(
+          req.user.id,
+          "seller_bank_details_overridden",
+          `Changed payout bank details for seller ${existing.rows[0].username}; reason: ${String(adminOverrideReason).trim()}`
+        );
+        await createNotification(
+          targetUserId,
+          "bank_details_changed",
+          "Your Stallyard payout bank details were changed by an authorized finance administrator. If you did not expect this, contact Stallyard support immediately."
+        );
+      }
+
       return res.json({ success: true, recipientCode: result.recipientCode });
     }
 
