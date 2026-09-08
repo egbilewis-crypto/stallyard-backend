@@ -8,6 +8,18 @@ const crypto = require("crypto");
 
 const app = express();
 
+// Production-safe internal error handling. Full technical details remain in
+// Railway logs, while users receive only a branded-safe generic message.
+function sendInternalError(res, err, context = "request") {
+  const errorId = crypto.randomUUID();
+  console.error(`[${errorId}] ${context}:`, err?.stack || err?.message || err);
+  return res.status(500).json({
+    error: "Something went wrong. Please try again in a moment.",
+    code: "INTERNAL_ERROR",
+    errorId,
+  });
+}
+
 // Production security gate: never bring Stallyard online with missing or obviously
 // unsafe secrets. Optional integrations (Termii, Sightengine, IPQS) remain
 // health-checked separately and do not block startup.
@@ -272,7 +284,7 @@ async function authenticate(req, res, next) {
     }
     next();
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 }
 
@@ -900,7 +912,7 @@ app.post("/phone-verify/send", smsSendIpRateLimit, smsSendPhoneRateLimit, async 
     await setSecurityState("phone-otp", phone, { pinId: data.pinId }, TERMII_PIN_TTL_MS);
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -937,7 +949,7 @@ app.post("/phone-verify/check", smsCheckRateLimit, async (req, res) => {
     }
     res.json({ valid });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -976,7 +988,7 @@ app.post("/email-verify/send", codeRateLimit, async (req, res) => {
     await setSecurityState("email-otp", email.toLowerCase(), { code }, EMAIL_CODE_TTL_MS);
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -996,7 +1008,7 @@ app.post("/email-verify/check", codeRateLimit, async (req, res) => {
     }
     res.json({ valid });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -1460,7 +1472,7 @@ app.post("/password-reset/send", authRateLimit, async (req, res) => {
     const maskedEmail = email.replace(/^(.{1,2}).*(@.*)$/, (m, a, b) => `${a}***${b}`);
     res.json({ ...genericResponse, maskedEmail });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -1497,7 +1509,7 @@ app.post("/password-reset/verify-code", codeRateLimit, async (req, res) => {
     );
     res.json({ resetToken });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -1540,7 +1552,7 @@ app.post("/password-reset/confirm", authRateLimit, async (req, res) => {
     clearAuthCookie(res);
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -1549,11 +1561,16 @@ app.get("/", (req, res) => {
 });
 
 app.get("/db-check", async (req, res) => {
+  // Do not expose database diagnostics publicly in production. The protected
+  // Admin System Health page is the supported production diagnostic surface.
+  if (process.env.NODE_ENV === "production") {
+    return res.status(404).json({ error: "Not found" });
+  }
   try {
-    const result = await pool.query("SELECT NOW()");
-    res.send(`Database connected! Server time: ${result.rows[0].now}`);
+    await pool.query("SELECT 1");
+    res.json({ ok: true, database: "connected" });
   } catch (err) {
-    res.status(500).send(`Database connection failed: ${err.message}`);
+    sendInternalError(res, err, "development database check");
   }
 });
 
@@ -2251,7 +2268,7 @@ app.get("/admin/schema-status", authenticate, requirePermission("role_assignment
       pending,
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2299,7 +2316,7 @@ app.post("/signup", authRateLimit, async (req, res) => {
     if (err.code === "23505") {
       return res.status(409).json({ error: "Username or email already in use" });
     }
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2359,7 +2376,7 @@ app.patch("/profile/complete", authenticate, async (req, res) => {
     if (err.code === "23505") {
       return res.status(409).json({ error: "That phone number is already in use" });
     }
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2378,7 +2395,7 @@ app.patch("/profile/store", authenticate, async (req, res) => {
     if (!result.rows.length) return res.status(404).json({ error: "User not found" });
     res.json({ user: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2406,7 +2423,7 @@ app.patch("/profile/change-password", authenticate, authRateLimit, async (req, r
     setAuthCookie(res, updated.rows[0], req.user.isAdmin ? { adminVerifiedAt: req.user.adminVerifiedAt } : {});
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2421,7 +2438,7 @@ app.post("/profile/sign-out-other-devices", authenticate, async (req, res) => {
     setAuthCookie(res, result.rows[0], req.user.isAdmin ? { adminVerifiedAt: req.user.adminVerifiedAt } : {});
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2433,7 +2450,7 @@ app.get("/addresses", authenticate, rejectAdminMarketplaceUse, async (req, res) 
     );
     res.json(result.rows);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2458,7 +2475,7 @@ app.post("/addresses", authenticate, rejectAdminMarketplaceUse, async (req, res)
     );
     res.json(result.rows[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2490,7 +2507,7 @@ app.patch("/addresses/:id", authenticate, async (req, res) => {
     );
     res.json(result.rows[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2508,7 +2525,7 @@ app.patch("/addresses/:id/default", authenticate, async (req, res) => {
     );
     res.json(result.rows[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2531,7 +2548,7 @@ app.delete("/addresses/:id", authenticate, async (req, res) => {
     }
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2543,7 +2560,7 @@ app.get("/saved-cards", authenticate, rejectAdminMarketplaceUse, async (req, res
     );
     res.json(result.rows);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2558,7 +2575,7 @@ app.patch("/saved-cards/:id/default", authenticate, async (req, res) => {
     const result = await pool.query("UPDATE saved_cards SET is_default = true WHERE id = $1 RETURNING *", [req.params.id]);
     res.json(result.rows[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2581,7 +2598,7 @@ app.delete("/saved-cards/:id", authenticate, async (req, res) => {
     }
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2601,7 +2618,7 @@ app.patch("/profile/two-factor", authenticate, async (req, res) => {
     if (!result.rows.length) return res.status(404).json({ error: "Account not found" });
     res.json({ twoFactorEnabled: result.rows[0].two_factor_enabled });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2635,7 +2652,7 @@ app.post("/profile/two-factor/enable/send", authenticate, async (req, res) => {
     await setSecurityState("2fa-enable", req.user.id, { code }, TWO_FACTOR_CODE_TTL_MS);
     res.json({ sent: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2660,7 +2677,7 @@ app.post("/profile/two-factor/enable/verify", authenticate, async (req, res) => 
     if (!result.rows.length) return res.status(404).json({ error: "Account not found" });
     res.json({ twoFactorEnabled: result.rows[0].two_factor_enabled });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2675,7 +2692,7 @@ app.post("/admin/totp/setup", authenticate, async (req, res) => {
     const qrCodeUrl = makeLocalTotpQrDataUrl(otpauthUrl);
     res.json({ secret, otpauthUrl, qrCodeUrl });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2696,7 +2713,7 @@ app.post("/admin/totp/confirm", authenticate, async (req, res) => {
     );
     res.json({ twoFactorEnabled: updated.rows[0].two_factor_enabled });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2718,7 +2735,7 @@ app.post("/admin/reauth", authenticate, authRateLimit, async (req, res) => {
     }
     res.json({ twoFactorRequired: true, method: "totp" });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2757,7 +2774,7 @@ app.post("/admin/reauth/verify", authenticate, authRateLimit, async (req, res) =
     await setSecurityState("totp-verified", req.user.id, { verified: true }, TOTP_VERIFIED_MARKER_TTL_MS);
     res.json({ emailStepRequired: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2791,7 +2808,7 @@ app.post("/admin/reauth/verify-email", authenticate, authRateLimit, async (req, 
     logAdminAction(req.user.id, "admin_reauth_completed", "Completed password + authenticator + email re-authentication; refreshed the server-enforced 30-minute admin session");
     res.json({ success: true, adminSessionExpiresInMs: ADMIN_SERVER_SESSION_MS });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2810,7 +2827,7 @@ app.patch("/profile/verify-email", authenticate, async (req, res) => {
     await pool.query("UPDATE users SET is_email_verified = true WHERE id = $1", [req.user.id]);
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2826,7 +2843,7 @@ app.patch("/profile/verify-phone", authenticate, async (req, res) => {
     await pool.query("UPDATE users SET phone = $1, is_phone_verified = true WHERE id = $2", [phone, req.user.id]);
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2846,7 +2863,7 @@ app.post("/profile/apply-to-sell", authenticate, requireNigeriaMarketplaceUser, 
     if (!result.rows.length) return res.status(404).json({ error: "User not found" });
     res.json({ user: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2939,7 +2956,7 @@ app.patch("/users/:id/verify", authenticate, requirePermission("user_management"
     logAdminAction(req.user.id, "user_verified", `${isVerified ? "Verified" : "Unverified"} ${result.rows[0].username}`);
     res.json({ user: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -2954,7 +2971,7 @@ app.patch("/users/:id/suspend", authenticate, requirePermission("user_management
     logAdminAction(req.user.id, "user_suspended", `${isSuspended ? "Suspended" : "Unsuspended"} ${result.rows[0].username}`);
     res.json({ user: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3002,7 +3019,7 @@ app.patch("/users/:id/admin-role", authenticate, requirePermission("role_assignm
     res.json({ user: result.rows[0] });
   } catch (err) {
     try { await client.query("ROLLBACK"); } catch {}
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   } finally {
     client.release();
   }
@@ -3038,7 +3055,7 @@ app.get("/admin/staff", authenticate, requirePermission("role_assignment"), asyn
     if (err.code === "42P01") {
       return res.status(409).json({ error: "Run the admin staff management migration first", code: "MIGRATION_REQUIRED" });
     }
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3058,7 +3075,7 @@ app.post("/admin/staff/:id/revoke-sessions", authenticate, requirePermission("ro
     logAdminAction(req.user.id, "admin_sessions_revoked", `Revoked all active sessions for admin ${result.rows[0].username}`);
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3128,7 +3145,7 @@ app.post("/admin/staff/:id/temporary-password", authenticate, requirePermission(
     if (err.code === "42703") {
       return res.status(409).json({ error: "Run the temporary admin password migration first", code: "MIGRATION_REQUIRED" });
     }
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3190,7 +3207,7 @@ app.post("/admin/staff/:id/reset-password", authenticate, requirePermission("rol
     res.json({ success: true, maskedEmail });
   } catch (err) {
     try { await client.query("ROLLBACK"); } catch {}
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   } finally {
     client.release();
   }
@@ -3231,7 +3248,7 @@ app.get("/admin-notes/:entityType/:entityId", authenticate, requireAdminNotesAcc
     );
     res.json({ notes: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3257,7 +3274,7 @@ app.post("/admin-notes/:entityType/:entityId", authenticate, requireAdminNotesAc
     logAdminAction(req.user.id, "admin_note_added", `Added private note to ${req.params.entityType} #${entityId}`);
     res.status(201).json({ note });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3271,7 +3288,7 @@ app.get("/admin-audit-log", authenticate, requirePermission("role_assignment"), 
     );
     res.json({ log: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3286,7 +3303,7 @@ app.patch("/users/:id/approve", authenticate, requirePermission("seller_verifica
     logAdminAction(req.user.id, "seller_approved", `Approved ${result.rows[0].username}'s seller application`);
     res.json({ user: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3307,7 +3324,7 @@ app.patch("/users/:id/reject", authenticate, requirePermission("seller_verificat
     );
     res.json({ user: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3325,7 +3342,7 @@ app.delete("/users/:id", authenticate, requirePermission("user_management"), asy
         code: "HAS_HISTORY",
       });
     }
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3363,7 +3380,7 @@ app.post("/admin/create-member", authenticate, requirePermission("user_managemen
     if (err.code === "23505") {
       return res.status(409).json({ error: "Username, email, or phone already in use" });
     }
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3372,7 +3389,7 @@ app.get("/follows", async (req, res) => {
     const result = await pool.query("SELECT follower_username, followed_username FROM follows");
     res.json({ follows: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3391,7 +3408,7 @@ app.post("/follows", authenticate, rejectAdminMarketplaceUse, async (req, res) =
     );
     res.status(201).json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3408,7 +3425,7 @@ app.delete("/follows", authenticate, rejectAdminMarketplaceUse, async (req, res)
     );
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3420,7 +3437,7 @@ app.get("/cart", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
     );
     res.json({ items: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3444,7 +3461,7 @@ app.put("/cart", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     await client.query("ROLLBACK");
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   } finally {
     client.release();
   }
@@ -3458,7 +3475,7 @@ app.get("/watchlist", authenticate, rejectAdminMarketplaceUse, async (req, res) 
     );
     res.json({ listingIds: result.rows.map((r) => r.listing_id) });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3479,7 +3496,7 @@ app.put("/watchlist", authenticate, rejectAdminMarketplaceUse, async (req, res) 
     res.json({ success: true });
   } catch (err) {
     await client.query("ROLLBACK");
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   } finally {
     client.release();
   }
@@ -3557,7 +3574,7 @@ app.post("/admin/login", authRateLimit, async (req, res) => {
     // (step 2), then sends the email code required for step 3.
     res.json({ twoFactorRequired: true, userId: user.id, method: "totp" });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3578,7 +3595,7 @@ app.get("/session/me", authenticate, async (req, res) => {
     }
     res.json({ user: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3667,7 +3684,7 @@ app.post("/login", authRateLimit, async (req, res) => {
     setAuthCookie(res, user);
     res.json({ user });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3732,7 +3749,7 @@ app.post("/login/verify-2fa", authRateLimit, async (req, res) => {
     setAuthCookie(res, user);
     res.json({ user });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3812,7 +3829,7 @@ app.post("/login/verify-2fa-email", authRateLimit, async (req, res) => {
     setAuthCookie(res, sessionUser, { adminVerifiedAt: Date.now() });
     res.json({ user: sessionUser, adminSessionExpiresInMs: ADMIN_SERVER_SESSION_MS });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3877,7 +3894,7 @@ app.post("/admin/temporary-password/complete", authRateLimit, async (req, res) =
     if (err.code === "42703") {
       return res.status(409).json({ error: "Run the temporary admin password migration first", code: "MIGRATION_REQUIRED" });
     }
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -3999,7 +4016,7 @@ app.post("/uploads/image", authenticate, imageUploadIpBurstRateLimit, imageUploa
       publicId: objectPath, // compatibility with the existing frontend response shape
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -4068,7 +4085,7 @@ app.post("/listings", authenticate, rejectAdminMarketplaceUse, requireNigeriaMar
     res.status(201).json({ listing: listingWithOwner });
     moderateListingImagesAsync(result.rows[0].id, images);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -4153,7 +4170,7 @@ app.get("/listings", async (req, res) => {
     });
     res.json({ listings: rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -4169,7 +4186,7 @@ app.get("/admin/listings", authenticate, requirePermission("listing_moderation")
     );
     res.json({ listings: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -4251,7 +4268,7 @@ app.patch("/listings/:id", authenticate, async (req, res) => {
       moderateListingImagesAsync(result.rows[0].id, req.body.images);
     }
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -4272,7 +4289,7 @@ app.patch("/listings/:id/dismiss-flag", authenticate, async (req, res) => {
     logAdminAction(req.user.id, "listing_image_flag_dismissed", `Dismissed an image moderation flag on listing #${req.params.id}`);
     res.json({ listing: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -4314,7 +4331,7 @@ app.patch("/listings/:id/image-visibility", authenticate, async (req, res) => {
     }
     res.json({ listing: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -4332,7 +4349,7 @@ app.delete("/listings/:id", authenticate, async (req, res) => {
     }
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -4342,7 +4359,7 @@ app.delete("/listings/by-owner/:ownerId", authenticate, requirePermission("user_
     logAdminAction(req.user.id, "seller_listings_removed", `Removed ${removed.rowCount} listing${removed.rowCount === 1 ? "" : "s"} belonging to user #${req.params.ownerId}`);
     res.json({ success: true, removedCount: removed.rowCount });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -4356,7 +4373,7 @@ app.get("/settings", async (req, res) => {
       authImage: row.auth_image || "",
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -4408,7 +4425,7 @@ app.patch("/settings", authenticate, async (req, res) => {
       authImage: result.rows[0].auth_image || "",
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -4544,7 +4561,7 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, requir
     await recordPaymentAttempt(req.user.id, { reference, method: "checkout_initialize", status: "initialized", amount: total, currency: "NGN" });
     res.json({ authorizationUrl: paystackData.data.authorization_url, reference });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -4576,7 +4593,7 @@ app.post("/checkout/verify/:reference", authenticate, async (req, res) => {
     const { order } = await finalizeOrderFromPaystackCharge(req.params.reference, verifyData.data);
     res.json({ order });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -4694,7 +4711,7 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
     const { order } = await finalizeOrderFromPaystackCharge(reference, chargeData.data);
     res.json({ order });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -4727,7 +4744,7 @@ app.get("/orders/mine", authenticate, rejectAdminMarketplaceUse, async (req, res
     const orders = await fetchOrdersWithItems("buyer_id = $1", [req.user.id], { includeDeliveryTokens: true });
     res.json({ orders });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -4739,7 +4756,7 @@ app.get("/orders/selling", authenticate, rejectAdminMarketplaceUse, async (req, 
     );
     res.json({ orders });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -4748,7 +4765,7 @@ app.get("/orders", authenticate, requirePermission("order_access"), async (req, 
     const orders = await fetchOrdersWithItems("TRUE", []);
     res.json({ orders });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -4896,7 +4913,7 @@ app.patch("/orders/:id/release", authenticate, requirePermission("finance"), asy
     });
   } catch (err) {
     try { await client.query("ROLLBACK"); } catch {}
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   } finally {
     client.release();
   }
@@ -5028,7 +5045,7 @@ app.patch("/orders/:id/refund", authenticate, requirePermission("finance"), asyn
     res.json({ order: updated.rows[0], paystackMessage: paystackData.message || "Refund queued" });
   } catch (err) {
     try { await client.query("ROLLBACK"); } catch {}
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   } finally {
     client.release();
   }
@@ -5184,7 +5201,7 @@ app.patch("/orders/:id/refund/partial", authenticate, requirePermission("finance
     res.json({ order: updated.rows[0], paystackMessage: paystackData.message || "Partial refund queued" });
   } catch (err) {
     try { await client.query("ROLLBACK"); } catch {}
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   } finally {
     client.release();
   }
@@ -5273,7 +5290,7 @@ app.patch("/orders/:id/dispute", authenticate, async (req, res) => {
     res.json({ order: result.rows[0], dispute });
   } catch (err) {
     try { await client.query("ROLLBACK"); } catch {}
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   } finally {
     client.release();
   }
@@ -5305,7 +5322,7 @@ app.get("/disputes", authenticate, requirePermission("dispute_resolution"), asyn
     `);
     res.json({ disputes: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -5321,7 +5338,7 @@ app.get("/disputes/mine", authenticate, async (req, res) => {
     `, [req.user.id]);
     res.json({ disputes: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -5349,7 +5366,7 @@ app.post("/disputes/:id/statement", authenticate, async (req, res) => {
     );
     res.json({ dispute: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -5446,7 +5463,7 @@ app.patch("/disputes/:id", authenticate, requirePermission("dispute_resolution")
     res.json({ dispute: result.rows[0] });
   } catch (err) {
     try { await client.query("ROLLBACK"); } catch {}
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   } finally {
     client.release();
   }
@@ -5499,7 +5516,7 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
     }
     res.json({ item: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -5575,7 +5592,7 @@ app.post("/order-items/:id/request-return", authenticate, async (req, res) => {
     createNotification(item.seller_id, "return_opened", `Return requested for "${item.title}" — ${reason}`);
     res.json({ item: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -5606,7 +5623,7 @@ app.patch("/order-items/:id/return-response", authenticate, async (req, res) => 
     }
     res.json({ item: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -5634,7 +5651,7 @@ app.patch("/order-items/:id/return-tracking", authenticate, async (req, res) => 
     );
     res.json({ item: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -5664,7 +5681,7 @@ app.post("/order-items/:id/generate-delivery-token", authenticate, async (req, r
     );
     res.json({ token });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -5705,7 +5722,7 @@ app.post("/order-items/:id/redeem-delivery-token", authenticate, codeRateLimit, 
     const { item: updatedItem, order } = await markItemReceivedAndMaybeRelease(req.params.id);
     res.json({ item: updatedItem, order });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -5846,7 +5863,7 @@ app.get("/paystack/banks", authenticate, async (req, res) => {
     }
     res.json({ banks: banksData.data.map((b) => ({ name: b.name, code: b.code })) });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -5993,7 +6010,7 @@ app.post(
     }, BANK_CHANGE_CODE_TTL_MS);
     res.json({ confirmationRequired: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -6039,7 +6056,7 @@ app.post(
     if (result.error) return res.status(result.status).json({ error: result.error });
     res.json({ success: true, recipientCode: result.recipientCode });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -6088,7 +6105,7 @@ app.post("/sellers/payout", authenticate, requirePermission("finance"), async (r
     logAdminAction(req.user.id, "manual_payout", `Manually paid out $${amount} to user #${userId}${reason ? ` (${reason})` : ""}`);
     res.json({ success: true, transfer: transferData.data });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -6178,7 +6195,7 @@ app.post("/withdrawals", authenticate, rejectAdminMarketplaceUse, async (req, re
     }
   } catch (err) {
     await client.query("ROLLBACK");
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   } finally {
     client.release();
   }
@@ -6192,7 +6209,7 @@ app.get("/withdrawals/mine", authenticate, rejectAdminMarketplaceUse, async (req
     );
     res.json({ withdrawals: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -6201,7 +6218,7 @@ app.get("/withdrawals", authenticate, requirePermission("finance"), async (req, 
     const result = await pool.query("SELECT * FROM withdrawals ORDER BY requested_at DESC");
     res.json({ withdrawals: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -6354,7 +6371,7 @@ app.get("/admin/buyer-risk", authenticate, requirePermission("user_management"),
       },
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -6527,7 +6544,7 @@ app.get("/admin/seller-performance", authenticate, requirePermission("seller_ver
       sellers,
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -6723,7 +6740,7 @@ app.get("/admin/reports/:type", authenticate, async (req, res) => {
     logAdminAction(req.user.id, "report_generated", `${type} report${req.query.from || req.query.to ? ` (${req.query.from || 'start'} to ${req.query.to || 'now'})` : ''}`);
     res.json({ type, generatedAt: new Date().toISOString(), from: req.query.from || null, to: req.query.to || null, columns, rows, summary });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -6877,7 +6894,7 @@ app.get("/admin/reconciliation", authenticate, requirePermission("finance"), asy
       records,
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -6903,7 +6920,8 @@ app.get("/admin/reconciliation/orders/:id/verify-paystack", authenticate, requir
     });
     const data = await paystackRes.json();
     if (!paystackRes.ok || !data.status) {
-      return res.status(502).json({ error: data.message || "Couldn't verify this transaction with Paystack" });
+      console.error("Paystack transaction verification failed:", data?.message || data);
+      return res.status(502).json({ error: "Something went wrong. Please try again in a moment.", code: "PAYMENT_PROVIDER_ERROR" });
     }
     const tx = data.data || {};
     const paystackAmount = Math.round((Number(tx.amount) || 0)) / 100;
@@ -6921,7 +6939,7 @@ app.get("/admin/reconciliation/orders/:id/verify-paystack", authenticate, requir
       paystack: { amount: paystackAmount, currency: tx.currency || null, status: tx.status || null, paidAt: tx.paid_at || null, channel: tx.channel || null },
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -6930,7 +6948,7 @@ app.get("/wallet/balance", authenticate, async (req, res) => {
     const available = await computeAvailableBalance(pool, req.user.id);
     res.json({ available });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -6961,7 +6979,7 @@ app.post("/threads", authenticate, rejectAdminMarketplaceUse, async (req, res) =
 
     res.status(201).json({ thread: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -6976,7 +6994,7 @@ app.get("/threads/:userId", authenticate, rejectAdminMarketplaceUse, async (req,
     );
     res.json({ threads: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7020,7 +7038,7 @@ app.post("/messages", authenticate, rejectAdminMarketplaceUse, async (req, res) 
       console.error("Failed to notify about new message:", notifyErr.message);
     }
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7054,7 +7072,7 @@ app.get("/messages/:threadId", authenticate, async (req, res) => {
     );
     res.json({ messages: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7086,7 +7104,7 @@ app.patch("/messages/:id/offer", authenticate, async (req, res) => {
     );
     res.json({ message: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7109,7 +7127,7 @@ app.post("/messages/:id/report", authenticate, async (req, res) => {
     );
     res.status(201).json({ report: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7131,7 +7149,7 @@ app.get("/message-reports", authenticate, requirePermission("dispute_resolution"
     );
     res.json({ reports: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7145,7 +7163,7 @@ app.patch("/message-reports/:id/resolve", authenticate, requirePermission("dispu
     logAdminAction(req.user.id, "message_report_resolved", `Resolved message report #${req.params.id}`);
     res.json({ report: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7154,7 +7172,7 @@ app.get("/reviews", async (req, res) => {
     const result = await pool.query("SELECT * FROM reviews ORDER BY created_at DESC");
     res.json({ reviews: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7196,7 +7214,7 @@ app.post("/reviews", authenticate, async (req, res) => {
 
     res.status(201).json({ review: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7217,7 +7235,7 @@ app.patch("/reviews/:id", authenticate, async (req, res) => {
     );
     res.json({ review: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7229,7 +7247,7 @@ app.get("/listings/:id/reviews", async (req, res) => {
     );
     res.json({ reviews: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7241,7 +7259,7 @@ app.get("/sellers/:id/reviews", async (req, res) => {
     );
     res.json({ reviews: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7262,7 +7280,7 @@ app.patch("/reviews/:id/respond", authenticate, async (req, res) => {
     );
     res.json({ review: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7277,7 +7295,7 @@ app.post("/reviews/:id/report", authenticate, async (req, res) => {
     );
     res.status(201).json({ report: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7298,7 +7316,7 @@ app.get("/review-reports", authenticate, requirePermission("dispute_resolution")
     );
     res.json({ reports: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7312,7 +7330,7 @@ app.patch("/review-reports/:id/resolve", authenticate, requirePermission("disput
     logAdminAction(req.user.id, "review_report_resolved", `Resolved review report #${req.params.id}`);
     res.json({ report: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7328,7 +7346,7 @@ app.post("/account-reports", authenticate, async (req, res) => {
     );
     res.status(201).json({ report: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7342,7 +7360,7 @@ app.get("/account-reports", authenticate, requirePermission("user_management"), 
     );
     res.json({ reports: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7356,7 +7374,7 @@ app.patch("/account-reports/:id/resolve", authenticate, requirePermission("user_
     logAdminAction(req.user.id, "account_report_resolved", `Resolved account report #${req.params.id}`);
     res.json({ report: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7373,7 +7391,7 @@ app.post("/users/:id/warnings", authenticate, requirePermission("user_management
     logAdminAction(req.user.id, "warning_issued", `Issued a warning to user #${req.params.id}: ${message.trim()}`);
     res.status(201).json({ warning: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7385,7 +7403,7 @@ app.get("/users/:id/warnings", authenticate, requirePermission("user_management"
     );
     res.json({ warnings: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7397,7 +7415,7 @@ app.get("/warnings/mine", authenticate, async (req, res) => {
     );
     res.json({ warnings: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7411,7 +7429,7 @@ app.get("/sellers/:username/completed-sales-count", async (req, res) => {
     );
     res.json({ count: Number(result.rows[0].count) });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7423,7 +7441,7 @@ app.get("/login-history/mine", authenticate, async (req, res) => {
     );
     res.json({ history: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7436,7 +7454,7 @@ app.get("/content", async (req, res) => {
     ]);
     res.json({ banners: banners.rows, articles: articles.rows, faqs: faqs.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7452,7 +7470,7 @@ app.post("/content/banners", authenticate, requirePermission("content_management
     logAdminAction(req.user.id, "banner_created", `Created banner #${result.rows[0].id}`);
     res.status(201).json({ banner: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7475,7 +7493,7 @@ app.patch("/content/banners/:id", authenticate, requirePermission("content_manag
     logAdminAction(req.user.id, "banner_updated", `Updated banner #${req.params.id} (${Object.keys(req.body || {}).join(", ")})`);
     res.json({ banner: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7485,7 +7503,7 @@ app.delete("/content/banners/:id", authenticate, requirePermission("content_mana
     logAdminAction(req.user.id, "banner_removed", `Removed banner #${req.params.id}`);
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7500,7 +7518,7 @@ app.post("/content/articles", authenticate, requirePermission("content_managemen
     logAdminAction(req.user.id, "article_created", `Created help article #${result.rows[0].id}: ${result.rows[0].title}`);
     res.status(201).json({ article: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7516,7 +7534,7 @@ app.patch("/content/articles/:id", authenticate, requirePermission("content_mana
     logAdminAction(req.user.id, "article_updated", `Updated help article #${req.params.id}: ${result.rows[0].title}`);
     res.json({ article: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7526,7 +7544,7 @@ app.delete("/content/articles/:id", authenticate, requirePermission("content_man
     logAdminAction(req.user.id, "article_removed", `Removed help article #${req.params.id}`);
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7541,7 +7559,7 @@ app.post("/content/faqs", authenticate, requirePermission("content_management"),
     logAdminAction(req.user.id, "faq_created", `Created FAQ #${result.rows[0].id}`);
     res.status(201).json({ faq: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7557,7 +7575,7 @@ app.patch("/content/faqs/:id", authenticate, requirePermission("content_manageme
     logAdminAction(req.user.id, "faq_updated", `Updated FAQ #${req.params.id}`);
     res.json({ faq: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7567,7 +7585,7 @@ app.delete("/content/faqs/:id", authenticate, requirePermission("content_managem
     logAdminAction(req.user.id, "faq_removed", `Removed FAQ #${req.params.id}`);
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7576,7 +7594,7 @@ app.get("/policies", async (req, res) => {
     const result = await pool.query("SELECT * FROM marketplace_policies");
     res.json({ policies: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7599,7 +7617,7 @@ app.patch("/policies/:category", authenticate, requirePermission("content_manage
     logAdminAction(req.user.id, "policy_updated", `Updated the "${req.params.category}" policy`);
     res.json({ policy: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7620,7 +7638,7 @@ app.post("/support-tickets", authenticate, async (req, res) => {
     );
     res.status(201).json({ ticket, message: messageResult.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7632,7 +7650,7 @@ app.get("/support-tickets/mine", authenticate, async (req, res) => {
     );
     res.json({ tickets: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7645,7 +7663,7 @@ app.get("/support-tickets", authenticate, requirePermission("support_tickets"), 
     );
     res.json({ tickets: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7777,7 +7795,7 @@ async function requireTicketAccess(req, res, next) {
     }
     next();
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 }
 
@@ -7791,7 +7809,7 @@ app.get("/support-tickets/:id/messages", authenticate, requireTicketAccess, asyn
     );
     res.json({ messages: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7809,7 +7827,7 @@ app.post("/support-tickets/:id/messages", authenticate, requireTicketAccess, asy
     }
     res.status(201).json({ message: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7827,7 +7845,7 @@ app.patch("/support-tickets/:id/status", authenticate, requirePermission("suppor
     logAdminAction(req.user.id, "support_ticket_status_changed", `Changed support ticket #${req.params.id} to ${status}`);
     res.json({ ticket: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7839,7 +7857,7 @@ app.get("/notifications/mine", authenticate, async (req, res) => {
     );
     res.json({ notifications: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7852,7 +7870,7 @@ app.patch("/notifications/:id/read", authenticate, async (req, res) => {
     if (result.rows.length === 0) return res.status(404).json({ error: "Notification not found" });
     res.json({ notification: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7861,7 +7879,7 @@ app.patch("/notifications/mark-all-read", authenticate, async (req, res) => {
     await pool.query("UPDATE notifications SET read = true WHERE user_id = $1 AND read = false", [req.user.id]);
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -7905,6 +7923,13 @@ async function sendShipReminders() {
     console.error("Ship reminder check failed:", err.message);
   }
 }
+// Final Express safety net for unexpected middleware/route failures. Never send
+// stack traces, SQL text, or provider internals to the browser.
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  return sendInternalError(res, err, `${req.method} ${req.path}`);
+});
+
 const PORT = process.env.PORT || 3000;
 
 async function startServer() {
