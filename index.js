@@ -361,31 +361,57 @@ function getClientIp(req) {
   return req.ip;
 }
 
-function rateLimit({ windowMs, max, message, keyFn }) {
-  const hits = new Map();
-  setInterval(() => {
-    const cutoff = Date.now() - windowMs;
-    for (const [key, entry] of hits) {
-      if (entry.start < cutoff) hits.delete(key);
-    }
-  }, Math.max(windowMs, 60000)).unref();
-  return (req, res, next) => {
-    const key = keyFn ? keyFn(req) : (getClientIp(req) || "unknown");
-    const now = Date.now();
-    const entry = hits.get(key);
-    if (!entry || now - entry.start > windowMs) {
-      hits.set(key, { start: now, count: 1 });
+// PostgreSQL-backed rate limiter. Security limits survive Railway restarts and
+// are shared by every backend instance. Raw emails/phones/IP combinations are
+// never stored as rate-limit keys; only a SHA-256 digest is persisted.
+function rateLimit({ scope, windowMs, max, message, keyFn }) {
+  if (!scope) throw new Error("A persistent rate limiter requires a scope");
+  return async (req, res, next) => {
+    try {
+      const rawKey = keyFn ? keyFn(req) : (getClientIp(req) || "unknown");
+      const rateKey = crypto.createHash("sha256").update(`${scope}:${rawKey}`).digest("hex");
+      const result = await pool.query(
+        `INSERT INTO security_rate_limits (rate_key, scope, hit_count, window_started_at, expires_at)
+         VALUES ($1, $2, 1, NOW(), NOW() + ($3::bigint * INTERVAL '1 millisecond'))
+         ON CONFLICT (rate_key) DO UPDATE SET
+           hit_count = CASE
+             WHEN security_rate_limits.expires_at <= NOW() THEN 1
+             ELSE security_rate_limits.hit_count + 1
+           END,
+           window_started_at = CASE
+             WHEN security_rate_limits.expires_at <= NOW() THEN NOW()
+             ELSE security_rate_limits.window_started_at
+           END,
+           expires_at = CASE
+             WHEN security_rate_limits.expires_at <= NOW() THEN NOW() + ($3::bigint * INTERVAL '1 millisecond')
+             ELSE security_rate_limits.expires_at
+           END
+         RETURNING hit_count, expires_at`,
+        [rateKey, scope, windowMs]
+      );
+      const row = result.rows[0];
+      if (Number(row.hit_count) > max) {
+        const retryAfterSeconds = Math.max(1, Math.ceil((new Date(row.expires_at).getTime() - Date.now()) / 1000));
+        res.setHeader("Retry-After", String(retryAfterSeconds));
+        return res.status(429).json({
+          error: message || "Too many attempts — please wait a bit and try again.",
+          retryAfterSeconds,
+        });
+      }
+      // Opportunistic cleanup keeps the table compact without a separate worker.
+      if (crypto.randomInt(0, 100) === 0) {
+        pool.query("DELETE FROM security_rate_limits WHERE expires_at < NOW() - INTERVAL '1 day'")
+          .catch((err) => console.error("Rate-limit cleanup failed:", err.message));
+      }
       return next();
+    } catch (err) {
+      console.error(`Persistent rate limiter failed (${scope}):`, err.message);
+      return res.status(503).json({ error: "Security checks are temporarily unavailable — please try again shortly." });
     }
-    entry.count++;
-    if (entry.count > max) {
-      return res.status(429).json({ error: message || "Too many attempts — please wait a bit and try again." });
-    }
-    next();
   };
 }
 
-const authRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: "Too many attempts — please wait 15 minutes and try again." });
+const authRateLimit = rateLimit({ scope: "auth", windowMs: 15 * 60 * 1000, max: 10, message: "Too many attempts — please wait 15 minutes and try again." });
 
 async function createNotification(userId, type, message) {
   if (!userId) return;
@@ -402,24 +428,27 @@ function logAdminAction(adminId, action, details) {
     .catch((err) => console.error("Failed to write audit log:", err.message));
 }
 
-const codeRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 8, message: "Too many attempts — please wait 15 minutes and try again." });
+const codeRateLimit = rateLimit({ scope: "security-code", windowMs: 15 * 60 * 1000, max: 8, message: "Too many attempts — please wait 15 minutes and try again." });
 
 // Payout-bank changes are especially sensitive because they control where seller
 // money is sent. Protect both code issuance and verification independently from
 // the general authentication limiter.
 const bankChangeSendUserRateLimit = rateLimit({
+  scope: "bank-change-send-user",
   windowMs: 15 * 60 * 1000,
   max: 3,
   message: "Too many bank-change confirmation codes requested — wait 15 minutes and try again.",
   keyFn: (req) => `bank-change-send:user:${req.user?.id || "unknown"}`,
 });
 const bankChangeSendIpRateLimit = rateLimit({
+  scope: "bank-change-send-ip",
   windowMs: 15 * 60 * 1000,
   max: 6,
   message: "Too many bank-change confirmation requests from this connection — wait 15 minutes and try again.",
   keyFn: (req) => `bank-change-send:ip:${getClientIp(req) || "unknown"}`,
 });
 const bankChangeConfirmRateLimit = rateLimit({
+  scope: "bank-change-confirm",
   windowMs: 15 * 60 * 1000,
   max: 8,
   message: "Too many bank-change code attempts — wait 15 minutes and request a new code.",
@@ -728,17 +757,20 @@ function normalizePhoneForRateLimit(phone) {
 // 1) per IP, which limits one client from spraying many numbers; and
 // 2) per phone number, which prevents repeatedly charging Stallyard to SMS the same person.
 const smsSendIpRateLimit = rateLimit({
+  scope: "sms-send-ip",
   windowMs: 15 * 60 * 1000,
   max: 5,
   message: "Too many SMS code requests from this connection — wait 15 minutes and try again.",
 });
 const smsSendPhoneRateLimit = rateLimit({
+  scope: "sms-send-phone",
   windowMs: 15 * 60 * 1000,
   max: 3,
   message: "Too many SMS codes were requested for this phone number — wait 15 minutes and try again.",
   keyFn: (req) => `phone:${normalizePhoneForRateLimit(req.body?.phone) || "missing"}`,
 });
 const smsCheckRateLimit = rateLimit({
+  scope: "sms-check",
   windowMs: 15 * 60 * 1000,
   max: 8,
   message: "Too many verification attempts — wait 15 minutes and request a new code.",
@@ -750,18 +782,21 @@ const smsCheckRateLimit = rateLimit({
 // hammer the upload endpoint or run up storage costs. These limits still allow
 // two full 12-photo listings plus a few retries within 15 minutes.
 const imageUploadUserBurstRateLimit = rateLimit({
+  scope: "image-upload-user-burst",
   windowMs: 15 * 60 * 1000,
   max: 30,
   message: "You've uploaded a lot of images recently — wait 15 minutes before uploading more.",
   keyFn: (req) => `user:${req.user?.id || "unknown"}`,
 });
 const imageUploadIpBurstRateLimit = rateLimit({
+  scope: "image-upload-ip-burst",
   windowMs: 15 * 60 * 1000,
   max: 60,
   message: "Too many image uploads from this connection — wait 15 minutes and try again.",
   keyFn: (req) => `ip:${getClientIp(req) || "unknown"}`,
 });
 const imageUploadUserDailyRateLimit = rateLimit({
+  scope: "image-upload-user-daily",
   windowMs: 24 * 60 * 60 * 1000,
   max: 120,
   message: "Daily image upload limit reached — try again tomorrow or contact support if you need help.",
@@ -1079,8 +1114,54 @@ function hashField(value) {
   return crypto.createHash("sha256").update(String(value)).digest("hex");
 }
 
-const pendingBankChanges = new Map();
 const BANK_CHANGE_CODE_TTL_MS = 15 * 60 * 1000;
+
+function securityStateKey(namespace, subject) {
+  return crypto.createHash("sha256").update(`${namespace}:${subject}`).digest("hex");
+}
+
+async function setSecurityState(namespace, subject, payload, ttlMs, client = pool) {
+  const stateKey = securityStateKey(namespace, subject);
+  const encryptedPayload = encryptField(JSON.stringify(payload));
+  await client.query(
+    `INSERT INTO security_ephemeral_state (state_key, namespace, payload_encrypted, expires_at, updated_at)
+     VALUES ($1, $2, $3, NOW() + ($4::bigint * INTERVAL '1 millisecond'), NOW())
+     ON CONFLICT (state_key) DO UPDATE SET
+       namespace = EXCLUDED.namespace,
+       payload_encrypted = EXCLUDED.payload_encrypted,
+       expires_at = EXCLUDED.expires_at,
+       updated_at = NOW()`,
+    [stateKey, namespace, encryptedPayload, ttlMs]
+  );
+}
+
+async function getSecurityState(namespace, subject, client = pool) {
+  const stateKey = securityStateKey(namespace, subject);
+  const result = await client.query(
+    `SELECT payload_encrypted, expires_at
+     FROM security_ephemeral_state
+     WHERE state_key = $1 AND namespace = $2`,
+    [stateKey, namespace]
+  );
+  if (!result.rows.length) return null;
+  const row = result.rows[0];
+  if (new Date(row.expires_at).getTime() <= Date.now()) {
+    await client.query("DELETE FROM security_ephemeral_state WHERE state_key = $1", [stateKey]);
+    return null;
+  }
+  try {
+    return JSON.parse(decryptFieldSafe(row.payload_encrypted));
+  } catch (err) {
+    console.error(`Failed to read security state (${namespace}):`, err.message);
+    await client.query("DELETE FROM security_ephemeral_state WHERE state_key = $1", [stateKey]);
+    return null;
+  }
+}
+
+async function deleteSecurityState(namespace, subject, client = pool) {
+  const stateKey = securityStateKey(namespace, subject);
+  await client.query("DELETE FROM security_ephemeral_state WHERE state_key = $1 AND namespace = $2", [stateKey, namespace]);
+}
 
 app.post("/password-reset/send", authRateLimit, async (req, res) => {
   try {
@@ -1832,6 +1913,32 @@ const SCHEMA_MIGRATIONS = [
     `,
     `CREATE INDEX IF NOT EXISTS idx_listing_checkout_reservations_reference ON listing_checkout_reservations(reference)`,
     `CREATE INDEX IF NOT EXISTS idx_listing_checkout_reservations_expires ON listing_checkout_reservations(expires_at)`,
+  ] },
+  { version: 45, name: "persistent-security-state", statements: [
+    `
+      CREATE TABLE IF NOT EXISTS security_rate_limits (
+        rate_key TEXT PRIMARY KEY,
+        scope TEXT NOT NULL,
+        hit_count INTEGER NOT NULL DEFAULT 0,
+        window_started_at TIMESTAMP NOT NULL DEFAULT NOW(),
+        expires_at TIMESTAMP NOT NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+      )
+    `,
+    `CREATE INDEX IF NOT EXISTS idx_security_rate_limits_expires ON security_rate_limits(expires_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_security_rate_limits_scope ON security_rate_limits(scope, expires_at)`,
+    `
+      CREATE TABLE IF NOT EXISTS security_ephemeral_state (
+        state_key TEXT PRIMARY KEY,
+        namespace TEXT NOT NULL,
+        payload_encrypted TEXT NOT NULL,
+        expires_at TIMESTAMP NOT NULL,
+        updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+      )
+    `,
+    `CREATE INDEX IF NOT EXISTS idx_security_ephemeral_state_expires ON security_ephemeral_state(expires_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_security_ephemeral_state_namespace ON security_ephemeral_state(namespace, expires_at)`,
   ] },
 ];
 
@@ -5608,7 +5715,7 @@ app.post(
       return res.status(500).json({ error: "Bank-change confirmation isn't configured yet" });
     }
 
-    const existingPendingChange = pendingBankChanges.get(req.user.id);
+    const existingPendingChange = await getSecurityState("bank-change", req.user.id);
     if (existingPendingChange && Date.now() - existingPendingChange.sentAt < BANK_CHANGE_RESEND_COOLDOWN_MS) {
       const retryAfterSeconds = Math.max(1, Math.ceil((BANK_CHANGE_RESEND_COOLDOWN_MS - (Date.now() - existingPendingChange.sentAt)) / 1000));
       res.setHeader("Retry-After", String(retryAfterSeconds));
@@ -5633,13 +5740,13 @@ app.post(
     if (!resendRes.ok) {
       return res.status(400).json({ error: "Couldn't send a confirmation code — try again" });
     }
-    pendingBankChanges.set(req.user.id, {
+    await setSecurityState("bank-change", req.user.id, {
       code,
       sentAt: Date.now(),
       bankCode,
       accountNumber,
       failedAttempts: 0,
-    });
+    }, BANK_CHANGE_CODE_TTL_MS);
     res.json({ confirmationRequired: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -5657,9 +5764,9 @@ app.post(
       return res.status(400).json({ error: "Enter the 6-digit code we emailed you" });
     }
 
-    const pending = pendingBankChanges.get(req.user.id);
+    const pending = await getSecurityState("bank-change", req.user.id);
     if (!pending || Date.now() - pending.sentAt > BANK_CHANGE_CODE_TTL_MS) {
-      pendingBankChanges.delete(req.user.id);
+      await deleteSecurityState("bank-change", req.user.id);
       return res.status(400).json({ error: "That code has expired — start the change again" });
     }
 
@@ -5671,18 +5778,19 @@ app.post(
     if (!codeMatches) {
       pending.failedAttempts = Number(pending.failedAttempts || 0) + 1;
       if (pending.failedAttempts >= BANK_CHANGE_MAX_CODE_ATTEMPTS) {
-        pendingBankChanges.delete(req.user.id);
+        await deleteSecurityState("bank-change", req.user.id);
         return res.status(429).json({
           error: "Too many incorrect bank-change codes — start the bank change again to receive a new code.",
         });
       }
+      await setSecurityState("bank-change", req.user.id, pending, BANK_CHANGE_CODE_TTL_MS);
       return res.status(400).json({
         error: "That code doesn't match — check and try again",
         attemptsRemaining: BANK_CHANGE_MAX_CODE_ATTEMPTS - pending.failedAttempts,
       });
     }
 
-    pendingBankChanges.delete(req.user.id);
+    await deleteSecurityState("bank-change", req.user.id);
     const result = await verifyAndSaveBankDetails(req.user.id, pending.bankCode, pending.accountNumber);
     if (result.error) return res.status(result.status).json({ error: result.error });
     res.json({ success: true, recipientCode: result.recipientCode });
