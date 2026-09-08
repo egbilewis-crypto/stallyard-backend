@@ -219,9 +219,9 @@ const ADMIN_ROLES = new Set([
 const ROLE_PERMISSIONS = {
   seller_verification: new Set(["seller_verification"]),
   listing_moderator: new Set(["listing_moderation"]),
-  order_dispute: new Set(["dispute_resolution", "order_access"]),
+  order_dispute: new Set(["dispute_resolution", "order_access", "order_management"]),
   finance: new Set(["finance", "order_access"]),
-  customer_support: new Set(["support_tickets"]),
+  customer_support: new Set(["support_tickets", "message_moderation"]),
 };
 
 function hasPermission(user, permission) {
@@ -4549,8 +4549,9 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
   try {
     const existing = await pool.query("SELECT seller_id FROM order_items WHERE id = $1", [req.params.id]);
     if (existing.rows.length === 0) return res.status(404).json({ error: "Order item not found" });
-    if (!req.user.isAdmin && existing.rows[0].seller_id !== req.user.id) {
-      return res.status(403).json({ error: "You can only update your own items" });
+    const isOwnSellerItem = existing.rows[0].seller_id === req.user.id;
+    if (!isOwnSellerItem && !hasPermission(req.user, "order_management")) {
+      return res.status(403).json({ error: "Only the seller, Order/Dispute Admin, or Super Admin can update fulfillment details" });
     }
     const { fulfillmentStatus, trackingNumber, carrier, proofOfDeliveryUrl } = req.body;
     if (fulfillmentStatus && !ORDER_ITEM_STATUSES.has(fulfillmentStatus)) {
@@ -4584,6 +4585,9 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
       `UPDATE order_items SET ${sets.join(", ")} WHERE id = $${i} RETURNING *`,
       values
     );
+    if (!isOwnSellerItem) {
+      logAdminAction(req.user.id, "order_item_fulfillment_updated", `Updated fulfillment details for order item #${req.params.id}`);
+    }
     res.json({ item: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -4768,8 +4772,8 @@ app.post("/order-items/:id/redeem-delivery-token", authenticate, codeRateLimit, 
     );
     if (existing.rows.length === 0) return res.status(404).json({ error: "Order item not found" });
     const item = existing.rows[0];
-    if (!req.user.isAdmin && item.seller_id !== req.user.id) {
-      return res.status(403).json({ error: "You can only redeem codes for your own items" });
+    if (item.seller_id !== req.user.id) {
+      return res.status(403).json({ error: "Only the seller for this item can redeem the buyer's delivery code" });
     }
     if (item.payment_status !== "held") {
       return res.status(400).json({ error: "This order's payment is not currently being held" });
@@ -6067,8 +6071,25 @@ app.get("/messages/:threadId", authenticate, async (req, res) => {
   try {
     const thread = await pool.query("SELECT buyer_id, seller_id FROM threads WHERE id = $1", [req.params.threadId]);
     if (thread.rows.length === 0) return res.status(404).json({ error: "Thread not found" });
-    if (thread.rows[0].buyer_id !== req.user.id && thread.rows[0].seller_id !== req.user.id && !req.user.isAdmin) {
-      return res.status(403).json({ error: "You're not a part of this thread" });
+    const isThreadParticipant = thread.rows[0].buyer_id === req.user.id || thread.rows[0].seller_id === req.user.id;
+    if (!isThreadParticipant) {
+      if (!hasPermission(req.user, "message_moderation")) {
+        return res.status(403).json({ error: "You don't have permission to view this conversation" });
+      }
+      // Customer Support gets deliberately narrow access: only conversations
+      // that have actually been reported. Super Admin remains the emergency
+      // override through hasPermission(). This prevents support staff from
+      // browsing arbitrary buyer/seller private messages by guessing thread IDs.
+      if (req.user.adminRole !== "super_admin") {
+        const reported = await pool.query(
+          "SELECT 1 FROM message_reports WHERE thread_id = $1 LIMIT 1",
+          [req.params.threadId]
+        );
+        if (!reported.rows.length) {
+          return res.status(403).json({ error: "Customer Support can only view marketplace conversations that have been reported" });
+        }
+      }
+      logAdminAction(req.user.id, "reported_conversation_viewed", `Viewed reported marketplace conversation thread #${req.params.threadId}`);
     }
     const result = await pool.query(
       "SELECT * FROM messages WHERE thread_id = $1 ORDER BY created_at ASC",
@@ -6098,8 +6119,8 @@ app.patch("/messages/:id/offer", authenticate, async (req, res) => {
     if (threadResult.rows.length === 0) return res.status(404).json({ error: "Thread not found" });
     const thread = threadResult.rows[0];
     const recipientId = msg.sender_id === thread.buyer_id ? thread.seller_id : thread.buyer_id;
-    if (req.user.id !== recipientId && !req.user.isAdmin) {
-      return res.status(403).json({ error: "Only the offer recipient can respond to it" });
+    if (req.user.id !== recipientId) {
+      return res.status(403).json({ error: "Only the offer recipient can accept or decline it" });
     }
 
     const result = await pool.query(
@@ -6121,8 +6142,8 @@ app.post("/messages/:id/report", authenticate, async (req, res) => {
     const threadResult = await pool.query("SELECT buyer_id, seller_id FROM threads WHERE id = $1", [threadId]);
     if (threadResult.rows.length === 0) return res.status(404).json({ error: "Thread not found" });
     const thread = threadResult.rows[0];
-    if (req.user.id !== thread.buyer_id && req.user.id !== thread.seller_id && !req.user.isAdmin) {
-      return res.status(403).json({ error: "You're not a part of this conversation" });
+    if (req.user.id !== thread.buyer_id && req.user.id !== thread.seller_id) {
+      return res.status(403).json({ error: "Only conversation participants can report a message" });
     }
     const result = await pool.query(
       `INSERT INTO message_reports (message_id, thread_id, reporter_id, reason)
@@ -6230,8 +6251,8 @@ app.patch("/reviews/:id", authenticate, async (req, res) => {
     }
     const existing = await pool.query("SELECT buyer_id FROM reviews WHERE id = $1", [req.params.id]);
     if (existing.rows.length === 0) return res.status(404).json({ error: "Review not found" });
-    if (existing.rows[0].buyer_id !== req.user.id && !req.user.isAdmin) {
-      return res.status(403).json({ error: "You can only edit your own review" });
+    if (existing.rows[0].buyer_id !== req.user.id) {
+      return res.status(403).json({ error: "Only the buyer who wrote this review can edit it" });
     }
     const result = await pool.query(
       "UPDATE reviews SET rating = COALESCE($1, rating), comment = COALESCE($2, comment) WHERE id = $3 RETURNING *",
@@ -6275,8 +6296,8 @@ app.patch("/reviews/:id/respond", authenticate, async (req, res) => {
     }
     const existing = await pool.query("SELECT seller_id FROM reviews WHERE id = $1", [req.params.id]);
     if (existing.rows.length === 0) return res.status(404).json({ error: "Review not found" });
-    if (existing.rows[0].seller_id !== req.user.id && !req.user.isAdmin) {
-      return res.status(403).json({ error: "You can only respond to reviews on your own sales" });
+    if (existing.rows[0].seller_id !== req.user.id) {
+      return res.status(403).json({ error: "Only the seller who received this review can respond to it" });
     }
     const result = await pool.query(
       "UPDATE reviews SET seller_response = $1, seller_response_at = NOW() WHERE id = $2 RETURNING *",
