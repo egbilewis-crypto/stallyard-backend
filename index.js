@@ -153,8 +153,8 @@ const ADMIN_ROLES = new Set([
 const ROLE_PERMISSIONS = {
   seller_verification: new Set(["seller_verification"]),
   listing_moderator: new Set(["listing_moderation"]),
-  order_dispute: new Set(["dispute_resolution"]),
-  finance: new Set(["finance"]),
+  order_dispute: new Set(["dispute_resolution", "order_access"]),
+  finance: new Set(["finance", "order_access"]),
   customer_support: new Set(["support_tickets"]),
 };
 
@@ -4011,7 +4011,7 @@ app.get("/orders/selling", authenticate, rejectAdminMarketplaceUse, async (req, 
   }
 });
 
-app.get("/orders", authenticate, requireAdmin, async (req, res) => {
+app.get("/orders", authenticate, requirePermission("order_access"), async (req, res) => {
   try {
     const orders = await fetchOrdersWithItems("TRUE", []);
     res.json({ orders });
