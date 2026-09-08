@@ -8,6 +8,71 @@ const crypto = require("crypto");
 
 const app = express();
 
+// Production security gate: never bring Stallyard online with missing or obviously
+// unsafe secrets. Optional integrations (Termii, Sightengine, IPQS) remain
+// health-checked separately and do not block startup.
+function validateProductionSecrets() {
+  if (process.env.NODE_ENV !== "production") return;
+
+  const problems = [];
+  const value = (name) => String(process.env[name] || "").trim();
+  const looksPlaceholder = (v) => /^(changeme|change-me|replace-me|your[-_ ]?secret|your[-_ ]?key|example|placeholder|secret|password|test)$/i.test(v);
+
+  const required = [
+    "DATABASE_URL",
+    "JWT_SECRET",
+    "FIELD_ENCRYPTION_KEY",
+    "PAYSTACK_SECRET_KEY",
+    "SUPABASE_URL",
+    "RESEND_API_KEY",
+  ];
+  for (const name of required) {
+    const v = value(name);
+    if (!v) problems.push(`${name} is missing`);
+    else if (looksPlaceholder(v)) problems.push(`${name} still contains a placeholder value`);
+  }
+
+  const supabaseServiceKey = value("SUPABASE_SERVICE_ROLE_KEY") || value("SUPABASE_SECRET_KEY");
+  if (!supabaseServiceKey) problems.push("SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_SECRET_KEY) is missing");
+  else if (looksPlaceholder(supabaseServiceKey)) problems.push("Supabase server secret still contains a placeholder value");
+
+  const jwtSecret = value("JWT_SECRET");
+  if (jwtSecret && jwtSecret.length < 32) problems.push("JWT_SECRET must be at least 32 characters in production");
+
+  const encryptionKey = value("FIELD_ENCRYPTION_KEY");
+  if (encryptionKey) {
+    try {
+      if (Buffer.from(encryptionKey, "base64").length !== 32) {
+        problems.push("FIELD_ENCRYPTION_KEY must decode to exactly 32 bytes");
+      }
+    } catch {
+      problems.push("FIELD_ENCRYPTION_KEY must be valid base64 for a 32-byte key");
+    }
+  }
+
+  const databaseUrl = value("DATABASE_URL");
+  if (databaseUrl && !/^postgres(?:ql)?:\/\//i.test(databaseUrl)) problems.push("DATABASE_URL is not a PostgreSQL connection URL");
+
+  const supabaseUrl = value("SUPABASE_URL");
+  if (supabaseUrl && !/^https:\/\/[^/]+\.supabase\.co\/?$/i.test(supabaseUrl)) problems.push("SUPABASE_URL must be the HTTPS Supabase project root URL");
+
+  const paystackSecret = value("PAYSTACK_SECRET_KEY");
+  if (paystackSecret && !/^sk_(?:test|live)_/i.test(paystackSecret)) problems.push("PAYSTACK_SECRET_KEY does not look like a Paystack secret key");
+
+  const resendKey = value("RESEND_API_KEY");
+  if (resendKey && !/^re_/i.test(resendKey)) problems.push("RESEND_API_KEY does not look like a Resend API key");
+
+  if (problems.length) {
+    console.error("SECURITY STARTUP CHECK FAILED — Stallyard will not start:");
+    for (const problem of problems) console.error(` - ${problem}`);
+    process.exit(1);
+  }
+
+  console.log("Production security startup check passed.");
+}
+
+validateProductionSecrets();
+
 // Railway sits behind a reverse proxy. Trust only the first proxy hop.
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
@@ -55,8 +120,8 @@ const pool = new Pool({
 });
 
 const JWT_SECRET = process.env.JWT_SECRET;
-if (!JWT_SECRET) {
-  console.error("WARNING: JWT_SECRET is not set. Set it in Railway's Variables tab or tokens cannot be verified.");
+if (!JWT_SECRET && process.env.NODE_ENV !== "production") {
+  console.warn("Development warning: JWT_SECRET is not set; authenticated routes will not work.");
 }
 
 function signToken(user) {
