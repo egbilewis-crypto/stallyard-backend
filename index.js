@@ -356,9 +356,12 @@ const vpnCheckCache = new Map();
 const VPN_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 function getClientIp(req) {
-  const forwarded = req.headers["x-forwarded-for"];
-  if (forwarded) return forwarded.split(",")[0].trim();
-  return req.ip;
+  // Express is configured with `trust proxy = 1`, so req.ip is derived using
+  // the trusted proxy chain instead of trusting a client-supplied
+  // X-Forwarded-For value directly. This prevents spoofing rate-limit and
+  // fraud/VPN checks by forging that header.
+  const ip = typeof req.ip === "string" ? req.ip.trim() : "";
+  return ip || req.socket?.remoteAddress || "";
 }
 
 // PostgreSQL-backed rate limiter. Security limits survive Railway restarts and
