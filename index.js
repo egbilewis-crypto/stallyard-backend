@@ -2859,9 +2859,8 @@ app.post("/profile/apply-to-sell", authenticate, requireNigeriaMarketplaceUser, 
   }
 });
 
-const USER_PUBLIC_FIELDS = `id, username, display_name, first_name, last_name, office_location,
-  country, is_admin, is_approved, is_verified, is_suspended, account_type, verification_status, created_at,
-  avatar_url, store_bio, store_policies, is_email_verified, is_phone_verified`;
+const USER_PUBLIC_FIELDS = `id, username, display_name, country, account_type, created_at,
+  avatar_url, store_bio, store_policies`;
 
 const USER_FULL_FIELDS = `id, username, email, phone, display_name, first_name, last_name, office_location,
   country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
@@ -2869,65 +2868,66 @@ const USER_FULL_FIELDS = `id, username, email, phone, display_name, first_name, 
   bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
   is_email_verified, is_phone_verified, admin_role`;
 
-// Safe admin directory fields. Admin roles that do not perform seller verification
-// can still resolve role/2FA state for UI permissions, but do NOT receive member
-// email, phone, ID/license data, ID photos, bank statements, or rejection details.
-const USER_ADMIN_SAFE_FIELDS = `${USER_PUBLIC_FIELDS}, two_factor_enabled, admin_role`;
+// Safe staff directory fields for admin roles that do not need seller-verification
+// documents. This intentionally excludes email/phone, ID/license data, document
+// URLs, bank statements, and seller-verification rejection details.
+const USER_ADMIN_SAFE_FIELDS = `id, username, display_name, first_name, last_name, office_location,
+  country, is_admin, is_approved, is_verified, is_suspended, account_type, verification_status, created_at,
+  avatar_url, store_bio, store_policies, two_factor_enabled, is_email_verified, is_phone_verified, admin_role`;
 
 app.get("/users", async (req, res) => {
   try {
-    const authHeader = req.headers.authorization || "";
-    const hasBearerToken = authHeader.startsWith("Bearer ");
     let fields = USER_PUBLIC_FIELDS;
+    const requester = getRequester(req);
 
-    // /users is public for storefront/profile discovery, but a caller that
-    // presents a token must not get any privileged behavior from stale JWT
-    // claims. Revalidate the account against PostgreSQL every time before
-    // exposing admin-only directory fields.
-    if (hasBearerToken) {
-      const requester = getRequester(req);
-      if (!requester?.id) {
-        return res.status(401).json({ error: "Your session is no longer valid — log in again" });
-      }
-
+    // /users remains usable for public storefront/profile discovery, but cookie-
+    // authenticated admin access is revalidated against PostgreSQL before any
+    // staff-only fields are exposed. A malformed/expired cookie never upgrades
+    // the response; it receives the same minimal public directory as anonymous
+    // callers.
+    if (requester?.id) {
       const authCheck = await pool.query(
         `SELECT is_admin, is_suspended, token_version, admin_role, two_factor_enabled
          FROM users WHERE id = $1`,
         [requester.id]
       );
-      if (!authCheck.rows.length) {
-        return res.status(401).json({ error: "Account no longer exists" });
-      }
 
-      const current = authCheck.rows[0];
-      if (current.is_suspended) {
-        return res.status(403).json({ error: "This account has been suspended" });
-      }
-      if ((requester.tokenVersion || 0) !== (current.token_version || 0)) {
-        return res.status(401).json({ error: "Your session was signed out from another device — log in again" });
-      }
+      if (authCheck.rows.length) {
+        const current = authCheck.rows[0];
+        const versionMatches = (requester.tokenVersion || 0) === (current.token_version || 0);
 
-      if (current.is_admin) {
-        // A revoked admin token can never reach this branch because both the
-        // current DB role and token_version are checked above. Full seller
-        // verification documents additionally require mandatory admin 2FA and
-        // the specific role that needs those documents.
-        const role = current.admin_role || "super_admin";
-        if (!current.two_factor_enabled) {
-          return res.status(403).json({
-            error: "Two-factor authentication is required for admin accounts",
-            code: "2FA_REQUIRED",
-          });
+        if (!current.is_suspended && versionMatches && current.is_admin) {
+          if (!current.two_factor_enabled) {
+            return res.status(403).json({
+              error: "Two-factor authentication is required for admin accounts",
+              code: "2FA_REQUIRED",
+            });
+          }
+
+          // The public directory must not become a way around the backend's
+          // 30-minute privileged-admin window.
+          const verifiedAt = Number(requester.adminVerifiedAt || 0);
+          const age = Date.now() - verifiedAt;
+          const invalidFutureTimestamp = verifiedAt > Date.now() + ADMIN_SESSION_CLOCK_SKEW_MS;
+          if (!verifiedAt || invalidFutureTimestamp || age > ADMIN_SERVER_SESSION_MS) {
+            return res.status(401).json({
+              error: "Admin session expired — complete admin re-authentication",
+              code: "ADMIN_SESSION_EXPIRED",
+            });
+          }
+
+          const role = current.admin_role || "super_admin";
+          const canReviewSellerPrivateData = role === "super_admin" || role === "seller_verification";
+          fields = canReviewSellerPrivateData ? USER_FULL_FIELDS : USER_ADMIN_SAFE_FIELDS;
         }
-        const canReviewSellerPrivateData = role === "super_admin" || role === "seller_verification";
-        fields = canReviewSellerPrivateData ? USER_FULL_FIELDS : USER_ADMIN_SAFE_FIELDS;
       }
     }
 
     const result = await pool.query(`SELECT ${fields} FROM users ORDER BY display_name ASC`);
     res.json({ users: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("Users directory error:", err);
+    res.status(500).json({ error: "Unable to load users" });
   }
 });
 
