@@ -3910,6 +3910,72 @@ app.patch("/orders/:id/release", authenticate, requirePermission("finance"), asy
       return res.status(409).json({ error: `Only held payments can be released. This order is currently ${order.payment_status}.` });
     }
 
+    // Returns remain a hard financial lock. A manual delivery override may
+    // bypass only the normal token/photo delivery safeguards — it may NEVER
+    // bypass an active return. This keeps "emergency release" from becoming a
+    // shortcut around buyer protection.
+    const itemResult = await client.query(
+      `SELECT id, title, fulfillment_status, buyer_confirmed_at, proof_of_delivery_url, return_status
+       FROM order_items WHERE order_id = $1 FOR UPDATE`,
+      [req.params.id]
+    );
+    const allItems = itemResult.rows;
+    const activeReturn = allItems.find((i) => ["requested", "approved"].includes(i.return_status));
+    if (activeReturn) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error: "Payment cannot be released while a return is in progress.",
+        code: "RETURN_LOCKED",
+      });
+    }
+    if (allItems.some((i) => i.fulfillment_status === "returned")) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error: "Payment cannot be released because this order contains a returned item.",
+        code: "RETURNED_ITEM_LOCKED",
+      });
+    }
+
+    const relevantItems = allItems.filter((i) => i.fulfillment_status !== "cancelled");
+    if (!relevantItems.length) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "There are no releasable items on this order." });
+    }
+
+    const safeguardProblems = [];
+    for (const item of relevantItems) {
+      if (!item.proof_of_delivery_url) {
+        safeguardProblems.push(`Item #${item.id} (${item.title}): delivery picture is missing`);
+      }
+      if (!item.buyer_confirmed_at) {
+        safeguardProblems.push(`Item #${item.id} (${item.title}): buyer delivery token has not been redeemed`);
+      }
+    }
+
+    const overrideDeliverySafeguards = req.body?.overrideDeliverySafeguards === true;
+    const overrideReason = String(req.body?.overrideReason || "").trim();
+    if (safeguardProblems.length && !overrideDeliverySafeguards) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error: "Normal delivery safeguards are incomplete. Use the explicit delivery-safeguard override only after reviewing the order and documenting why an emergency release is justified.",
+        code: "DELIVERY_SAFEGUARDS_REQUIRED",
+        safeguardProblems,
+      });
+    }
+    if (safeguardProblems.length && overrideDeliverySafeguards) {
+      if (overrideReason.length < 10) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: "Enter a clear override reason of at least 10 characters.",
+          code: "OVERRIDE_REASON_REQUIRED",
+        });
+      }
+      if (overrideReason.length > 1000) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "Override reason is too long." });
+      }
+    }
+
     // A disputed order stays locked unless the active case has already been
     // explicitly decided in the seller's favor. In that one case, release
     // and dispute resolution happen in the SAME database transaction so
@@ -3944,10 +4010,13 @@ app.patch("/orders/:id/release", authenticate, requirePermission("finance"), asy
     );
     await client.query("COMMIT");
 
+    const usedDeliveryOverride = safeguardProblems.length > 0 && overrideDeliverySafeguards;
     logAdminAction(
       req.user.id,
-      "payment_released",
-      `Released payment for order #${updated.rows[0].id} (${formatMoneyServer(updated.rows[0].total, updated.rows[0].currency)})${resolvedDispute ? ` and resolved dispute #${resolvedDispute.id}` : ""}`
+      usedDeliveryOverride ? "payment_release_delivery_override" : "payment_released",
+      usedDeliveryOverride
+        ? `OVERRIDE DELIVERY SAFEGUARDS for order #${updated.rows[0].id} (${formatMoneyServer(updated.rows[0].total, updated.rows[0].currency)}). Missing safeguards: ${safeguardProblems.join("; ")}. Admin reason: ${overrideReason}${resolvedDispute ? `; resolved dispute #${resolvedDispute.id}` : ""}`
+        : `Released payment for order #${updated.rows[0].id} (${formatMoneyServer(updated.rows[0].total, updated.rows[0].currency)})${resolvedDispute ? ` and resolved dispute #${resolvedDispute.id}` : ""}`
     );
     const sellerIds = await pool.query(
       "SELECT DISTINCT seller_id FROM order_items WHERE order_id = $1",
@@ -3962,7 +4031,12 @@ app.patch("/orders/:id/release", authenticate, requirePermission("finance"), asy
         createNotification(buyer.rows[0].buyer_id, "dispute_status", `Your dispute for order #${req.params.id} has been resolved. Payment was released to the seller.`);
       }
     }
-    res.json({ order: updated.rows[0], resolvedDispute });
+    res.json({
+      order: updated.rows[0],
+      resolvedDispute,
+      deliverySafeguardsOverridden: usedDeliveryOverride,
+      safeguardProblems: usedDeliveryOverride ? safeguardProblems : [],
+    });
   } catch (err) {
     try { await client.query("ROLLBACK"); } catch {}
     res.status(500).json({ error: err.message });
