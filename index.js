@@ -3023,9 +3023,17 @@ app.post("/admin/login", authRateLimit, async (req, res) => {
   }
 });
 
+// Keep session restoration deliberately small. This endpoint is called on page
+// load, so it must never return seller verification documents, bank data,
+// government-ID details, or other private profile records.
+const SESSION_USER_FIELDS = `id, username, email, phone, display_name, first_name, last_name,
+  country, is_admin, is_approved, is_verified, is_suspended, account_type,
+  has_applied_to_sell, verification_status, avatar_url, store_bio, store_policies,
+  two_factor_enabled, is_email_verified, is_phone_verified, token_version, admin_role`;
+
 app.get("/session/me", authenticate, async (req, res) => {
   try {
-    const result = await pool.query(`SELECT ${USER_RETURNING_FIELDS} FROM users WHERE id = $1`, [req.user.id]);
+    const result = await pool.query(`SELECT ${SESSION_USER_FIELDS} FROM users WHERE id = $1`, [req.user.id]);
     if (!result.rows.length) {
       clearAuthCookie(res);
       return res.status(401).json({ error: "Session account no longer exists" });
