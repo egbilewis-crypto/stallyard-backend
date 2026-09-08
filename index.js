@@ -97,6 +97,7 @@ app.use(cors({
   },
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "X-Paystack-Signature"],
+  credentials: true,
   maxAge: 86400,
 }));
 
@@ -113,6 +114,20 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json({ limit: "15mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
+
+// HttpOnly cookies protect tokens from JavaScript, but cookie authentication
+// requires CSRF protection. Browser state-changing requests carrying the auth
+// cookie must come from an explicitly allowed Stallyard origin. Paystack's
+// server-to-server webhook is exempt and is independently HMAC-verified.
+app.use((req, res, next) => {
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
+  if (req.path === "/webhooks/paystack") return next();
+  const hasAuthCookie = Object.prototype.hasOwnProperty.call(parseCookies(req), AUTH_COOKIE_NAME);
+  if (!hasAuthCookie) return next();
+  const origin = req.headers.origin || "";
+  if (origin && ALLOWED_ORIGINS.has(origin)) return next();
+  return res.status(403).json({ error: "Request origin is not allowed", code: "CSRF_ORIGIN_REJECTED" });
+});
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -132,9 +147,56 @@ function signToken(user) {
   );
 }
 
+const AUTH_COOKIE_NAME = "stallyard_session";
+
+function parseCookies(req) {
+  const out = {};
+  const header = req.headers.cookie || "";
+  for (const part of header.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx < 0) continue;
+    const key = part.slice(0, idx).trim();
+    if (!key) continue;
+    try {
+      out[key] = decodeURIComponent(part.slice(idx + 1).trim());
+    } catch {
+      out[key] = part.slice(idx + 1).trim();
+    }
+  }
+  return out;
+}
+
+function setAuthCookie(res, user) {
+  const token = signToken(user);
+  const production = process.env.NODE_ENV === "production";
+  const parts = [
+    `${AUTH_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    "Path=/",
+    "HttpOnly",
+    production ? "Secure" : "",
+    production ? "SameSite=None" : "SameSite=Lax",
+  ].filter(Boolean);
+  // Marketplace sessions persist for 30 days. Admin sessions are browser-session
+  // cookies; the existing 30-minute admin unlock gate still applies in the UI.
+  if (!user.is_admin) parts.push(`Max-Age=${30 * 24 * 60 * 60}`);
+  res.setHeader("Set-Cookie", parts.join("; "));
+}
+
+function clearAuthCookie(res) {
+  const production = process.env.NODE_ENV === "production";
+  const parts = [
+    `${AUTH_COOKIE_NAME}=`,
+    "Path=/",
+    "HttpOnly",
+    production ? "Secure" : "",
+    production ? "SameSite=None" : "SameSite=Lax",
+    "Max-Age=0",
+  ].filter(Boolean);
+  res.setHeader("Set-Cookie", parts.join("; "));
+}
+
 function getRequester(req) {
-  const authHeader = req.headers.authorization || "";
-  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  const token = parseCookies(req)[AUTH_COOKIE_NAME] || null;
   if (!token || !JWT_SECRET) return null;
   try {
     return jwt.verify(token, JWT_SECRET);
@@ -145,7 +207,10 @@ function getRequester(req) {
 
 async function authenticate(req, res, next) {
   const requester = getRequester(req);
-  if (!requester) return res.status(401).json({ error: "Sign in required" });
+  if (!requester) {
+    if (parseCookies(req)[AUTH_COOKIE_NAME]) clearAuthCookie(res);
+    return res.status(401).json({ error: "Sign in required" });
+  }
   try {
     const result = await pool.query(
       "SELECT is_admin, is_suspended, token_version, admin_role, two_factor_enabled, country FROM users WHERE id = $1",
@@ -1488,7 +1553,8 @@ app.post("/signup", authRateLimit, async (req, res) => {
     );
 
     verifiedEmails.delete(email.toLowerCase());
-    res.status(201).json({ user: result.rows[0], token: signToken(result.rows[0]) });
+    if (!result.rows[0].is_admin) setAuthCookie(res, result.rows[0]);
+    res.status(201).json({ user: result.rows[0] });
   } catch (err) {
     if (err.code === "23505") {
       return res.status(409).json({ error: "Username or email already in use" });
@@ -1597,7 +1663,8 @@ app.patch("/profile/change-password", authenticate, authRateLimit, async (req, r
        WHERE id = $2 RETURNING ${USER_RETURNING_FIELDS}`,
       [newHash, req.user.id]
     );
-    res.json({ success: true, token: signToken(updated.rows[0]) });
+    setAuthCookie(res, updated.rows[0]);
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1611,7 +1678,8 @@ app.post("/profile/sign-out-other-devices", authenticate, async (req, res) => {
       [req.user.id]
     );
     if (!result.rows.length) return res.status(404).json({ error: "Account not found" });
-    res.json({ token: signToken(result.rows[0]) });
+    setAuthCookie(res, result.rows[0]);
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2540,7 +2608,7 @@ app.post("/admin/create-member", authenticate, requirePermission("user_managemen
     );
 
     logAdminAction(req.user.id, "member_created", `Created member ${result.rows[0].username}${result.rows[0].is_admin ? " as an admin" : ""}`);
-    res.status(201).json({ user: result.rows[0], token: signToken(result.rows[0]) });
+    res.status(201).json({ user: result.rows[0] });
   } catch (err) {
     if (err.code === "23505") {
       return res.status(409).json({ error: "Username, email, or phone already in use" });
@@ -2743,6 +2811,24 @@ app.post("/admin/login", authRateLimit, async (req, res) => {
   }
 });
 
+app.get("/session/me", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT ${USER_RETURNING_FIELDS} FROM users WHERE id = $1`, [req.user.id]);
+    if (!result.rows.length) {
+      clearAuthCookie(res);
+      return res.status(401).json({ error: "Session account no longer exists" });
+    }
+    res.json({ user: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/logout", (req, res) => {
+  clearAuthCookie(res);
+  res.json({ success: true });
+});
+
 app.post("/login", authRateLimit, async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -2820,7 +2906,8 @@ app.post("/login", authRateLimit, async (req, res) => {
     pool
       .query("INSERT INTO login_history (user_id, ip, user_agent) VALUES ($1, $2, $3)", [user.id, ip, userAgent])
       .catch((err) => console.error("Failed to record login history:", err.message));
-    res.json({ user, token: signToken(user) });
+    setAuthCookie(res, user);
+    res.json({ user });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2884,7 +2971,8 @@ app.post("/login/verify-2fa", authRateLimit, async (req, res) => {
     pool
       .query("INSERT INTO login_history (user_id, ip, user_agent) VALUES ($1, $2, $3)", [user.id, ip, userAgent])
       .catch((err) => console.error("Failed to record login history:", err.message));
-    res.json({ user, token: signToken(user) });
+    setAuthCookie(res, user);
+    res.json({ user });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2963,7 +3051,8 @@ app.post("/login/verify-2fa-email", authRateLimit, async (req, res) => {
         `Completed three-step admin login from ${ip || "unknown IP"}; previous admin sessions were revoked`
       );
     }
-    res.json({ user: sessionUser, token: signToken(sessionUser) });
+    setAuthCookie(res, sessionUser);
+    res.json({ user: sessionUser });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -3024,7 +3113,8 @@ app.post("/admin/temporary-password/complete", authRateLimit, async (req, res) =
     const userAgent = req.headers["user-agent"] || "";
     await pool.query("INSERT INTO login_history (user_id, ip, user_agent) VALUES ($1, $2, $3)", [user.id, ip, userAgent]);
     logAdminAction(user.id, "admin_temporary_password_completed", `Set a new permanent password after temporary-password recovery from ${ip || "unknown IP"}`);
-    res.json({ user, token: signToken(user) });
+    setAuthCookie(res, user);
+    res.json({ user });
   } catch (err) {
     if (err.code === "42703") {
       return res.status(409).json({ error: "Run the temporary admin password migration first", code: "MIGRATION_REQUIRED" });
