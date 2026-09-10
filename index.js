@@ -4416,6 +4416,8 @@ const LISTING_SUBCATEGORIES = {
     "Home Audio",
     "Gaming Consoles",
     "Video Games",
+    "Gaming Controllers",
+    "Gaming Accessories",
     "Smart Watches",
     "Wearable Technology",
     "Chargers & Cables",
@@ -4425,6 +4427,7 @@ const LISTING_SUBCATEGORIES = {
     "Storage Devices",
     "Security Cameras",
     "Smart Home Devices",
+    "Media Players",
     "Electronic Accessories",
     "Other Electronics"
   ],
@@ -4501,9 +4504,13 @@ const LISTING_SUBCATEGORIES = {
     "Storage & Organization",
     "Bathroom Accessories",
     "Cleaning Supplies",
-    "Garden & Outdoor",
+    "Garden Tools",
+    "Plants",
+    "Pots & Planters",
+    "Outdoor Furniture",
+    "Lawn Equipment",
+    "Grills & Outdoor Cooking",
     "Home Improvement",
-    "Tools",
     "Other Home Items"
   ],
   "Jewelry": [
@@ -4561,6 +4568,17 @@ const LISTING_SUBCATEGORIES = {
     "Studio Equipment",
     "Microphones",
     "Other Movies & Music"
+  ],
+  "Office": [
+    "Office Furniture",
+    "Printers & Scanners",
+    "Stationery",
+    "Filing & Storage",
+    "Office Electronics",
+    "School & Office Supplies",
+    "Desk Accessories",
+    "Packaging & Mailing",
+    "Other Office Supplies"
   ],
   "Outdoors": [
     "Camping",
@@ -4626,6 +4644,18 @@ const LISTING_SUBCATEGORIES = {
     "Sports Shoes",
     "Traditional Footwear",
     "Other Shoes"
+  ],
+  "Tools & Equipment": [
+    "Hand Tools",
+    "Power Tools",
+    "Measuring Tools",
+    "Workshop Equipment",
+    "Safety Equipment",
+    "Tool Storage",
+    "Welding Equipment",
+    "Construction Tools",
+    "Agricultural Tools",
+    "Other Tools & Equipment"
   ],
   "Toys & Games": [
     "Action Figures",
