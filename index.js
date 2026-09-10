@@ -819,6 +819,24 @@ const imageUploadUserDailyRateLimit = rateLimit({
 });
 const MAX_IMAGE_UPLOAD_BYTES = 8 * 1024 * 1024;
 
+// Homepage Ad 1 may use a short promotional video. Keep this much tighter than
+// general file hosting so the admin tool cannot become an accidental large-file store.
+const homepageVideoUserRateLimit = rateLimit({
+  scope: "homepage-video-upload-user",
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: "Too many promotional video uploads — wait 15 minutes and try again.",
+  keyFn: (req) => `user:${req.user?.id || "unknown"}`,
+});
+const homepageVideoIpRateLimit = rateLimit({
+  scope: "homepage-video-upload-ip",
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: "Too many promotional video uploads from this connection — wait 15 minutes and try again.",
+  keyFn: (req) => `ip:${getClientIp(req) || "unknown"}`,
+});
+const MAX_HOMEPAGE_VIDEO_BYTES = 40 * 1024 * 1024;
+
 async function isVpnOrProxy(ip) {
   if (!ip || ip === "::1" || ip === "127.0.0.1") return false;
   const cached = vpnCheckCache.get(ip);
@@ -2212,6 +2230,11 @@ const SCHEMA_MIGRATIONS = [
       )
     `,
     `INSERT INTO homepage_ads (slot) VALUES (1), (2), (3) ON CONFLICT (slot) DO NOTHING`,
+  ] },
+  { version: 47, name: "homepage-ad-video", statements: [
+    `ALTER TABLE homepage_ads ADD COLUMN IF NOT EXISTS media_type TEXT NOT NULL DEFAULT 'image'`,
+    `ALTER TABLE homepage_ads ADD COLUMN IF NOT EXISTS poster_url TEXT NOT NULL DEFAULT ''`,
+    `UPDATE homepage_ads SET media_type = 'image' WHERE slot IN (2, 3) OR media_type NOT IN ('image', 'video')`,
   ] },
 ];
 
@@ -4129,6 +4152,71 @@ app.post("/uploads/image", authenticate, imageUploadIpBurstRateLimit, imageUploa
     sendInternalError(res, err);
   }
 });
+
+// Super Admin-only upload for the large homepage promotional slot. The browser
+// streams the MP4/WebM bytes directly instead of base64-encoding them, avoiding
+// the ~33% base64 size penalty and keeping the normal JSON limit small.
+app.post(
+  "/admin/homepage-ads/upload-video",
+  authenticate,
+  requireAdmin,
+  homepageVideoIpRateLimit,
+  homepageVideoUserRateLimit,
+  express.raw({ type: ["video/mp4", "video/webm"], limit: "40mb" }),
+  async (req, res) => {
+    try {
+      if (req.user.adminRole && req.user.adminRole !== "super_admin") {
+        return res.status(403).json({ error: "Only the Super Admin can manage homepage ads" });
+      }
+
+      const mimeType = String(req.headers["content-type"] || "").split(";")[0].trim().toLowerCase();
+      if (!["video/mp4", "video/webm"].includes(mimeType)) {
+        return res.status(400).json({ error: "Use an MP4 or WebM promotional video" });
+      }
+      if (!Buffer.isBuffer(req.body) || !req.body.length) {
+        return res.status(400).json({ error: "Video file is empty" });
+      }
+      if (req.body.length > MAX_HOMEPAGE_VIDEO_BYTES) {
+        return res.status(413).json({ error: "Video is too large — maximum upload size is 40 MB" });
+      }
+
+      const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
+      const SUPABASE_SECRET_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY;
+      const SUPABASE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "stallyard-media";
+      if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+        return res.status(500).json({ error: "Media uploads aren't configured — contact support" });
+      }
+
+      const extension = mimeType === "video/webm" ? "webm" : "mp4";
+      const objectPath = `homepage-ads/${req.user.id}/${Date.now()}-${crypto.randomBytes(8).toString("hex")}.${extension}`;
+      const uploadUrl = `${SUPABASE_URL}/storage/v1/object/${encodeURIComponent(SUPABASE_BUCKET)}/${objectPath.split("/").map(encodeURIComponent).join("/")}`;
+      const storageRes = await fetch(uploadUrl, {
+        method: "POST",
+        headers: {
+          apikey: SUPABASE_SECRET_KEY,
+          "Content-Type": mimeType,
+          "x-upsert": "false",
+          "Cache-Control": "public, max-age=31536000, immutable",
+        },
+        body: req.body,
+      });
+
+      let storageData = {};
+      try { storageData = await storageRes.json(); } catch {}
+      if (!storageRes.ok) {
+        console.error("Supabase promotional video upload failed:", storageRes.status, storageData);
+        return res.status(400).json({ error: storageData.message || storageData.error || "Video upload failed" });
+      }
+
+      const encodedPath = objectPath.split("/").map(encodeURIComponent).join("/");
+      const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/${encodeURIComponent(SUPABASE_BUCKET)}/${encodedPath}`;
+      logAdminAction(req.user.id, "homepage_ad_video_uploaded", "Uploaded a promotional video for homepage Ad 1");
+      res.json({ url: publicUrl, path: objectPath });
+    } catch (err) {
+      sendInternalError(res, err);
+    }
+  }
+);
 
 // Publishes a new listing. RETURNING * only pulls columns from the
 // listings table itself, so seller_name/owner_username (which the
@@ -7561,12 +7649,14 @@ app.get("/login-history/mine", authenticate, async (req, res) => {
 app.get("/homepage-ads", async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT slot, image_url, link_url, updated_at FROM homepage_ads ORDER BY slot ASC"
+      "SELECT slot, image_url, media_type, poster_url, link_url, updated_at FROM homepage_ads ORDER BY slot ASC"
     );
     const bySlot = new Map(result.rows.map((row) => [Number(row.slot), row]));
     const ads = [1, 2, 3].map((slot) => bySlot.get(slot) || {
       slot,
       image_url: "",
+      media_type: "image",
+      poster_url: "",
       link_url: "",
       updated_at: null,
     });
@@ -7586,15 +7676,26 @@ app.put("/admin/homepage-ads/:slot", authenticate, requireAdmin, async (req, res
       return res.status(400).json({ error: "Invalid homepage ad slot" });
     }
 
-    const imageUrl = String(req.body?.imageUrl || "").trim();
+    const imageUrl = String(req.body?.imageUrl || "").trim(); // primary media URL (image or Ad 1 video)
+    const requestedMediaType = String(req.body?.mediaType || "image").trim().toLowerCase();
+    const mediaType = requestedMediaType === "video" ? "video" : requestedMediaType === "image" ? "image" : "";
+    const posterUrl = String(req.body?.posterUrl || "").trim();
     const linkUrl = String(req.body?.linkUrl || "").trim();
 
-    if (imageUrl) {
+    if (!mediaType) {
+      return res.status(400).json({ error: "Ad media type must be image or video" });
+    }
+    if (slot !== 1 && mediaType !== "image") {
+      return res.status(400).json({ error: "Only homepage Ad 1 can use video" });
+    }
+
+    for (const [url, label] of [[imageUrl, "Ad media"], [posterUrl, "Video poster"]]) {
+      if (!url) continue;
       try {
-        const parsedImage = new URL(imageUrl);
-        if (parsedImage.protocol !== "https:") throw new Error("unsafe image protocol");
+        const parsed = new URL(url);
+        if (parsed.protocol !== "https:") throw new Error("unsafe protocol");
       } catch {
-        return res.status(400).json({ error: "Ad image must use a valid HTTPS URL" });
+        return res.status(400).json({ error: `${label} must use a valid HTTPS URL` });
       }
     }
 
@@ -7608,15 +7709,17 @@ app.put("/admin/homepage-ads/:slot", authenticate, requireAdmin, async (req, res
     }
 
     const result = await pool.query(
-      `INSERT INTO homepage_ads (slot, image_url, link_url, updated_at, updated_by)
-       VALUES ($1, $2, $3, NOW(), $4)
+      `INSERT INTO homepage_ads (slot, image_url, media_type, poster_url, link_url, updated_at, updated_by)
+       VALUES ($1, $2, $3, $4, $5, NOW(), $6)
        ON CONFLICT (slot) DO UPDATE SET
          image_url = EXCLUDED.image_url,
+         media_type = EXCLUDED.media_type,
+         poster_url = EXCLUDED.poster_url,
          link_url = EXCLUDED.link_url,
          updated_at = NOW(),
          updated_by = EXCLUDED.updated_by
-       RETURNING slot, image_url, link_url, updated_at`,
-      [slot, imageUrl, linkUrl, req.user.id]
+       RETURNING slot, image_url, media_type, poster_url, link_url, updated_at`,
+      [slot, imageUrl, mediaType, mediaType === "video" ? posterUrl : "", linkUrl, req.user.id]
     );
     logAdminAction(req.user.id, "homepage_ad_updated", `Updated homepage ad slot #${slot}`);
     res.json({ ad: result.rows[0] });
