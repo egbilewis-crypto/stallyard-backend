@@ -2544,7 +2544,34 @@ const SCHEMA_MIGRATIONS = [
        admin_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
        action TEXT NOT NULL,
        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )`,
+  ] },
+  { version: 64, name: "verified-seller-20m-tier", statements: [
+    `ALTER TABLE users
+       ADD COLUMN IF NOT EXISTS seller_tier TEXT NOT NULL DEFAULT 'buyer',
+       ADD COLUMN IF NOT EXISTS seller_listing_limit NUMERIC(14,2) NOT NULL DEFAULT 20000000`,
+    `UPDATE users SET seller_tier = 'verified', seller_listing_limit = 20000000 WHERE is_approved = true AND is_admin = false`,
+    `UPDATE users SET seller_tier = 'casual' WHERE is_approved = false AND casual_seller_status = 'approved'`,
+    `CREATE TABLE IF NOT EXISTS verified_seller_applications (
+       id BIGSERIAL PRIMARY KEY,
+       reference TEXT NOT NULL UNIQUE,
+       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+       casual_application_id BIGINT NOT NULL REFERENCES casual_seller_applications(id) ON DELETE RESTRICT,
+       bank_statement_path TEXT NOT NULL,
+       address_id INTEGER NOT NULL REFERENCES user_addresses(id) ON DELETE RESTRICT,
+       requested_limit NUMERIC(14,2) NOT NULL DEFAULT 20000000,
+       requirements_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+       consented_at TIMESTAMP NOT NULL,
+       status TEXT NOT NULL DEFAULT 'pending',
+       decision_reason TEXT,
+       reviewed_by INTEGER REFERENCES users(id) ON DELETE RESTRICT,
+       reviewed_at TIMESTAMP,
+       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
      )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_one_pending_verified_seller_application
+       ON verified_seller_applications(user_id) WHERE status = 'pending'`,
+    `CREATE INDEX IF NOT EXISTS idx_verified_seller_admin_queue ON verified_seller_applications(status, created_at DESC)`,
   ] },
 ];
 
@@ -3327,7 +3354,7 @@ const USER_RETURNING_FIELDS = `id, username, email, phone, display_name, first_n
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
   bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
   is_email_verified, is_phone_verified, token_version, admin_role, casual_seller_status,
-  casual_seller_limit, casual_seller_approved_at`;
+  casual_seller_limit, casual_seller_approved_at, seller_tier, seller_listing_limit`;
 
 app.patch("/users/:id/verify", authenticate, requirePermission("user_management"), async (req, res) => {
   try {
@@ -3678,12 +3705,24 @@ app.get("/admin-audit-log", authenticate, requirePermission("role_assignment"), 
 
 app.patch("/users/:id/approve", authenticate, requirePermission("seller_verification"), async (req, res) => {
   try {
+    const pendingApplication = await pool.query(
+      "SELECT id FROM verified_seller_applications WHERE user_id=$1 AND status='pending' ORDER BY created_at DESC LIMIT 1", [req.params.id]
+    );
+    if (!pendingApplication.rows.length) {
+      return res.status(409).json({ error: "A complete pending verified-seller application is required before approval" });
+    }
     const result = await pool.query(
-      `UPDATE users SET is_approved = true, verification_status = 'approved', rejection_reason = NULL
+      `UPDATE users SET is_approved = true, verification_status = 'approved', rejection_reason = NULL,
+         seller_tier = 'verified', seller_listing_limit = 20000000
        WHERE id = $1 RETURNING ${USER_RETURNING_FIELDS}`,
       [req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
+    await pool.query(
+      `UPDATE verified_seller_applications SET status='approved', reviewed_by=$1, reviewed_at=NOW(), updated_at=NOW()
+        WHERE id=(SELECT id FROM verified_seller_applications WHERE user_id=$2 AND status='pending' ORDER BY created_at DESC LIMIT 1)`,
+      [req.user.id, req.params.id]
+    );
     logAdminAction(req.user.id, "seller_approved", `Approved ${result.rows[0].username}'s seller application`);
     res.json({ user: result.rows[0] });
   } catch (err) {
@@ -3700,6 +3739,11 @@ app.patch("/users/:id/reject", authenticate, requirePermission("seller_verificat
       [reason || null, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
+    await pool.query(
+      `UPDATE verified_seller_applications SET status='rejected', decision_reason=$1, reviewed_by=$2, reviewed_at=NOW(), updated_at=NOW()
+        WHERE id=(SELECT id FROM verified_seller_applications WHERE user_id=$3 AND status='pending' ORDER BY created_at DESC LIMIT 1)`,
+      [reason || "Application rejected", req.user.id, req.params.id]
+    );
     logAdminAction(req.user.id, "seller_rejected", `Rejected ${result.rows[0].username}'s seller application${reason ? ": " + reason : ""}`);
     createNotification(
       req.params.id,
@@ -3985,7 +4029,7 @@ const SESSION_USER_FIELDS = `id, username, email, phone, display_name, first_nam
   country, is_admin, is_approved, is_verified, is_suspended, account_type,
   has_applied_to_sell, verification_status, avatar_url, store_bio, store_policies,
   two_factor_enabled, is_email_verified, is_phone_verified, token_version, admin_role,
-  casual_seller_status, casual_seller_limit, casual_seller_approved_at`;
+  casual_seller_status, casual_seller_limit, casual_seller_approved_at, seller_tier, seller_listing_limit`;
 
 app.get("/session/me", authenticate, async (req, res) => {
   try {
@@ -5011,6 +5055,7 @@ const LISTING_SUBCATEGORIES = {
 };
 
 const CASUAL_SELLER_LIMIT_NGN = 500000;
+const VERIFIED_SELLER_LIMIT_NGN = 20000000;
 const CASUAL_SELLER_ID_TYPES = new Set(["nin", "passport", "drivers_license", "voters_card"]);
 const CASUAL_SELLER_CONSENT_VERSION = "2026-09-12";
 const VERIFICATION_BUCKET = process.env.SUPABASE_VERIFICATION_BUCKET || "seller-verification-private";
@@ -5111,19 +5156,27 @@ async function activeListingValue(client, ownerId, excludeListingId = null) {
 
 async function assertSellerMayPublish(client, ownerId, proposedPrice, proposedQuantity, excludeListingId = null) {
   const userResult = await client.query(
-    `SELECT is_approved, casual_seller_status, casual_seller_limit, username, display_name
+    `SELECT is_approved, casual_seller_status, casual_seller_limit, seller_tier, seller_listing_limit, username, display_name
        FROM users WHERE id = $1 FOR UPDATE`,
     [ownerId]
   );
   if (!userResult.rows.length) throw Object.assign(new Error("Seller account not found"), { statusCode: 404 });
   const seller = userResult.rows[0];
-  if (seller.is_approved) return seller;
-  if (seller.casual_seller_status !== "approved") {
-    throw Object.assign(new Error("Complete automatic casual-seller identity verification before publishing."), { statusCode: 403, code: "CASUAL_VERIFICATION_REQUIRED" });
-  }
   const price = Number(proposedPrice || 0);
   const quantity = Math.max(1, Number(proposedQuantity || 1));
   const current = await activeListingValue(client, ownerId, excludeListingId);
+  if (seller.is_approved) {
+    const verifiedLimit = Number(seller.seller_listing_limit || VERIFIED_SELLER_LIMIT_NGN);
+    if (!Number.isFinite(price) || price <= 0 || current + price * quantity > verifiedLimit) {
+      throw Object.assign(new Error(`Verified sellers may have no more than ₦${verifiedLimit.toLocaleString("en-NG")} in combined active listings.`), {
+        statusCode: 409, code: "VERIFIED_LISTING_LIMIT", currentActiveValue: current, limit: verifiedLimit,
+      });
+    }
+    return seller;
+  }
+  if (seller.casual_seller_status !== "approved") {
+    throw Object.assign(new Error("Complete automatic casual-seller identity verification before publishing."), { statusCode: 403, code: "CASUAL_VERIFICATION_REQUIRED" });
+  }
   const limit = Number(seller.casual_seller_limit || CASUAL_SELLER_LIMIT_NGN);
   if (!Number.isFinite(price) || price <= 0 || current + price * quantity > limit) {
     throw Object.assign(new Error(`Casual sellers may have no more than ₦${limit.toLocaleString("en-NG")} in combined active listings.`), {
@@ -5285,6 +5338,91 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requir
     if (err.statusCode) return res.status(err.statusCode).json({ error: err.message, code: err.code, currentActiveValue: err.currentActiveValue, limit: err.limit });
     sendInternalError(res, err, "casual seller application");
   } finally { client.release(); }
+});
+
+function parsePrivateApplicationDocument(dataUrl, label) {
+  const match = String(dataUrl || "").match(/^data:(image\/jpeg|application\/pdf);base64,([a-zA-Z0-9+/=]+)$/);
+  if (!match) throw Object.assign(new Error(`${label} must be a JPEG image or PDF`), { statusCode: 400 });
+  const buffer = Buffer.from(match[2], "base64");
+  if (buffer.length < 1024 || buffer.length > 6 * 1024 * 1024) throw Object.assign(new Error(`${label} must be between 1 KB and 6 MB`), { statusCode: 413 });
+  if (match[1] === "application/pdf" && buffer.subarray(0, 5).toString() !== "%PDF-") throw Object.assign(new Error(`${label} is not a valid PDF`), { statusCode: 400 });
+  if (match[1] === "image/jpeg" && (buffer[0] !== 0xff || buffer[1] !== 0xd8)) throw Object.assign(new Error(`${label} is not a valid JPEG`), { statusCode: 400 });
+  return { buffer, contentType: match[1], extension: match[1] === "application/pdf" ? "pdf" : "jpg", sha256: crypto.createHash("sha256").update(buffer).digest("hex") };
+}
+
+app.post("/verified-seller/apply", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (req.body?.consent !== true) return res.status(400).json({ error: "Accept the verified-seller declaration before applying" });
+    const document = parsePrivateApplicationDocument(req.body?.bankStatement, "Bank statement");
+    await client.query("BEGIN");
+    const userResult = await client.query(
+      `SELECT id, username, is_approved, is_suspended, casual_seller_status, is_email_verified,
+              is_phone_verified, paystack_recipient_code FROM users WHERE id=$1 FOR UPDATE`, [req.user.id]
+    );
+    const user = userResult.rows[0];
+    if (!user || user.is_suspended) throw Object.assign(new Error("This account cannot apply"), { statusCode: 403 });
+    if (user.is_approved) throw Object.assign(new Error("Your account is already a verified seller"), { statusCode: 409 });
+    if (user.casual_seller_status !== "approved") throw Object.assign(new Error("Complete automatic casual-seller identity verification first"), { statusCode: 400 });
+    if (!user.is_email_verified || !user.is_phone_verified) throw Object.assign(new Error("Verify your email and phone number first"), { statusCode: 400 });
+    if (!user.paystack_recipient_code) throw Object.assign(new Error("Add and verify your seller payout bank account first"), { statusCode: 400 });
+    const identityResult = await client.query(
+      "SELECT id, reference FROM casual_seller_applications WHERE user_id=$1 AND status='approved' ORDER BY approved_at DESC LIMIT 1", [req.user.id]
+    );
+    if (!identityResult.rows.length) throw Object.assign(new Error("Approved identity evidence was not found — complete casual verification again"), { statusCode: 400 });
+    const addressResult = await client.query(
+      `SELECT id, full_name, phone, street, city, state, zip, country FROM user_addresses
+        WHERE user_id=$1 AND is_default=true AND street<>'' AND city<>'' AND state<>'' AND LOWER(country)='nigeria' LIMIT 1`, [req.user.id]
+    );
+    if (!addressResult.rows.length) throw Object.assign(new Error("Add a complete default Nigerian address before applying"), { statusCode: 400 });
+    const existing = await client.query("SELECT reference FROM verified_seller_applications WHERE user_id=$1 AND status='pending'", [req.user.id]);
+    if (existing.rows.length) throw Object.assign(new Error(`Your verified-seller application ${existing.rows[0].reference} is already awaiting review`), { statusCode: 409 });
+    const reference = `VSA-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
+    const path = `user-${req.user.id}/verified-seller/${reference}/bank-statement-${document.sha256.slice(0, 12)}.${document.extension}`;
+    await uploadPrivateVerificationObject(path, document.buffer, document.contentType);
+    const snapshot = { identityReference: identityResult.rows[0].reference, emailVerified: true, phoneVerified: true,
+      payoutBankVerified: true, address: addressResult.rows[0], requestedLimit: VERIFIED_SELLER_LIMIT_NGN };
+    await client.query(
+      `INSERT INTO verified_seller_applications(reference,user_id,casual_application_id,bank_statement_path,address_id,
+         requested_limit,requirements_snapshot,consented_at,status)
+       VALUES($1,$2,$3,$4,$5,$6,$7,NOW(),'pending')`,
+      [reference, req.user.id, identityResult.rows[0].id, path, addressResult.rows[0].id, VERIFIED_SELLER_LIMIT_NGN, JSON.stringify(snapshot)]
+    );
+    await client.query("UPDATE users SET has_applied_to_sell=true, verification_status='pending', rejection_reason=NULL WHERE id=$1", [req.user.id]);
+    await client.query("COMMIT");
+    createNotification(req.user.id, "seller_application", `Your verified-seller application ${reference} was submitted for review.`);
+    res.status(201).json({ reference, status: "pending", requestedLimit: VERIFIED_SELLER_LIMIT_NGN });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
+    if (err.code === "23505") return res.status(409).json({ error: "A verified-seller application is already pending" });
+    sendInternalError(res, err, "verified seller application");
+  } finally { client.release(); }
+});
+
+app.get("/admin/verified-seller-applications", authenticate, requirePermission("seller_verification"), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT a.id,a.reference,a.user_id,a.requested_limit,a.requirements_snapshot,a.status,a.decision_reason,
+              a.created_at,a.reviewed_at,u.username,u.display_name,u.email,u.phone
+         FROM verified_seller_applications a JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT 500`
+    );
+    res.json({ applications: result.rows });
+  } catch (err) { sendInternalError(res, err); }
+});
+
+app.get("/admin/verified-seller-applications/:id/bank-statement", authenticate, requirePermission("seller_verification"), async (req, res) => {
+  try {
+    const result = await pool.query("SELECT reference,bank_statement_path FROM verified_seller_applications WHERE id=$1", [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error: "Application not found" });
+    const bytes = await fetchPrivateVerificationObject(result.rows[0].bank_statement_path);
+    const isPdf = result.rows[0].bank_statement_path.endsWith(".pdf");
+    logAdminAction(req.user.id, "verified_seller_bank_statement_viewed", `Viewed bank statement for ${result.rows[0].reference}`);
+    res.setHeader("Content-Type", isPdf ? "application/pdf" : "image/jpeg");
+    res.setHeader("Content-Disposition", `inline; filename="${result.rows[0].reference}-bank-statement.${isPdf ? "pdf" : "jpg"}"`);
+    res.setHeader("Cache-Control", "private, no-store");
+    res.send(bytes);
+  } catch (err) { sendInternalError(res, err); }
 });
 
 function jpegDimensions(buffer) {
