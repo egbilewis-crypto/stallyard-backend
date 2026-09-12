@@ -703,11 +703,11 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
            seller_id, seller_username, seller_name, fulfillment_status,
            delivery_token, delivery_token_generated_at
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'new', $11, NOW())
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'new', NULL, NULL)
          RETURNING *`,
         [
           order.id, listing.id, listing.title, listing.emoji, price, qty, shippingFee,
-          listing.owner_id, seller?.username, seller?.display_name, generateDeliveryTokenValue(),
+          listing.owner_id, seller?.username, seller?.display_name,
         ]
       );
       insertedItems.push(itemResult.rows[0]);
@@ -2239,6 +2239,14 @@ const SCHEMA_MIGRATIONS = [
   { version: 48, name: "listing-subcategories", statements: [
     `ALTER TABLE listings ADD COLUMN IF NOT EXISTS subcategory TEXT NOT NULL DEFAULT ''`,
     `CREATE INDEX IF NOT EXISTS idx_listings_category_subcategory ON listings(category, subcategory)`,
+  ] },  { version: 49, name: "delivery-token-after-buyer-confirmation", statements: [
+    `UPDATE order_items oi
+       SET delivery_token = NULL, delivery_token_generated_at = NULL
+      FROM orders o
+      WHERE o.id = oi.order_id
+        AND o.payment_status = 'held'
+        AND oi.buyer_confirmed_at IS NULL
+        AND oi.delivery_token IS NOT NULL`,
   ] },
 ];
 
@@ -4416,8 +4424,6 @@ const LISTING_SUBCATEGORIES = {
     "Home Audio",
     "Gaming Consoles",
     "Video Games",
-    "Gaming Controllers",
-    "Gaming Accessories",
     "Smart Watches",
     "Wearable Technology",
     "Chargers & Cables",
@@ -4427,7 +4433,6 @@ const LISTING_SUBCATEGORIES = {
     "Storage Devices",
     "Security Cameras",
     "Smart Home Devices",
-    "Media Players",
     "Electronic Accessories",
     "Other Electronics"
   ],
@@ -4504,13 +4509,9 @@ const LISTING_SUBCATEGORIES = {
     "Storage & Organization",
     "Bathroom Accessories",
     "Cleaning Supplies",
-    "Garden Tools",
-    "Plants",
-    "Pots & Planters",
-    "Outdoor Furniture",
-    "Lawn Equipment",
-    "Grills & Outdoor Cooking",
+    "Garden & Outdoor",
     "Home Improvement",
+    "Tools",
     "Other Home Items"
   ],
   "Jewelry": [
@@ -4568,17 +4569,6 @@ const LISTING_SUBCATEGORIES = {
     "Studio Equipment",
     "Microphones",
     "Other Movies & Music"
-  ],
-  "Office": [
-    "Office Furniture",
-    "Printers & Scanners",
-    "Stationery",
-    "Filing & Storage",
-    "Office Electronics",
-    "School & Office Supplies",
-    "Desk Accessories",
-    "Packaging & Mailing",
-    "Other Office Supplies"
   ],
   "Outdoors": [
     "Camping",
@@ -4644,18 +4634,6 @@ const LISTING_SUBCATEGORIES = {
     "Sports Shoes",
     "Traditional Footwear",
     "Other Shoes"
-  ],
-  "Tools & Equipment": [
-    "Hand Tools",
-    "Power Tools",
-    "Measuring Tools",
-    "Workshop Equipment",
-    "Safety Equipment",
-    "Tool Storage",
-    "Welding Equipment",
-    "Construction Tools",
-    "Agricultural Tools",
-    "Other Tools & Equipment"
   ],
   "Toys & Games": [
     "Action Figures",
@@ -6225,43 +6203,125 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
 });
 
 async function markItemReceivedAndMaybeRelease(itemId) {
-  const result = await pool.query(
-    "UPDATE order_items SET buyer_confirmed_at = NOW(), delivery_token = NULL, delivery_token_generated_at = NULL WHERE id = $1 RETURNING *",
-    [itemId]
-  );
-  const item = result.rows[0];
-  createNotification(item.seller_id, "delivery_confirmed", `Buyer confirmed delivery for "${item.title}"`);
-  const allItems = await pool.query("SELECT * FROM order_items WHERE order_id = $1", [item.order_id]);
-  const relevant = allItems.rows.filter((r) => !["cancelled", "returned"].includes(r.fulfillment_status));
-  const allConfirmed = relevant.length > 0 && relevant.every(
-    (r) => r.buyer_confirmed_at && r.proof_of_delivery_url && !["requested", "approved"].includes(r.return_status)
-  );
-  let order = null;
-  if (allConfirmed) {
-    const orderRes = await pool.query(
-      `UPDATE orders SET payment_status = 'released'
-       WHERE id = $1 AND payment_status = 'held' AND COALESCE(is_disputed, false) = false
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const locked = await client.query(
+      `SELECT oi.*, o.payment_status, o.is_disputed
+       FROM order_items oi JOIN orders o ON o.id = oi.order_id
+       WHERE oi.id = $1
+       FOR UPDATE OF oi, o`,
+      [itemId]
+    );
+    if (!locked.rows.length) throw new Error("Order item not found");
+    const current = locked.rows[0];
+    if (!current.buyer_confirmed_at) {
+      throw new Error("Buyer must confirm delivery before the delivery token can be redeemed");
+    }
+    if (current.payment_status !== "held" || current.is_disputed) {
+      throw new Error("Payment is no longer eligible for release");
+    }
+    if (["requested", "approved"].includes(current.return_status)) {
+      throw new Error("Payment is locked because a return is in progress");
+    }
+
+    const result = await client.query(
+      `UPDATE order_items
+       SET delivery_token = NULL, delivery_token_generated_at = NULL
+       WHERE id = $1 AND delivery_token IS NOT NULL
        RETURNING *`,
+      [itemId]
+    );
+    if (!result.rows.length) throw new Error("This delivery token has already been redeemed");
+    const item = result.rows[0];
+
+    const allItems = await client.query(
+      "SELECT * FROM order_items WHERE order_id = $1 FOR UPDATE",
       [item.order_id]
     );
-    order = orderRes.rows[0] || null;
+    const relevant = allItems.rows.filter((r) => !["cancelled", "returned"].includes(r.fulfillment_status));
+    const allConfirmed = relevant.length > 0 && relevant.every(
+      (r) => r.buyer_confirmed_at && r.proof_of_delivery_url && !r.delivery_token &&
+        !["requested", "approved"].includes(r.return_status)
+    );
+    let order = null;
+    if (allConfirmed) {
+      const orderRes = await client.query(
+        `UPDATE orders SET payment_status = 'released'
+         WHERE id = $1 AND payment_status = 'held' AND COALESCE(is_disputed, false) = false
+         RETURNING *`,
+        [item.order_id]
+      );
+      order = orderRes.rows[0] || null;
+    }
+    await client.query("COMMIT");
+
+    createNotification(item.seller_id, "delivery_completed", `Delivery token redeemed for "${item.title}"`);
     if (order) {
       const sellerIds = [...new Set(relevant.map((r) => r.seller_id))];
       for (const sellerId of sellerIds) {
-        createNotification(sellerId, "funds_released", `Funds released for order — payment is now in your available balance.`);
+        createNotification(sellerId, "funds_released", "Funds released for order — payment is now in your available balance.");
       }
     }
+    return { item, order };
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
   }
-  return { item, order };
 }
 
 app.patch("/order-items/:id/confirm-receipt", authenticate, async (req, res) => {
-  // Stallyard's release flow requires the seller to submit BOTH the buyer's
-  // delivery token and proof-of-delivery photo. A buyer-side confirmation
-  // must not bypass those safeguards.
-  return res.status(400).json({
-    error: "Delivery is confirmed when the seller submits your delivery code together with proof of delivery."
-  });
+  try {
+    const existing = await pool.query(
+      `SELECT oi.*, o.buyer_id, o.payment_status, o.is_disputed
+       FROM order_items oi
+       JOIN orders o ON o.id = oi.order_id
+       WHERE oi.id = $1`,
+      [req.params.id]
+    );
+    if (existing.rows.length === 0) return res.status(404).json({ error: "Order item not found" });
+    const item = existing.rows[0];
+    if (item.buyer_id !== req.user.id) {
+      return res.status(403).json({ error: "Only the buyer can confirm delivery for this item" });
+    }
+    if (item.payment_status !== "held") {
+      return res.status(400).json({ error: "This order is no longer awaiting delivery confirmation" });
+    }
+    if (item.is_disputed) {
+      return res.status(409).json({ error: "You cannot release a delivery token while this order has an active dispute" });
+    }
+    if (["requested", "approved"].includes(item.return_status)) {
+      return res.status(409).json({ error: "You cannot release a delivery token while a return is in progress" });
+    }
+    if (!["shipped", "delivered"].includes(item.fulfillment_status)) {
+      return res.status(400).json({ error: "Confirm delivery only after the item has been shipped and received" });
+    }
+
+    if (item.buyer_confirmed_at && item.delivery_token) {
+      return res.json({ item, token: item.delivery_token });
+    }
+
+    const token = item.delivery_token || generateDeliveryTokenValue();
+    const result = await pool.query(
+      `UPDATE order_items
+       SET buyer_confirmed_at = COALESCE(buyer_confirmed_at, NOW()),
+           delivery_token = $1,
+           delivery_token_generated_at = COALESCE(delivery_token_generated_at, NOW())
+       WHERE id = $2
+       RETURNING *`,
+      [token, req.params.id]
+    );
+    createNotification(
+      item.seller_id,
+      "buyer_confirmed_delivery",
+      `Buyer confirmed delivery for "${item.title}". Ask the buyer for the delivery token only after handoff, then upload delivery proof and enter the token.`
+    );
+    res.json({ item: result.rows[0], token });
+  } catch (err) {
+    sendInternalError(res, err);
+  }
 });
 
 app.post("/order-items/:id/request-return", authenticate, async (req, res) => {
@@ -6362,7 +6422,7 @@ app.patch("/order-items/:id/return-tracking", authenticate, async (req, res) => 
 app.post("/order-items/:id/generate-delivery-token", authenticate, async (req, res) => {
   try {
     const existing = await pool.query(
-      `SELECT oi.*, o.buyer_id
+      `SELECT oi.*, o.buyer_id, o.payment_status, o.is_disputed
        FROM order_items oi JOIN orders o ON oi.order_id = o.id
        WHERE oi.id = $1`,
       [req.params.id]
@@ -6372,12 +6432,19 @@ app.post("/order-items/:id/generate-delivery-token", authenticate, async (req, r
     if (item.buyer_id !== req.user.id) {
       return res.status(403).json({ error: "Only the buyer can access a delivery code for this item" });
     }
-    if (item.buyer_confirmed_at) {
-      return res.status(400).json({ error: "This item has already been confirmed as received" });
+    if (!item.buyer_confirmed_at) {
+      return res.status(400).json({ error: "Confirm that you received and inspected the item before requesting the delivery token" });
     }
-    // Tokens are normally generated automatically when payment succeeds.
-    // This endpoint only recovers/creates one for older orders or migrations.
+    if (item.payment_status !== "held") {
+      return res.status(400).json({ error: "This order is no longer awaiting delivery confirmation" });
+    }
+    if (item.is_disputed || ["requested", "approved"].includes(item.return_status)) {
+      return res.status(409).json({ error: "The delivery token is unavailable while a dispute or return is active" });
+    }
     if (item.delivery_token) return res.json({ token: item.delivery_token });
+
+    // Recovery path only: if a confirmed buyer's token is missing because of a
+    // legacy order or interrupted response, create a fresh one after confirmation.
     const token = generateDeliveryTokenValue();
     await pool.query(
       "UPDATE order_items SET delivery_token = $1, delivery_token_generated_at = NOW() WHERE id = $2",
@@ -6408,11 +6475,17 @@ app.post("/order-items/:id/redeem-delivery-token", authenticate, codeRateLimit, 
     if (item.payment_status !== "held") {
       return res.status(400).json({ error: "This order's payment is not currently being held" });
     }
+    if (item.fulfillment_status !== "delivered") {
+      return res.status(409).json({ error: "Mark the item delivered before confirming delivery" });
+    }
     if (item.is_disputed) {
       return res.status(409).json({ error: "Payment is locked because this order has an active dispute" });
     }
     if (["requested", "approved"].includes(item.return_status)) {
       return res.status(409).json({ error: "Payment is locked because a return is in progress" });
+    }
+    if (!item.buyer_confirmed_at) {
+      return res.status(400).json({ error: "The buyer has not confirmed delivery yet" });
     }
     if (!item.proof_of_delivery_url) {
       return res.status(400).json({ error: "Upload a delivery picture before entering the buyer's code" });
@@ -8672,30 +8745,6 @@ app.patch("/notifications/mark-all-read", authenticate, async (req, res) => {
   }
 });
 
-async function backfillMissingDeliveryTokens() {
-  // Orders finalized before automatic token creation may be missing the buyer's
-  // delivery code. Only backfill still-held, unconfirmed paid orders.
-  const result = await pool.query(
-    `SELECT oi.id
-     FROM order_items oi
-     JOIN orders o ON o.id = oi.order_id
-     WHERE o.payment_status = 'held'
-       AND oi.buyer_confirmed_at IS NULL
-       AND (oi.delivery_token IS NULL OR oi.delivery_token = '')`
-  );
-  for (const row of result.rows) {
-    await pool.query(
-      `UPDATE order_items
-       SET delivery_token = $1, delivery_token_generated_at = NOW()
-       WHERE id = $2 AND (delivery_token IS NULL OR delivery_token = '')`,
-      [generateDeliveryTokenValue(), row.id]
-    );
-  }
-  if (result.rows.length) {
-    console.log(`Backfilled delivery tokens for ${result.rows.length} held order item(s).`);
-  }
-}
-
 async function sendShipReminders() {
   try {
     const result = await pool.query(
@@ -8725,7 +8774,6 @@ async function startServer() {
   try {
     await applyPendingMigrations();
     await encryptLegacyTotpSecrets();
-    await backfillMissingDeliveryTokens();
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
       setInterval(sendShipReminders, 60 * 60 * 1000).unref();
