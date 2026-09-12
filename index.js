@@ -2307,6 +2307,134 @@ const SCHEMA_MIGRATIONS = [
        ADD COLUMN IF NOT EXISTS cancellation_fee NUMERIC NOT NULL DEFAULT 0,
        ADD COLUMN IF NOT EXISTS buyer_exit_type TEXT`,
   ] },
+  { version: 58, name: "estimated-delivery-window", statements: [
+    `ALTER TABLE order_items
+       ADD COLUMN IF NOT EXISTS estimated_delivery_start DATE,
+       ADD COLUMN IF NOT EXISTS estimated_delivery_end DATE`,
+  ] },
+  { version: 59, name: "seller-live-delivery-location", statements: [
+    `ALTER TABLE order_items
+       ADD COLUMN IF NOT EXISTS live_location_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+       ADD COLUMN IF NOT EXISTS live_location_latitude NUMERIC,
+       ADD COLUMN IF NOT EXISTS live_location_longitude NUMERIC,
+       ADD COLUMN IF NOT EXISTS live_location_accuracy NUMERIC,
+       ADD COLUMN IF NOT EXISTS live_location_updated_at TIMESTAMP,
+       ADD COLUMN IF NOT EXISTS live_location_expires_at TIMESTAMP`,
+  ] },
+  { version: 60, name: "permanent-order-status-history", statements: [
+    `CREATE TABLE IF NOT EXISTS order_item_status_events (
+       id SERIAL PRIMARY KEY,
+       order_item_id INTEGER NOT NULL REFERENCES order_items(id) ON DELETE CASCADE,
+       event_type TEXT NOT NULL,
+       label TEXT NOT NULL,
+       details JSONB NOT NULL DEFAULT '{}'::jsonb,
+       created_at TIMESTAMP NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_order_item_status_events_item_time
+       ON order_item_status_events(order_item_id, created_at, id)`,
+    `INSERT INTO order_item_status_events (order_item_id, event_type, label, created_at)
+       SELECT oi.id, 'order_placed', 'Order placed', COALESCE(oi.created_at, o.created_at, NOW())
+       FROM order_items oi JOIN orders o ON o.id = oi.order_id
+       WHERE NOT EXISTS (SELECT 1 FROM order_item_status_events e WHERE e.order_item_id = oi.id)`,
+    `INSERT INTO order_item_status_events (order_item_id, event_type, label, created_at)
+       SELECT oi.id, oi.fulfillment_status,
+         CASE oi.fulfillment_status WHEN 'preparing' THEN 'Seller is preparing the order' WHEN 'shipped' THEN 'Order shipped'
+           WHEN 'delivered' THEN 'Marked delivered' WHEN 'cancelled' THEN 'Order cancelled'
+           WHEN 'returned' THEN 'Order returned' ELSE 'Order status updated' END,
+         COALESCE(oi.shipped_at, NOW())
+       FROM order_items oi
+       WHERE oi.fulfillment_status <> 'new'
+         AND NOT EXISTS (SELECT 1 FROM order_item_status_events e WHERE e.order_item_id = oi.id AND e.event_type = oi.fulfillment_status)`,
+    `CREATE OR REPLACE FUNCTION record_order_item_status_event() RETURNS TRIGGER AS $$
+     BEGIN
+       IF TG_OP = 'INSERT' THEN
+         INSERT INTO order_item_status_events(order_item_id, event_type, label, created_at)
+         VALUES (NEW.id, 'order_placed', 'Order placed', COALESCE(NEW.created_at, NOW()));
+         RETURN NEW;
+       END IF;
+       IF NEW.fulfillment_status IS DISTINCT FROM OLD.fulfillment_status THEN
+         INSERT INTO order_item_status_events(order_item_id, event_type, label)
+         VALUES (NEW.id, NEW.fulfillment_status,
+           CASE NEW.fulfillment_status WHEN 'preparing' THEN 'Seller is preparing the order' WHEN 'shipped' THEN 'Order shipped'
+             WHEN 'delivered' THEN 'Marked delivered' WHEN 'cancelled' THEN 'Order cancelled'
+             WHEN 'returned' THEN 'Order returned' ELSE 'Order status updated' END);
+       END IF;
+       IF ROW(NEW.estimated_delivery_start, NEW.estimated_delivery_end) IS DISTINCT FROM ROW(OLD.estimated_delivery_start, OLD.estimated_delivery_end) THEN
+         INSERT INTO order_item_status_events(order_item_id, event_type, label, details)
+         VALUES (NEW.id,
+           CASE WHEN OLD.estimated_delivery_end IS NOT NULL AND NEW.estimated_delivery_end > OLD.estimated_delivery_end THEN 'delivery_delayed' ELSE 'delivery_estimate_updated' END,
+           CASE WHEN OLD.estimated_delivery_end IS NOT NULL AND NEW.estimated_delivery_end > OLD.estimated_delivery_end THEN 'Estimated delivery delayed' ELSE 'Estimated delivery updated' END,
+           jsonb_build_object('start', NEW.estimated_delivery_start, 'end', NEW.estimated_delivery_end));
+       END IF;
+       IF NEW.live_location_enabled IS DISTINCT FROM OLD.live_location_enabled THEN
+         INSERT INTO order_item_status_events(order_item_id, event_type, label)
+         VALUES (NEW.id, CASE WHEN NEW.live_location_enabled THEN 'out_for_delivery' ELSE 'location_sharing_stopped' END,
+           CASE WHEN NEW.live_location_enabled THEN 'Out for delivery — location sharing started' ELSE 'Live location sharing stopped' END);
+       END IF;
+       IF NEW.proof_of_delivery_url IS NOT NULL AND OLD.proof_of_delivery_url IS NULL THEN
+         INSERT INTO order_item_status_events(order_item_id, event_type, label) VALUES (NEW.id, 'delivery_proof_uploaded', 'Delivery photo uploaded');
+       END IF;
+       IF NEW.delivery_token_sent_at IS NOT NULL AND OLD.delivery_token_sent_at IS NULL THEN
+         INSERT INTO order_item_status_events(order_item_id, event_type, label) VALUES (NEW.id, 'delivery_token_sent', 'Buyer sent delivery token to seller');
+       END IF;
+       IF NEW.delivery_token_redeemed_at IS NOT NULL AND OLD.delivery_token_redeemed_at IS NULL THEN
+         INSERT INTO order_item_status_events(order_item_id, event_type, label) VALUES (NEW.id, 'delivery_token_redeemed', 'Delivery token verified');
+       END IF;
+       IF NEW.buyer_confirmed_at IS NOT NULL AND OLD.buyer_confirmed_at IS NULL THEN
+         INSERT INTO order_item_status_events(order_item_id, event_type, label) VALUES (NEW.id, 'buyer_confirmed', 'Buyer confirmed receipt');
+       END IF;
+       IF NEW.cancellation_status IS DISTINCT FROM OLD.cancellation_status AND NEW.cancellation_status IS NOT NULL THEN
+         INSERT INTO order_item_status_events(order_item_id, event_type, label)
+         VALUES (NEW.id, 'cancellation_' || NEW.cancellation_status, 'Cancellation ' || NEW.cancellation_status);
+       END IF;
+       IF NEW.return_status IS DISTINCT FROM OLD.return_status AND NEW.return_status IS NOT NULL THEN
+         INSERT INTO order_item_status_events(order_item_id, event_type, label)
+         VALUES (NEW.id, 'return_' || NEW.return_status, 'Return ' || NEW.return_status);
+       END IF;
+       RETURN NEW;
+     END; $$ LANGUAGE plpgsql`,
+    `DROP TRIGGER IF EXISTS trg_order_item_status_event ON order_items`,
+    `CREATE TRIGGER trg_order_item_status_event AFTER INSERT OR UPDATE ON order_items
+       FOR EACH ROW EXECUTE FUNCTION record_order_item_status_event()`,
+    `CREATE OR REPLACE FUNCTION record_order_payment_status_event() RETURNS TRIGGER AS $$
+     DECLARE item_id INTEGER; event_name TEXT; event_label TEXT;
+     BEGIN
+       IF NEW.payment_status IS DISTINCT FROM OLD.payment_status OR NEW.refund_status IS DISTINCT FROM OLD.refund_status THEN
+         event_name := CASE WHEN NEW.payment_status = 'released' THEN 'payment_released'
+           WHEN NEW.payment_status = 'refunded' OR NEW.refund_status = 'processed' THEN 'refund_completed'
+           WHEN NEW.refund_status = 'failed' THEN 'refund_failed'
+           WHEN NEW.refund_type = 'buyer_cancellation' AND NEW.payment_status = 'refund_pending' AND OLD.payment_status IS DISTINCT FROM NEW.payment_status THEN 'cancellation_submitted'
+           WHEN NEW.payment_status = 'refund_pending' THEN 'refund_processing' ELSE 'payment_updated' END;
+         event_label := CASE event_name WHEN 'payment_released' THEN 'Payment released to seller'
+           WHEN 'refund_completed' THEN 'Refund completed' WHEN 'refund_failed' THEN 'Refund failed — action required'
+           WHEN 'cancellation_submitted' THEN 'Cancellation submitted — refund started'
+           WHEN 'refund_processing' THEN 'Refund submitted to Paystack' ELSE 'Payment status updated' END;
+         FOR item_id IN SELECT id FROM order_items WHERE order_id = NEW.id LOOP
+           INSERT INTO order_item_status_events(order_item_id, event_type, label, details)
+           VALUES (item_id, event_name, event_label, jsonb_build_object('paymentStatus', NEW.payment_status, 'refundStatus', NEW.refund_status));
+         END LOOP;
+       END IF;
+       RETURN NEW;
+     END; $$ LANGUAGE plpgsql`,
+    `DROP TRIGGER IF EXISTS trg_order_payment_status_event ON orders`,
+    `CREATE TRIGGER trg_order_payment_status_event AFTER UPDATE ON orders
+       FOR EACH ROW EXECUTE FUNCTION record_order_payment_status_event()`,
+    `CREATE OR REPLACE FUNCTION record_dispute_status_event() RETURNS TRIGGER AS $$
+     DECLARE item_id INTEGER;
+     BEGIN
+       IF TG_OP = 'INSERT' OR NEW.status IS DISTINCT FROM OLD.status THEN
+         FOR item_id IN SELECT id FROM order_items WHERE order_id = NEW.order_id LOOP
+           INSERT INTO order_item_status_events(order_item_id, event_type, label)
+           VALUES (item_id, CASE WHEN TG_OP = 'INSERT' THEN 'dispute_opened' ELSE 'dispute_' || NEW.status END,
+             CASE WHEN TG_OP = 'INSERT' THEN 'Dispute opened — payment locked' ELSE 'Dispute ' || NEW.status END);
+         END LOOP;
+       END IF;
+       RETURN NEW;
+     END; $$ LANGUAGE plpgsql`,
+    `DROP TRIGGER IF EXISTS trg_dispute_status_event ON dispute_cases`,
+    `CREATE TRIGGER trg_dispute_status_event AFTER INSERT OR UPDATE ON dispute_cases
+       FOR EACH ROW EXECUTE FUNCTION record_dispute_status_event()`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -5509,12 +5637,23 @@ async function fetchOrdersWithItems(whereClause, params, { includeDeliveryTokens
     `SELECT * FROM order_items WHERE order_id = ANY($1) ORDER BY id ASC`,
     [orderIds]
   );
+  const historiesResult = await pool.query(
+    `SELECT order_item_id, event_type, label, details, created_at
+     FROM order_item_status_events
+     WHERE order_item_id = ANY($1)
+     ORDER BY created_at ASC, id ASC`,
+    [itemsResult.rows.map((item) => item.id)]
+  );
   const safeItems = itemsResult.rows.map((item) => {
+    const withHistory = {
+      ...item,
+      status_history: historiesResult.rows.filter((event) => event.order_item_id === item.id),
+    };
     // The paid buyer can see the token immediately. A seller receives it only
     // after that buyer explicitly sends it; admin order responses never do.
-    if (includeDeliveryTokens) return item;
-    if (includeSentDeliveryTokens && payoutSellerId && Number(item.seller_id) === Number(payoutSellerId) && item.delivery_token_sent_at) return item;
-    const { delivery_token, ...safe } = item;
+    if (includeDeliveryTokens) return withHistory;
+    if (includeSentDeliveryTokens && payoutSellerId && Number(item.seller_id) === Number(payoutSellerId) && item.delivery_token_sent_at) return withHistory;
+    const { delivery_token, ...safe } = withHistory;
     return safe;
   });
   let payouts = [];
@@ -6456,13 +6595,27 @@ const ORDER_ITEM_STATUSES = new Set(["new", "preparing", "shipped", "delivered",
 
 app.patch("/order-items/:id", authenticate, async (req, res) => {
   try {
-    const existing = await pool.query("SELECT seller_id, cancellation_status FROM order_items WHERE id = $1", [req.params.id]);
+    const existing = await pool.query(
+      "SELECT seller_id, cancellation_status, fulfillment_status, estimated_delivery_start, estimated_delivery_end FROM order_items WHERE id = $1",
+      [req.params.id]
+    );
     if (existing.rows.length === 0) return res.status(404).json({ error: "Order item not found" });
     const isOwnSellerItem = existing.rows[0].seller_id === req.user.id;
     if (!isOwnSellerItem && !hasPermission(req.user, "order_management")) {
       return res.status(403).json({ error: "Only the seller, Order/Dispute Admin, or Super Admin can update fulfillment details" });
     }
-    const { fulfillmentStatus, trackingNumber, carrier, proofOfDeliveryUrl } = req.body;
+    const {
+      fulfillmentStatus,
+      trackingNumber,
+      carrier,
+      proofOfDeliveryUrl,
+      estimatedDeliveryStart,
+      estimatedDeliveryEnd,
+      liveLocationEnabled,
+      liveLocationLatitude,
+      liveLocationLongitude,
+      liveLocationAccuracy,
+    } = req.body;
     if (fulfillmentStatus && existing.rows[0].cancellation_status === "requested") {
       return res.status(409).json({ error: "Approve or deny the buyer's cancellation request before changing fulfillment status" });
     }
@@ -6472,11 +6625,48 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
     const sets = [];
     const values = [];
     let i = 1;
+    const parseDeliveryDate = (value, fieldLabel) => {
+      if (value === undefined) return undefined;
+      if (value === null || value === "") return null;
+      if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+        throw Object.assign(new Error(`${fieldLabel} must use YYYY-MM-DD format`), { statusCode: 400 });
+      }
+      const [year, month, day] = value.split("-").map(Number);
+      const parsed = new Date(Date.UTC(year, month - 1, day));
+      if (parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month - 1 || parsed.getUTCDate() !== day) {
+        throw Object.assign(new Error(`${fieldLabel} is not a valid date`), { statusCode: 400 });
+      }
+      return value;
+    };
+    const deliveryStart = parseDeliveryDate(estimatedDeliveryStart, "Estimated delivery start");
+    const deliveryEnd = parseDeliveryDate(estimatedDeliveryEnd, "Estimated delivery end");
+    const existingStart = existing.rows[0].estimated_delivery_start
+      ? String(existing.rows[0].estimated_delivery_start).slice(0, 10)
+      : null;
+    const existingEnd = existing.rows[0].estimated_delivery_end
+      ? String(existing.rows[0].estimated_delivery_end).slice(0, 10)
+      : null;
+    const effectiveStart = deliveryStart !== undefined ? deliveryStart : existingStart;
+    const effectiveEnd = deliveryEnd !== undefined ? deliveryEnd : existingEnd;
+    if (effectiveStart && effectiveEnd && effectiveEnd < effectiveStart) {
+      return res.status(400).json({ error: "Estimated delivery end cannot be earlier than the start date" });
+    }
+    const hasLocation = liveLocationLatitude !== undefined || liveLocationLongitude !== undefined;
+    if (hasLocation && existing.rows[0].fulfillment_status !== "shipped") {
+      return res.status(409).json({ error: "Mark the order shipped before sharing a delivery location" });
+    }
+    if (hasLocation && fulfillmentStatus && ["delivered", "cancelled", "returned"].includes(fulfillmentStatus)) {
+      return res.status(400).json({ error: "Location sharing cannot continue after delivery closes" });
+    }
     if (fulfillmentStatus) {
       sets.push(`fulfillment_status = $${i++}`);
       values.push(fulfillmentStatus);
       if (fulfillmentStatus === "shipped") {
         sets.push(`shipped_at = COALESCE(shipped_at, NOW())`);
+      }
+      if (["delivered", "cancelled", "returned"].includes(fulfillmentStatus)) {
+        sets.push(`live_location_enabled = FALSE`);
+        sets.push(`live_location_expires_at = NULL`);
       }
     }
     if (typeof trackingNumber === "string") {
@@ -6491,6 +6681,41 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
       sets.push(`proof_of_delivery_url = $${i++}`);
       values.push(proofOfDeliveryUrl);
     }
+    if (deliveryStart !== undefined) {
+      sets.push(`estimated_delivery_start = $${i++}`);
+      values.push(deliveryStart);
+    }
+    if (deliveryEnd !== undefined) {
+      sets.push(`estimated_delivery_end = $${i++}`);
+      values.push(deliveryEnd);
+    }
+    if (typeof liveLocationEnabled === "boolean" && !hasLocation && !(fulfillmentStatus && ["delivered", "cancelled", "returned"].includes(fulfillmentStatus))) {
+      sets.push(`live_location_enabled = $${i++}`);
+      values.push(liveLocationEnabled);
+      if (!liveLocationEnabled) {
+        sets.push(`live_location_updated_at = NOW()`);
+        sets.push(`live_location_expires_at = NULL`);
+      }
+    }
+    if (hasLocation) {
+      const latitude = Number(liveLocationLatitude);
+      const longitude = Number(liveLocationLongitude);
+      const accuracy = liveLocationAccuracy === undefined ? null : Number(liveLocationAccuracy);
+      if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 ||
+          !Number.isFinite(longitude) || longitude < -180 || longitude > 180 ||
+          (accuracy !== null && (!Number.isFinite(accuracy) || accuracy < 0))) {
+        return res.status(400).json({ error: "Invalid delivery location" });
+      }
+      sets.push(`live_location_latitude = $${i++}`);
+      values.push(latitude);
+      sets.push(`live_location_longitude = $${i++}`);
+      values.push(longitude);
+      sets.push(`live_location_accuracy = $${i++}`);
+      values.push(accuracy);
+      sets.push(`live_location_updated_at = NOW()`);
+      sets.push(`live_location_expires_at = NOW() + INTERVAL '30 minutes'`);
+      sets.push(`live_location_enabled = TRUE`);
+    }
     if (sets.length === 0) return res.status(400).json({ error: "No valid fields to update" });
     values.push(req.params.id);
     const result = await pool.query(
@@ -6502,6 +6727,7 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
     }
     res.json({ item: result.rows[0] });
   } catch (err) {
+    if (err.statusCode === 400) return res.status(400).json({ error: err.message });
     sendInternalError(res, err);
   }
 });
@@ -6531,7 +6757,8 @@ async function markItemReceivedAndMaybeRelease(itemId) {
 
     const result = await client.query(
       `UPDATE order_items
-       SET delivery_token = NULL, delivery_token_generated_at = NULL, delivery_token_redeemed_at = NOW()
+       SET delivery_token = NULL, delivery_token_generated_at = NULL, delivery_token_redeemed_at = NOW(),
+           live_location_enabled = FALSE, live_location_expires_at = NULL
        WHERE id = $1 AND delivery_token IS NOT NULL
        RETURNING *`,
       [itemId]
@@ -6863,7 +7090,7 @@ app.patch("/order-items/:id/return-response", authenticate, async (req, res) => 
     const result =
       decision === "approved"
         ? await pool.query(
-            `UPDATE order_items SET return_status = 'approved', fulfillment_status = 'returned' WHERE id = $1 RETURNING *`,
+            `UPDATE order_items SET return_status = 'approved', fulfillment_status = 'returned', live_location_enabled = FALSE, live_location_expires_at = NULL WHERE id = $1 RETURNING *`,
             [req.params.id]
           )
         : await pool.query(`UPDATE order_items SET return_status = 'denied' WHERE id = $1 RETURNING *`, [req.params.id]);
@@ -7090,7 +7317,8 @@ app.post("/webhook/paystack", async (req, res) => {
                   `UPDATE order_items SET
                      fulfillment_status = CASE WHEN $1 = 'return_refund' THEN 'returned' ELSE 'cancelled' END,
                      cancellation_status = 'approved', cancellation_responded_at = NOW(),
-                     delivery_token = NULL, delivery_token_generated_at = NULL
+                     delivery_token = NULL, delivery_token_generated_at = NULL,
+                     live_location_enabled = FALSE, live_location_expires_at = NULL
                    WHERE order_id = $2 AND delivery_token_sent_at IS NULL AND delivery_token_redeemed_at IS NULL`,
                   [order.buyer_exit_type, order.id]
                 );
