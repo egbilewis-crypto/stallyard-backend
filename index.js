@@ -2289,6 +2289,9 @@ const SCHEMA_MIGRATIONS = [
   { version: 53, name: "buyer-token-visible-after-payment", statements: [
     `SELECT 1`,
   ] },
+  { version: 54, name: "buyer-sends-delivery-token-to-seller", statements: [
+    `ALTER TABLE order_items ADD COLUMN IF NOT EXISTS delivery_token_sent_at TIMESTAMP`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -5479,7 +5482,7 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
   }
 });
 
-async function fetchOrdersWithItems(whereClause, params, { includeDeliveryTokens = false, payoutSellerId = null, includeAdminPayouts = false } = {}) {
+async function fetchOrdersWithItems(whereClause, params, { includeDeliveryTokens = false, includeSentDeliveryTokens = false, payoutSellerId = null, includeAdminPayouts = false } = {}) {
   const ordersResult = await pool.query(
     `SELECT * FROM orders WHERE ${whereClause} ORDER BY created_at DESC`,
     params
@@ -5492,9 +5495,10 @@ async function fetchOrdersWithItems(whereClause, params, { includeDeliveryTokens
     [orderIds]
   );
   const safeItems = itemsResult.rows.map((item) => {
-    // The paid buyer can see the token immediately; seller and admin order
-    // responses never receive the secret token value.
+    // The paid buyer can see the token immediately. A seller receives it only
+    // after that buyer explicitly sends it; admin order responses never do.
     if (includeDeliveryTokens) return item;
+    if (includeSentDeliveryTokens && payoutSellerId && Number(item.seller_id) === Number(payoutSellerId) && item.delivery_token_sent_at) return item;
     const { delivery_token, ...safe } = item;
     return safe;
   });
@@ -5534,7 +5538,7 @@ app.get("/orders/selling", authenticate, rejectAdminMarketplaceUse, async (req, 
     const orders = await fetchOrdersWithItems(
       "id IN (SELECT order_id FROM order_items WHERE seller_id = $1)",
       [req.user.id],
-      { payoutSellerId: req.user.id }
+      { payoutSellerId: req.user.id, includeSentDeliveryTokens: true }
     );
     res.json({
       orders: orders.map((order) => order.payment_status === "refunded"
@@ -6408,6 +6412,69 @@ async function markItemReceivedAndMaybeRelease(itemId) {
     client.release();
   }
 }
+
+app.post("/order-items/:id/send-delivery-token", authenticate, codeRateLimit, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const existing = await client.query(
+      `SELECT oi.*, o.buyer_id, o.payment_status, o.is_disputed
+       FROM order_items oi JOIN orders o ON o.id = oi.order_id
+       WHERE oi.id = $1 FOR UPDATE OF oi, o`,
+      [req.params.id]
+    );
+    if (!existing.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Order item not found" });
+    }
+    const item = existing.rows[0];
+    if (Number(item.buyer_id) !== Number(req.user.id)) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Only the buyer can send this delivery token" });
+    }
+    if (item.payment_status !== "held" || !item.delivery_token) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "This delivery token is no longer available" });
+    }
+    if (item.is_disputed || ["requested", "approved"].includes(item.return_status)) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "The token cannot be sent while a dispute or return is active" });
+    }
+    if (item.delivery_token_sent_at) {
+      await client.query("ROLLBACK");
+      return res.json({ item, alreadySent: true });
+    }
+
+    let threadResult = await client.query(
+      "SELECT * FROM threads WHERE listing_id = $1 AND buyer_id = $2 AND seller_id = $3 LIMIT 1",
+      [item.listing_id, item.buyer_id, item.seller_id]
+    );
+    if (!threadResult.rows.length) {
+      threadResult = await client.query(
+        "INSERT INTO threads (listing_id, buyer_id, seller_id) VALUES ($1, $2, $3) RETURNING *",
+        [item.listing_id, item.buyer_id, item.seller_id]
+      );
+    }
+    const body = `Delivery token for order #${item.order_id}, ${item.title}: ${item.delivery_token}`;
+    const messageResult = await client.query(
+      `INSERT INTO messages (thread_id, sender_id, message_type, body, order_id)
+       VALUES ($1, $2, 'text', $3, $4) RETURNING *`,
+      [threadResult.rows[0].id, item.buyer_id, body, item.order_id]
+    );
+    const updated = await client.query(
+      "UPDATE order_items SET delivery_token_sent_at = NOW() WHERE id = $1 RETURNING *",
+      [item.id]
+    );
+    await client.query("COMMIT");
+    createNotification(item.seller_id, "delivery_token_sent", `Buyer sent the delivery token for order #${item.order_id}: ${item.title}`);
+    res.json({ item: updated.rows[0], message: messageResult.rows[0] });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    sendInternalError(res, err);
+  } finally {
+    client.release();
+  }
+});
 
 app.patch("/order-items/:id/confirm-receipt", authenticate, async (req, res) => {
   try {
