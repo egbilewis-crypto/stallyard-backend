@@ -5074,7 +5074,7 @@ const LISTING_SUBCATEGORIES = {
 
 const CASUAL_SELLER_LIMIT_NGN = 500000;
 const VERIFIED_SELLER_LIMIT_NGN = 10000000;
-const CASUAL_SELLER_ID_TYPES = new Set(["nin", "passport", "drivers_license", "voters_card"]);
+const CASUAL_SELLER_ID_TYPES = new Set(["nin", "passport", "drivers_license", "voters_card", "cerpac"]);
 const CASUAL_SELLER_CONSENT_VERSION = "2026-09-12";
 const VERIFICATION_BUCKET = process.env.SUPABASE_VERIFICATION_BUCKET || "seller-verification-private";
 
