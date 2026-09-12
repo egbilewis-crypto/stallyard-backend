@@ -339,9 +339,9 @@ const ADMIN_ROLES = new Set([
 const ROLE_PERMISSIONS = {
   seller_verification: new Set(["seller_verification"]),
   listing_moderator: new Set(["listing_moderation"]),
-  order_dispute: new Set(["dispute_resolution", "order_access", "order_management"]),
+  order_dispute: new Set(["dispute_resolution", "order_access", "order_management", "seller_report_review"]),
   finance: new Set(["finance", "order_access"]),
-  customer_support: new Set(["support_tickets", "message_moderation"]),
+  customer_support: new Set(["support_tickets", "message_moderation", "seller_report_review"]),
 };
 
 function hasPermission(user, permission) {
@@ -8914,13 +8914,19 @@ app.post("/reviews", authenticate, async (req, res) => {
     }
 
     const purchase = await pool.query(
-      `SELECT 1 FROM orders o
+      `SELECT oi.fulfillment_status, o.payment_status FROM orders o
        JOIN order_items oi ON oi.order_id = o.id
        WHERE o.id = $1 AND o.buyer_id = $2 AND oi.listing_id = $3 AND oi.seller_id = $4`,
       [orderId, buyerId, listingId, sellerId]
     );
     if (purchase.rows.length === 0) {
       return res.status(403).json({ error: "You can only review items you've actually purchased" });
+    }
+    if (purchase.rows[0].fulfillment_status !== "delivered" && purchase.rows[0].payment_status !== "released") {
+      return res.status(409).json({ error: "You can review this item only after delivery is completed" });
+    }
+    if (["cancelled", "returned"].includes(purchase.rows[0].fulfillment_status)) {
+      return res.status(409).json({ error: "Cancelled or returned items cannot be reviewed" });
     }
 
     const existing = await pool.query(
@@ -9093,7 +9099,7 @@ app.post("/seller-reports", authenticate, rejectAdminMarketplaceUse, async (req,
     await pool.query(
       `INSERT INTO notifications(user_id, type, message)
        SELECT id, 'seller_report_received', $1 FROM users
-       WHERE is_admin = true AND admin_role IN ('super_admin', 'user_support', 'order_dispute')`,
+       WHERE is_admin = true AND admin_role IN ('super_admin', 'customer_support', 'order_dispute')`,
       [`Seller report ${reference} requires review.`]
     ).catch(() => {});
     res.status(201).json({ report: result.rows[0] });
@@ -9114,7 +9120,7 @@ app.get("/seller-reports/mine", authenticate, rejectAdminMarketplaceUse, async (
   } catch (err) { sendInternalError(res, err); }
 });
 
-app.get("/seller-reports", authenticate, requirePermission("user_management"), async (req, res) => {
+app.get("/seller-reports", authenticate, requirePermission("seller_report_review"), async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT sr.*, reporter.username AS reporter_username, reporter.display_name AS reporter_display_name,
@@ -9127,7 +9133,7 @@ app.get("/seller-reports", authenticate, requirePermission("user_management"), a
   } catch (err) { sendInternalError(res, err); }
 });
 
-app.patch("/seller-reports/:id", authenticate, requirePermission("user_management"), async (req, res) => {
+app.patch("/seller-reports/:id", authenticate, requirePermission("seller_report_review"), async (req, res) => {
   try {
     const status = String(req.body?.status || "");
     const adminNote = String(req.body?.adminNote || "").trim().slice(0, 2000);
