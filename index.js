@@ -3930,26 +3930,30 @@ app.post("/logout", (req, res) => {
 app.post("/login", authRateLimit, async (req, res) => {
   try {
     const { username, password } = req.body;
+    const loginIdentifier = String(username || "").trim().toLowerCase();
 
-    if (!username || !password) {
-      return res.status(400).json({ error: "Missing username or password" });
+    if (!loginIdentifier || !password) {
+      return res.status(400).json({ error: "Missing username/email or password" });
     }
 
     const result = await pool.query(
       `SELECT ${USER_RETURNING_FIELDS}, password_hash, totp_secret
-       FROM users WHERE username = $1`,
-      [username]
+       FROM users
+       WHERE LOWER(username) = $1 OR LOWER(email) = $1
+       ORDER BY CASE WHEN LOWER(username) = $1 THEN 0 ELSE 1 END
+       LIMIT 1`,
+      [loginIdentifier]
     );
 
     if (result.rows.length === 0) {
-      return res.status(401).json({ error: "Username or password doesn't match" });
+      return res.status(401).json({ error: "Username/email or password doesn't match" });
     }
 
     const user = result.rows[0];
     const passwordMatches = await bcrypt.compare(password, user.password_hash);
 
     if (!passwordMatches) {
-      return res.status(401).json({ error: "Username or password doesn't match" });
+      return res.status(401).json({ error: "Username/email or password doesn't match" });
     }
 
     if (user.is_suspended) {
