@@ -364,6 +364,13 @@ function requirePermission(permission) {
   };
 }
 
+function requireSuperAdmin(req, res, next) {
+  if (!req.user?.isAdmin || !req.user.twoFactorEnabled || (req.user.adminRole && req.user.adminRole !== "super_admin")) {
+    return res.status(403).json({ error: "Only an authenticated super admin may access identity-verification records" });
+  }
+  next();
+}
+
 const vpnCheckCache = new Map();
 const VPN_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -2470,6 +2477,75 @@ const SCHEMA_MIGRATIONS = [
     `CREATE TRIGGER trg_refund_progress_updated_at BEFORE UPDATE ON orders
        FOR EACH ROW EXECUTE FUNCTION set_refund_progress_updated_at()`,
   ] },
+  { version: 63, name: "casual-seller-automatic-verification", statements: [
+    `ALTER TABLE users
+       ADD COLUMN IF NOT EXISTS casual_seller_status TEXT NOT NULL DEFAULT 'none',
+       ADD COLUMN IF NOT EXISTS casual_seller_limit NUMERIC(14,2) NOT NULL DEFAULT 500000,
+       ADD COLUMN IF NOT EXISTS casual_seller_approved_at TIMESTAMP,
+       ADD COLUMN IF NOT EXISTS casual_seller_suspended_at TIMESTAMP`,
+    `CREATE TABLE IF NOT EXISTS casual_seller_applications (
+       id BIGSERIAL PRIMARY KEY,
+       reference TEXT NOT NULL UNIQUE,
+       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+       legal_name TEXT NOT NULL,
+       date_of_birth DATE NOT NULL,
+       id_type TEXT NOT NULL,
+       id_number_hash TEXT NOT NULL,
+       id_number_last4 TEXT NOT NULL,
+       id_expiration DATE,
+       evidence_paths JSONB NOT NULL DEFAULT '{}'::jsonb,
+       evidence_hashes JSONB NOT NULL DEFAULT '{}'::jsonb,
+       face_descriptor JSONB,
+       liveness_challenges JSONB NOT NULL DEFAULT '[]'::jsonb,
+       automatic_checks JSONB NOT NULL DEFAULT '{}'::jsonb,
+       status TEXT NOT NULL,
+       decision_reason TEXT,
+       consent_version TEXT NOT NULL,
+       consented_at TIMESTAMP NOT NULL,
+       submitted_ip_hash TEXT,
+       submitted_user_agent TEXT,
+       approved_at TIMESTAMP,
+       suspended_at TIMESTAMP,
+       included_in_report_id BIGINT,
+       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+     )`,
+    `ALTER TABLE casual_seller_applications ADD COLUMN IF NOT EXISTS face_descriptor JSONB`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_casual_seller_identity_once
+       ON casual_seller_applications(id_number_hash)
+       WHERE status IN ('approved', 'suspended')`,
+    `CREATE INDEX IF NOT EXISTS idx_casual_seller_applications_user
+       ON casual_seller_applications(user_id, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_casual_seller_daily_report_queue
+       ON casual_seller_applications(status, approved_at)
+       WHERE status = 'approved' AND included_in_report_id IS NULL`,
+    `CREATE TABLE IF NOT EXISTS casual_seller_daily_reports (
+       id BIGSERIAL PRIMARY KEY,
+       report_date DATE NOT NULL UNIQUE,
+       application_count INTEGER NOT NULL DEFAULT 0,
+       pdf_storage_path TEXT,
+       pdf_sha256 TEXT,
+       email_recipients JSONB NOT NULL DEFAULT '[]'::jsonb,
+       email_status TEXT NOT NULL DEFAULT 'pending',
+       email_error TEXT,
+       emailed_at TIMESTAMP,
+       created_at TIMESTAMP NOT NULL DEFAULT NOW()
+     )`,
+    `DO $$ BEGIN
+       IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'casual_seller_applications_report_fk') THEN
+         ALTER TABLE casual_seller_applications ADD CONSTRAINT casual_seller_applications_report_fk
+         FOREIGN KEY (included_in_report_id) REFERENCES casual_seller_daily_reports(id) ON DELETE SET NULL;
+       END IF;
+     END $$`,
+    `CREATE TABLE IF NOT EXISTS casual_seller_access_log (
+       id BIGSERIAL PRIMARY KEY,
+       application_id BIGINT REFERENCES casual_seller_applications(id) ON DELETE RESTRICT,
+       report_id BIGINT REFERENCES casual_seller_daily_reports(id) ON DELETE RESTRICT,
+       admin_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+       action TEXT NOT NULL,
+       created_at TIMESTAMP NOT NULL DEFAULT NOW()
+     )`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -3250,7 +3326,8 @@ const USER_RETURNING_FIELDS = `id, username, email, phone, display_name, first_n
   country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
   bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
-  is_email_verified, is_phone_verified, token_version, admin_role`;
+  is_email_verified, is_phone_verified, token_version, admin_role, casual_seller_status,
+  casual_seller_limit, casual_seller_approved_at`;
 
 app.patch("/users/:id/verify", authenticate, requirePermission("user_management"), async (req, res) => {
   try {
@@ -3907,7 +3984,8 @@ app.post("/admin/login", authRateLimit, async (req, res) => {
 const SESSION_USER_FIELDS = `id, username, email, phone, display_name, first_name, last_name,
   country, is_admin, is_approved, is_verified, is_suspended, account_type,
   has_applied_to_sell, verification_status, avatar_url, store_bio, store_policies,
-  two_factor_enabled, is_email_verified, is_phone_verified, token_version, admin_role`;
+  two_factor_enabled, is_email_verified, is_phone_verified, token_version, admin_role,
+  casual_seller_status, casual_seller_limit, casual_seller_approved_at`;
 
 app.get("/session/me", authenticate, async (req, res) => {
   try {
@@ -4932,7 +5010,518 @@ const LISTING_SUBCATEGORIES = {
   ]
 };
 
+const CASUAL_SELLER_LIMIT_NGN = 500000;
+const CASUAL_SELLER_ID_TYPES = new Set(["nin", "passport", "drivers_license", "voters_card"]);
+const CASUAL_SELLER_CONSENT_VERSION = "2026-09-12";
+const VERIFICATION_BUCKET = process.env.SUPABASE_VERIFICATION_BUCKET || "seller-verification-private";
+
+function verificationStorageConfig() {
+  return {
+    url: (process.env.SUPABASE_URL || "").replace(/\/$/, ""),
+    key: process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY || "",
+  };
+}
+
+async function ensurePrivateVerificationBucket() {
+  const { url, key } = verificationStorageConfig();
+  if (!url || !key) throw new Error("Private seller-verification storage is not configured");
+  const inspect = await fetch(`${url}/storage/v1/bucket/${encodeURIComponent(VERIFICATION_BUCKET)}`, {
+    headers: { apikey: key, Authorization: `Bearer ${key}` },
+  });
+  if (inspect.ok) {
+    const bucket = await inspect.json();
+    if (bucket.public) throw new Error(`${VERIFICATION_BUCKET} exists but is public; identity evidence requires a private bucket`);
+    return;
+  }
+  if (![400, 404].includes(inspect.status)) throw new Error(`Could not inspect private verification bucket (${inspect.status})`);
+  const created = await fetch(`${url}/storage/v1/bucket`, {
+    method: "POST",
+    headers: { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ id: VERIFICATION_BUCKET, name: VERIFICATION_BUCKET, public: false, file_size_limit: 25 * 1024 * 1024,
+      allowed_mime_types: ["image/jpeg", "application/pdf"] }),
+  });
+  if (!created.ok) throw new Error(`Could not create private verification bucket (${created.status})`);
+}
+
+function parseVerificationJpeg(dataUrl, label) {
+  const match = String(dataUrl || "").match(/^data:image\/jpeg;base64,([a-zA-Z0-9+/=]+)$/);
+  if (!match) throw Object.assign(new Error(`${label} must be a camera-captured JPEG image`), { statusCode: 400 });
+  const buffer = Buffer.from(match[1], "base64");
+  if (buffer.length < 20 * 1024) throw Object.assign(new Error(`${label} is too small or unclear — capture it again`), { statusCode: 400 });
+  if (buffer.length > 3 * 1024 * 1024) throw Object.assign(new Error(`${label} is too large — maximum 3 MB`), { statusCode: 413 });
+  if (buffer[0] !== 0xff || buffer[1] !== 0xd8 || buffer[buffer.length - 2] !== 0xff || buffer[buffer.length - 1] !== 0xd9) {
+    throw Object.assign(new Error(`${label} is not a valid JPEG image`), { statusCode: 400 });
+  }
+  return { buffer, sha256: crypto.createHash("sha256").update(buffer).digest("hex") };
+}
+
+async function uploadPrivateVerificationObject(path, buffer, contentType = "image/jpeg") {
+  const { url, key } = verificationStorageConfig();
+  if (!url || !key) throw Object.assign(new Error("Private identity storage isn't configured"), { statusCode: 500 });
+  const endpoint = `${url}/storage/v1/object/${encodeURIComponent(VERIFICATION_BUCKET)}/${path.split("/").map(encodeURIComponent).join("/")}`;
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": contentType, "x-upsert": "false" },
+    body: buffer,
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    console.error("Private verification upload failed:", response.status, body.slice(0, 300));
+    throw Object.assign(new Error("Couldn't securely store verification evidence"), { statusCode: 502 });
+  }
+  return path;
+}
+
+async function fetchPrivateVerificationObject(path) {
+  const { url, key } = verificationStorageConfig();
+  if (!url || !key) throw new Error("Private identity storage isn't configured");
+  const endpoint = `${url}/storage/v1/object/authenticated/${encodeURIComponent(VERIFICATION_BUCKET)}/${String(path).split("/").map(encodeURIComponent).join("/")}`;
+  const response = await fetch(endpoint, { headers: { apikey: key, Authorization: `Bearer ${key}` } });
+  if (!response.ok) throw new Error(`Private verification object could not be read (${response.status})`);
+  return Buffer.from(await response.arrayBuffer());
+}
+
+function identityDigest(value) {
+  const secret = process.env.FIELD_ENCRYPTION_KEY || JWT_SECRET || "development-only";
+  return crypto.createHmac("sha256", secret).update(String(value || "").replace(/\s+/g, "").toUpperCase()).digest("hex");
+}
+
+function normalizedPersonName(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z]/g, "");
+}
+
+function ageOnDate(dateOfBirth, now = new Date()) {
+  const birth = new Date(`${dateOfBirth}T00:00:00Z`);
+  if (Number.isNaN(birth.getTime()) || birth > now) return -1;
+  let age = now.getUTCFullYear() - birth.getUTCFullYear();
+  const beforeBirthday = now.getUTCMonth() < birth.getUTCMonth() ||
+    (now.getUTCMonth() === birth.getUTCMonth() && now.getUTCDate() < birth.getUTCDate());
+  if (beforeBirthday) age--;
+  return age;
+}
+
+async function activeListingValue(client, ownerId, excludeListingId = null) {
+  const result = await client.query(
+    `SELECT COALESCE(SUM(price * GREATEST(COALESCE(quantity, 1), 1)), 0)::numeric AS total
+       FROM listings WHERE owner_id = $1 AND status = 'active' AND ($2::integer IS NULL OR id <> $2)`,
+    [ownerId, excludeListingId]
+  );
+  return Number(result.rows[0]?.total || 0);
+}
+
+async function assertSellerMayPublish(client, ownerId, proposedPrice, proposedQuantity, excludeListingId = null) {
+  const userResult = await client.query(
+    `SELECT is_approved, casual_seller_status, casual_seller_limit, username, display_name
+       FROM users WHERE id = $1 FOR UPDATE`,
+    [ownerId]
+  );
+  if (!userResult.rows.length) throw Object.assign(new Error("Seller account not found"), { statusCode: 404 });
+  const seller = userResult.rows[0];
+  if (seller.is_approved) return seller;
+  if (seller.casual_seller_status !== "approved") {
+    throw Object.assign(new Error("Complete automatic casual-seller identity verification before publishing."), { statusCode: 403, code: "CASUAL_VERIFICATION_REQUIRED" });
+  }
+  const price = Number(proposedPrice || 0);
+  const quantity = Math.max(1, Number(proposedQuantity || 1));
+  const current = await activeListingValue(client, ownerId, excludeListingId);
+  const limit = Number(seller.casual_seller_limit || CASUAL_SELLER_LIMIT_NGN);
+  if (!Number.isFinite(price) || price <= 0 || current + price * quantity > limit) {
+    throw Object.assign(new Error(`Casual sellers may have no more than ₦${limit.toLocaleString("en-NG")} in combined active listings.`), {
+      statusCode: 409, code: "CASUAL_LISTING_LIMIT", currentActiveValue: current, limit,
+    });
+  }
+  return seller;
+}
+
+app.get("/casual-seller/status", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  try {
+    const user = await pool.query(
+      `SELECT casual_seller_status, casual_seller_limit, casual_seller_approved_at,
+              is_approved, is_email_verified, is_phone_verified
+         FROM users WHERE id = $1`, [req.user.id]
+    );
+    const latest = await pool.query(
+      `SELECT reference, status, decision_reason, automatic_checks, created_at, approved_at
+         FROM casual_seller_applications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`, [req.user.id]
+    );
+    const currentValue = await activeListingValue(pool, req.user.id);
+    res.json({
+      status: user.rows[0]?.casual_seller_status || "none",
+      limit: Number(user.rows[0]?.casual_seller_limit || CASUAL_SELLER_LIMIT_NGN),
+      currentActiveValue: currentValue,
+      remainingValue: Math.max(0, Number(user.rows[0]?.casual_seller_limit || CASUAL_SELLER_LIMIT_NGN) - currentValue),
+      fullyApprovedSeller: !!user.rows[0]?.is_approved,
+      emailVerified: !!user.rows[0]?.is_email_verified,
+      phoneVerified: !!user.rows[0]?.is_phone_verified,
+      application: latest.rows[0] || null,
+    });
+  } catch (err) { sendInternalError(res, err); }
+});
+
+app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, async (req, res) => {
+  const client = await pool.connect();
+  const uploadedPaths = [];
+  try {
+    const {
+      legalName, dateOfBirth, idType, idNumber, idExpiration, consent,
+      liveSelfie, holdingIdSelfie, idFront, idBack, challengeFrames, challenges,
+      faceDetectionSupported, faceChecks, faceMatch,
+    } = req.body || {};
+    if (consent !== true) return res.status(400).json({ error: "Consent is required before identity verification" });
+    if (!legalName || !dateOfBirth || !idNumber || !CASUAL_SELLER_ID_TYPES.has(idType)) {
+      return res.status(400).json({ error: "Complete your legal name, birth date, ID type, and ID number" });
+    }
+    if (ageOnDate(dateOfBirth) < 18) return res.status(400).json({ error: "Casual sellers must be at least 18 years old" });
+    if (idExpiration && new Date(`${idExpiration}T23:59:59Z`) < new Date()) return res.status(400).json({ error: "This identification has expired" });
+    if (!Array.isArray(challengeFrames) || challengeFrames.length !== 3 || !Array.isArray(challenges) || challenges.length !== 3) {
+      return res.status(400).json({ error: "Complete all three live camera challenges" });
+    }
+    const acceptedChallenges = new Set(["blink", "turn_left", "turn_right", "smile", "move_closer"]);
+    if (new Set(challenges).size !== 3 || challenges.some((item) => !acceptedChallenges.has(item))) {
+      return res.status(400).json({ error: "The live camera challenge is invalid — restart verification" });
+    }
+
+    const images = {
+      live_selfie: parseVerificationJpeg(liveSelfie, "Live selfie"),
+      holding_id_selfie: parseVerificationJpeg(holdingIdSelfie, "Selfie holding ID"),
+      id_front: parseVerificationJpeg(idFront, "ID front"),
+      ...(idBack ? { id_back: parseVerificationJpeg(idBack, "ID back") } : {}),
+    };
+    challengeFrames.forEach((frame, index) => { images[`challenge_${index + 1}`] = parseVerificationJpeg(frame, `Challenge photo ${index + 1}`); });
+    const hashes = Object.values(images).map((image) => image.sha256);
+    const distinctEvidence = new Set(hashes).size === hashes.length;
+
+    await client.query("BEGIN");
+    const accountResult = await client.query(
+      `SELECT id, username, email, phone, first_name, last_name, display_name, country,
+              is_email_verified, is_phone_verified, is_suspended, is_approved, casual_seller_status
+         FROM users WHERE id = $1 FOR UPDATE`, [req.user.id]
+    );
+    const account = accountResult.rows[0];
+    if (!account || account.is_suspended) throw Object.assign(new Error("This account cannot apply"), { statusCode: 403 });
+    if (account.is_approved) throw Object.assign(new Error("Your account already has full seller approval"), { statusCode: 409 });
+    if (!account.is_email_verified || !account.is_phone_verified) {
+      throw Object.assign(new Error("Verify both your email and phone number before applying"), { statusCode: 400, code: "CONTACT_VERIFICATION_REQUIRED" });
+    }
+    const accountName = normalizedPersonName(`${account.first_name || ""}${account.last_name || ""}`) || normalizedPersonName(account.display_name);
+    const submittedName = normalizedPersonName(legalName);
+    const nameMatches = !!accountName && (submittedName.includes(accountName) || accountName.includes(submittedName));
+    const clientFaceChecks = faceDetectionSupported === true && Array.isArray(faceChecks) && faceChecks.length >= 5 && faceChecks.every(Boolean);
+    const faceDescriptor = Array.isArray(faceMatch?.selfieDescriptor) && faceMatch.selfieDescriptor.length === 128 &&
+      faceMatch.selfieDescriptor.every((value) => Number.isFinite(Number(value)) && Math.abs(Number(value)) < 10)
+      ? faceMatch.selfieDescriptor.map(Number) : null;
+    const checks = {
+      age18OrOlder: true,
+      nigeriaAccount: isNigeriaCountry(account.country),
+      emailVerified: true,
+      phoneVerified: true,
+      nameMatchesProfile: nameMatches,
+      evidenceFilesPresent: Object.keys(images).length >= 6,
+      evidenceFilesDistinct: distinctEvidence,
+      randomizedChallengesComplete: true,
+      cameraFacePresenceChecks: clientFaceChecks,
+      liveSelfieMatchesId: faceMatch?.passed === true && Number(faceMatch?.distance) >= 0 && Number(faceMatch.distance) <= 0.5,
+      validFaceDescriptor: !!faceDescriptor,
+      idNotExpired: true,
+      duplicateIdentityNotFound: true,
+      duplicateFaceNotFound: true,
+    };
+    const previousIdentity = await client.query(
+      `SELECT user_id FROM casual_seller_applications
+        WHERE id_number_hash = $1 AND user_id <> $2 AND status IN ('approved','review_required','suspended') LIMIT 1`,
+      [identityDigest(idNumber), req.user.id]
+    );
+    checks.duplicateIdentityNotFound = !previousIdentity.rows.length;
+    if (faceDescriptor) {
+      const previousFaces = await client.query(
+        `SELECT user_id, face_descriptor FROM casual_seller_applications
+          WHERE user_id <> $1 AND status IN ('approved','suspended') AND face_descriptor IS NOT NULL`, [req.user.id]
+      );
+      checks.duplicateFaceNotFound = !previousFaces.rows.some((row) => {
+        const stored = row.face_descriptor;
+        if (!Array.isArray(stored) || stored.length !== 128) return false;
+        const distance = Math.sqrt(faceDescriptor.reduce((sum, value, index) => sum + (value - Number(stored[index] || 0)) ** 2, 0));
+        return distance < 0.45;
+      });
+    }
+    const approved = Object.values(checks).every(Boolean);
+    const status = approved ? "approved" : "review_required";
+    const failedLabels = Object.entries(checks).filter(([, passed]) => !passed).map(([name]) => name);
+    const reference = `CSV-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
+    const applicationInsert = await client.query(
+      `INSERT INTO casual_seller_applications
+        (reference, user_id, legal_name, date_of_birth, id_type, id_number_hash, id_number_last4,
+         id_expiration, evidence_paths, evidence_hashes, liveness_challenges, automatic_checks,
+         status, decision_reason, consent_version, consented_at, submitted_ip_hash, submitted_user_agent, approved_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'{}'::jsonb,$9,$10,$11,$12,$13,$14,NOW(),$15,$16,
+         CASE WHEN $12 = 'approved' THEN NOW() ELSE NULL END) RETURNING id`,
+      [reference, req.user.id, String(legalName).trim(), dateOfBirth, idType, identityDigest(idNumber), String(idNumber).slice(-4),
+       idExpiration || null, JSON.stringify(Object.fromEntries(Object.entries(images).map(([k, v]) => [k, v.sha256]))),
+       JSON.stringify(challenges), JSON.stringify(checks), status,
+       approved ? "All automatic checks passed" : `Automatic verification needs attention: ${failedLabels.join(", ")}`,
+       CASUAL_SELLER_CONSENT_VERSION, identityDigest(getClientIp(req) || "unknown"), String(req.headers["user-agent"] || "").slice(0, 500)]
+    );
+    const applicationId = applicationInsert.rows[0].id;
+    const evidencePaths = {};
+    for (const [name, image] of Object.entries(images)) {
+      const path = `user-${req.user.id}/application-${applicationId}/${name}-${image.sha256.slice(0, 12)}.jpg`;
+      evidencePaths[name] = await uploadPrivateVerificationObject(path, image.buffer);
+      uploadedPaths.push(path);
+    }
+    await client.query("UPDATE casual_seller_applications SET evidence_paths = $1, face_descriptor = $2 WHERE id = $3", [JSON.stringify(evidencePaths), JSON.stringify(faceDescriptor), applicationId]);
+    await client.query(
+      `UPDATE users SET casual_seller_status = $1, casual_seller_approved_at = CASE WHEN $1 = 'approved' THEN NOW() ELSE NULL END,
+         has_applied_to_sell = true, verification_status = CASE WHEN $1 = 'approved' THEN 'casual_approved' ELSE 'review_required' END
+       WHERE id = $2`, [status, req.user.id]
+    );
+    await client.query("COMMIT");
+    createNotification(req.user.id, approved ? "seller_verified" : "verification_problem",
+      approved ? "Your casual-seller identity verification passed. You may publish up to ₦500,000 in combined active listings."
+        : "Your automatic identity verification needs attention. Please review the results and try again.");
+    res.status(201).json({ reference, status, checks, limit: CASUAL_SELLER_LIMIT_NGN });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (err.code === "23505") return res.status(409).json({ error: "This identity is already connected to another seller account", code: "DUPLICATE_IDENTITY" });
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message, code: err.code, currentActiveValue: err.currentActiveValue, limit: err.limit });
+    sendInternalError(res, err, "casual seller application");
+  } finally { client.release(); }
+});
+
+function jpegDimensions(buffer) {
+  let offset = 2;
+  while (offset + 9 < buffer.length) {
+    if (buffer[offset] !== 0xff) { offset++; continue; }
+    const marker = buffer[offset + 1];
+    const length = buffer.readUInt16BE(offset + 2);
+    if ([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf].includes(marker)) {
+      return { height: buffer.readUInt16BE(offset + 5), width: buffer.readUInt16BE(offset + 7) };
+    }
+    if (!length || length < 2) break;
+    offset += 2 + length;
+  }
+  throw new Error("Invalid JPEG dimensions");
+}
+
+function pdfText(value) {
+  return String(value ?? "").replace(/[^\x20-\x7E]/g, "?").replace(/([\\()])/g, "\\$1");
+}
+
+function assemblePdf(objects, rootId) {
+  const chunks = [Buffer.from("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n", "binary")];
+  const offsets = [0];
+  let position = chunks[0].length;
+  for (let id = 1; id < objects.length; id++) {
+    offsets[id] = position;
+    const prefix = Buffer.from(`${id} 0 obj\n`);
+    const suffix = Buffer.from("\nendobj\n");
+    chunks.push(prefix, objects[id], suffix);
+    position += prefix.length + objects[id].length + suffix.length;
+  }
+  const xrefOffset = position;
+  let xref = `xref\n0 ${objects.length}\n0000000000 65535 f \n`;
+  for (let id = 1; id < objects.length; id++) xref += `${String(offsets[id]).padStart(10, "0")} 00000 n \n`;
+  xref += `trailer\n<< /Size ${objects.length} /Root ${rootId} 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+  chunks.push(Buffer.from(xref));
+  return Buffer.concat(chunks);
+}
+
+async function buildCasualSellerReportPdf(applications, reportDate) {
+  const objects = [null];
+  const addObject = (value) => { objects.push(Buffer.isBuffer(value) ? value : Buffer.from(value)); return objects.length - 1; };
+  const fontId = addObject("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+  const pagesId = addObject("");
+  const catalogId = addObject(`<< /Type /Catalog /Pages ${pagesId} 0 R >>`);
+  const pageIds = [];
+  for (const application of applications) {
+    const paths = application.evidence_paths || {};
+    const slots = [
+      ["live_selfie", "Live selfie"], ["holding_id_selfie", "Selfie holding ID"],
+      ["id_front", "ID front"], ["id_back", "ID back"],
+    ].filter(([key]) => paths[key]);
+    const imageObjects = [];
+    for (const [key, label] of slots) {
+      const bytes = await fetchPrivateVerificationObject(paths[key]);
+      const dimensions = jpegDimensions(bytes);
+      const header = Buffer.from(`<< /Type /XObject /Subtype /Image /Width ${dimensions.width} /Height ${dimensions.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${bytes.length} >>\nstream\n`);
+      const imageId = addObject(Buffer.concat([header, bytes, Buffer.from("\nendstream")]));
+      imageObjects.push({ imageId, label, ...dimensions });
+    }
+    let content = "BT /F1 15 Tf 40 808 Td (Stallyard Casual Seller Verification) Tj ET\n";
+    const lines = [
+      `Daily report: ${reportDate}`,
+      `Application: ${application.reference}`,
+      `Applicant: ${application.legal_name} (@${application.username})`,
+      `Email: ${application.email || "not provided"}   Phone: ${application.phone || "not provided"}`,
+      `ID: ${application.id_type} ending ${application.id_number_last4}`,
+      `Date of birth: ${String(application.date_of_birth).slice(0, 10)}   Approved: ${new Date(application.approved_at).toISOString()}`,
+      `Checks: ${Object.entries(application.automatic_checks || {}).map(([key, value]) => `${key}=${value ? "pass" : "fail"}`).join(", ")}`,
+    ];
+    lines.forEach((line, index) => { content += `BT /F1 ${index === 6 ? 7 : 9} Tf 40 ${786 - index * 14} Td (${pdfText(line).slice(0, 145)}) Tj ET\n`; });
+    const placements = [[40, 410], [308, 410], [40, 105], [308, 105]];
+    imageObjects.forEach((image, index) => {
+      const [x, y] = placements[index];
+      const maxW = 247, maxH = 270;
+      const scale = Math.min(maxW / image.width, maxH / image.height);
+      const width = Math.max(1, image.width * scale), height = Math.max(1, image.height * scale);
+      content += `BT /F1 9 Tf ${x} ${y + 278} Td (${pdfText(image.label)}) Tj ET\nq ${width.toFixed(2)} 0 0 ${height.toFixed(2)} ${x} ${y} cm /Im${index + 1} Do Q\n`;
+    });
+    const contentBuffer = Buffer.from(content);
+    const contentId = addObject(Buffer.concat([Buffer.from(`<< /Length ${contentBuffer.length} >>\nstream\n`), contentBuffer, Buffer.from("endstream")]));
+    const xObjects = imageObjects.map((image, index) => `/Im${index + 1} ${image.imageId} 0 R`).join(" ");
+    const pageId = addObject(`<< /Type /Page /Parent ${pagesId} 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 ${fontId} 0 R >> /XObject << ${xObjects} >> >> /Contents ${contentId} 0 R >>`);
+    pageIds.push(pageId);
+  }
+  objects[pagesId] = Buffer.from(`<< /Type /Pages /Count ${pageIds.length} /Kids [${pageIds.map((id) => `${id} 0 R`).join(" ")}] >>`);
+  return assemblePdf(objects, catalogId);
+}
+
+function lagosDateParts(now = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Lagos", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hourCycle: "h23" })
+    .formatToParts(now).reduce((out, part) => ({ ...out, [part.type]: part.value }), {});
+  return { date: `${parts.year}-${parts.month}-${parts.day}`, hour: Number(parts.hour) };
+}
+
+async function sendDailyCasualSellerReport(force = false) {
+  const { date, hour } = lagosDateParts();
+  if (!force && hour < 8) return { skipped: true, reason: "before_schedule" };
+  const lockClient = await pool.connect();
+  try {
+    const locked = await lockClient.query("SELECT pg_try_advisory_lock($1) AS locked", [830500001]);
+    if (!locked.rows[0]?.locked) return { skipped: true, reason: "already_running" };
+    const existing = await lockClient.query("SELECT id, email_status FROM casual_seller_daily_reports WHERE report_date = $1", [date]);
+    if (existing.rows[0]?.email_status === "sent") return { skipped: true, reason: "already_sent" };
+    const applicationsResult = await lockClient.query(
+      `SELECT a.*, u.username, u.email, u.phone
+         FROM casual_seller_applications a JOIN users u ON u.id = a.user_id
+        WHERE a.status = 'approved' AND a.included_in_report_id IS NULL
+        ORDER BY a.approved_at, a.id`
+    );
+    if (!applicationsResult.rows.length) return { skipped: true, reason: "no_applications" };
+    const recipientsResult = await lockClient.query(
+      `SELECT email FROM users WHERE is_admin = true AND COALESCE(admin_role, 'super_admin') = 'super_admin'
+         AND is_suspended = false AND email IS NOT NULL AND email <> ''`
+    );
+    const recipients = [...new Set(recipientsResult.rows.map((row) => row.email.toLowerCase()))];
+    if (!recipients.length) throw new Error("No active super-admin email address is configured");
+    const reportRow = await lockClient.query(
+      `INSERT INTO casual_seller_daily_reports(report_date, application_count, email_recipients)
+       VALUES ($1,$2,$3) ON CONFLICT(report_date) DO UPDATE SET application_count = EXCLUDED.application_count,
+       email_recipients = EXCLUDED.email_recipients, email_status = 'pending', email_error = NULL RETURNING id`,
+      [date, applicationsResult.rows.length, JSON.stringify(recipients)]
+    );
+    const reportId = reportRow.rows[0].id;
+    const pdf = await buildCasualSellerReportPdf(applicationsResult.rows, date);
+    const pdfHash = crypto.createHash("sha256").update(pdf).digest("hex");
+    const pdfPath = `daily-reports/${date}/casual-seller-approved-${reportId}-${pdfHash.slice(0, 12)}-${crypto.randomBytes(4).toString("hex")}.pdf`;
+    await uploadPrivateVerificationObject(pdfPath, pdf, "application/pdf");
+    await lockClient.query("UPDATE casual_seller_daily_reports SET pdf_storage_path=$1, pdf_sha256=$2 WHERE id=$3", [pdfPath, pdfHash, reportId]);
+    if (!process.env.RESEND_API_KEY) throw new Error("RESEND_API_KEY is not configured");
+    const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
+    const emailResponse = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
+      body: JSON.stringify({
+        from: fromAddress, to: recipients,
+        subject: `Stallyard approved casual sellers — ${date}`,
+        html: `<p>Attached is the protected daily record of ${applicationsResult.rows.length} automatically approved casual-seller application(s).</p><p>This document contains sensitive identity information. Do not forward it.</p>`,
+        attachments: [{ filename: `stallyard-casual-sellers-${date}.pdf`, content: pdf.toString("base64") }],
+      }),
+    });
+    if (!emailResponse.ok) throw new Error(`Daily report email failed (${emailResponse.status})`);
+    await lockClient.query("BEGIN");
+    await lockClient.query("UPDATE casual_seller_daily_reports SET email_status='sent', emailed_at=NOW(), email_error=NULL WHERE id=$1", [reportId]);
+    await lockClient.query("UPDATE casual_seller_applications SET included_in_report_id=$1 WHERE id = ANY($2::bigint[])", [reportId, applicationsResult.rows.map((row) => row.id)]);
+    await lockClient.query("COMMIT");
+    return { sent: true, reportId, applicationCount: applicationsResult.rows.length };
+  } catch (err) {
+    await lockClient.query("ROLLBACK").catch(() => {});
+    console.error("Daily casual-seller report failed:", err.message);
+    await lockClient.query(
+      `UPDATE casual_seller_daily_reports SET email_status='failed', email_error=$1
+        WHERE report_date=$2`, [String(err.message).slice(0, 500), date]
+    ).catch(() => {});
+    return { sent: false, error: err.message };
+  } finally {
+    await lockClient.query("SELECT pg_advisory_unlock($1)", [830500001]).catch(() => {});
+    lockClient.release();
+  }
+}
+
+app.get("/admin/casual-seller-applications", authenticate, requireSuperAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT a.id, a.reference, a.user_id, a.legal_name, a.date_of_birth, a.id_type, a.id_number_last4,
+              a.id_expiration, a.status, a.decision_reason, a.automatic_checks, a.liveness_challenges,
+              a.approved_at, a.suspended_at, a.created_at, u.username, u.email, u.phone,
+              ARRAY(SELECT jsonb_object_keys(a.evidence_paths)) AS evidence_keys
+         FROM casual_seller_applications a JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT 500`
+    );
+    res.json({ applications: result.rows });
+  } catch (err) { sendInternalError(res, err); }
+});
+
+app.get("/admin/casual-seller-applications/:id/evidence/:key", authenticate, requireSuperAdmin, async (req, res) => {
+  try {
+    const allowed = new Set(["live_selfie", "holding_id_selfie", "id_front", "id_back", "challenge_1", "challenge_2", "challenge_3"]);
+    if (!allowed.has(req.params.key)) return res.status(400).json({ error: "Invalid evidence type" });
+    const result = await pool.query("SELECT evidence_paths ->> $1 AS path FROM casual_seller_applications WHERE id=$2", [req.params.key, req.params.id]);
+    if (!result.rows[0]?.path) return res.status(404).json({ error: "Evidence not found" });
+    const bytes = await fetchPrivateVerificationObject(result.rows[0].path);
+    await pool.query("INSERT INTO casual_seller_access_log(application_id,admin_id,action) VALUES($1,$2,$3)", [req.params.id, req.user.id, `viewed_${req.params.key}`]);
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("Cache-Control", "private, no-store");
+    res.send(bytes);
+  } catch (err) { sendInternalError(res, err); }
+});
+
+app.patch("/admin/casual-seller-applications/:id/suspend", authenticate, requireSuperAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const application = await client.query("SELECT user_id, reference FROM casual_seller_applications WHERE id=$1 FOR UPDATE", [req.params.id]);
+    if (!application.rows.length) throw Object.assign(new Error("Application not found"), { statusCode: 404 });
+    await client.query("UPDATE casual_seller_applications SET status='suspended', suspended_at=NOW(), decision_reason=$1, updated_at=NOW() WHERE id=$2", [String(req.body?.reason || "Suspended after verification review").slice(0, 500), req.params.id]);
+    await client.query("UPDATE users SET casual_seller_status='suspended', casual_seller_suspended_at=NOW() WHERE id=$1", [application.rows[0].user_id]);
+    await client.query("UPDATE listings SET status='paused' WHERE owner_id=$1 AND status='active'", [application.rows[0].user_id]);
+    await client.query("COMMIT");
+    logAdminAction(req.user.id, "casual_seller_suspended", `Suspended casual seller application ${application.rows[0].reference}`);
+    createNotification(application.rows[0].user_id, "verification_problem", "Your casual-seller verification was suspended. Your active listings have been paused.");
+    res.json({ success: true });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
+    sendInternalError(res, err);
+  } finally { client.release(); }
+});
+
+app.get("/admin/casual-seller-reports", authenticate, requireSuperAdmin, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT id, report_date, application_count, email_status, emailed_at, created_at FROM casual_seller_daily_reports ORDER BY report_date DESC LIMIT 365");
+    res.json({ reports: result.rows });
+  } catch (err) { sendInternalError(res, err); }
+});
+
+app.get("/admin/casual-seller-reports/:id/download", authenticate, requireSuperAdmin, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT report_date,pdf_storage_path FROM casual_seller_daily_reports WHERE id=$1", [req.params.id]);
+    if (!result.rows[0]?.pdf_storage_path) return res.status(404).json({ error: "Report file not found" });
+    const pdf = await fetchPrivateVerificationObject(result.rows[0].pdf_storage_path);
+    await pool.query("INSERT INTO casual_seller_access_log(report_id,admin_id,action) VALUES($1,$2,'downloaded_pdf')", [req.params.id, req.user.id]);
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="stallyard-casual-sellers-${result.rows[0].report_date}.pdf"`);
+    res.setHeader("Cache-Control", "private, no-store");
+    res.send(pdf);
+  } catch (err) { sendInternalError(res, err); }
+});
+
+app.post("/admin/casual-seller-reports/run", authenticate, requireSuperAdmin, async (req, res) => {
+  const result = await sendDailyCasualSellerReport(true);
+  if (result.error) return res.status(502).json({ error: "The report could not be completed", details: result.error });
+  res.json(result);
+});
+
 app.post("/listings", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, async (req, res) => {
+  const client = await pool.connect();
   try {
     const {
       title, description, price, category, subcategory, condition, shippingFee,
@@ -4949,14 +5538,6 @@ app.post("/listings", authenticate, rejectAdminMarketplaceUse, requireNigeriaMar
       return res.status(400).json({ error: "Give it a price before publishing" });
     }
 
-    // The frontend already hides the listing form until a seller is
-    // approved, but that's only a UI convenience — enforce it here too,
-    // since nothing stops someone from calling this endpoint directly.
-    const sellerCheck = await pool.query("SELECT is_approved, username, display_name FROM users WHERE id = $1", [ownerId]);
-    if (!sellerCheck.rows.length || !sellerCheck.rows[0].is_approved) {
-      return res.status(403).json({ error: "Your seller account must be approved before you can list items." });
-    }
-
     // "active" is the one canonical live listing status across browse, checkout, and moderation.
     // Approved sellers may create a draft or publish live; legacy client value "approved" is treated as live.
     const listingStatus = status === "draft" ? "draft" : "active";
@@ -4965,7 +5546,11 @@ app.post("/listings", authenticate, rejectAdminMarketplaceUse, requireNigeriaMar
       return res.status(400).json({ error: "Choose a valid subcategory for this category." });
     }
 
-    const result = await pool.query(
+    await client.query("BEGIN");
+    const seller = listingStatus === "active"
+      ? await assertSellerMayPublish(client, ownerId, price, quantity)
+      : (await client.query("SELECT username, display_name FROM users WHERE id = $1", [ownerId])).rows[0];
+    const result = await client.query(
       `INSERT INTO listings (
          owner_id, title, description, price, category, subcategory, condition, shipping_fee,
          emoji, fit_make, fit_model, fit_year, images, listing_type, currency,
@@ -4987,15 +5572,18 @@ app.post("/listings", authenticate, rejectAdminMarketplaceUse, requireNigeriaMar
 
     const listingWithOwner = {
       ...result.rows[0],
-      owner_username: sellerCheck.rows[0].username,
-      seller_name: sellerCheck.rows[0].display_name,
+      owner_username: seller.username,
+      seller_name: seller.display_name,
     };
 
+    await client.query("COMMIT");
     res.status(201).json({ listing: listingWithOwner });
     moderateListingImagesAsync(result.rows[0].id, images);
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message, code: err.code, currentActiveValue: err.currentActiveValue, limit: err.limit });
     sendInternalError(res, err);
-  }
+  } finally { client.release(); }
 });
 
 function publicListingRow(row) {
@@ -5131,65 +5719,66 @@ const LISTING_FIELD_MAP = {
 const LISTING_JSON_FIELDS = new Set(["images", "bidHistory", "shippingMethods"]);
 
 app.patch("/listings/:id", authenticate, async (req, res) => {
+  const client = await pool.connect();
   try {
-    const existing = await pool.query("SELECT owner_id FROM listings WHERE id = $1", [req.params.id]);
-    if (existing.rows.length === 0) return res.status(404).json({ error: "Listing not found" });
+    await client.query("BEGIN");
+    const existing = await client.query("SELECT * FROM listings WHERE id = $1 FOR UPDATE", [req.params.id]);
+    if (existing.rows.length === 0) throw Object.assign(new Error("Listing not found"), { statusCode: 404 });
     if (existing.rows[0].owner_id !== req.user.id && !hasPermission(req.user, "listing_moderation")) {
-      return res.status(403).json({ error: "You can only edit your own listings" });
+      throw Object.assign(new Error("You can only edit your own listings"), { statusCode: 403 });
     }
     const sets = [];
     const values = [];
-    const currentListing = await pool.query("SELECT category, subcategory FROM listings WHERE id = $1", [req.params.id]);
-    const nextCategory = req.body.category ?? currentListing.rows[0]?.category;
-    const nextSubcategory = req.body.subcategory ?? currentListing.rows[0]?.subcategory;
+    const nextCategory = req.body.category ?? existing.rows[0].category;
+    const nextSubcategory = req.body.subcategory ?? existing.rows[0].subcategory;
     if (Object.prototype.hasOwnProperty.call(req.body, "subcategory") || Object.prototype.hasOwnProperty.call(req.body, "category")) {
       const allowed = LISTING_SUBCATEGORIES[nextCategory] || [];
       if (nextSubcategory && !allowed.includes(nextSubcategory)) {
-        return res.status(400).json({ error: "Choose a valid subcategory for this category." });
+        throw Object.assign(new Error("Choose a valid subcategory for this category."), { statusCode: 400 });
       }
     }
     let i = 1;
     for (const [key, column] of Object.entries(LISTING_FIELD_MAP)) {
-      if (Object.prototype.hasOwnProperty.call(req.body, key)) {
-        sets.push(`${column} = $${i}`);
-        const raw = req.body[key];
-        if (key === "quantity") {
-          values.push(raw === "" || raw === undefined || raw === null ? null : Number(raw));
-        } else if (key === "status") {
-          const normalizedStatus = raw === "approved" ? "active" : raw;
-          const allowedStatuses = new Set(["draft", "pending", "active", "paused", "sold", "rejected", "removed"]);
-          if (!allowedStatuses.has(normalizedStatus)) {
-            return res.status(400).json({ error: "Invalid listing status" });
-          }
-          values.push(normalizedStatus);
-        } else {
-          values.push(LISTING_JSON_FIELDS.has(key) ? JSON.stringify(raw) : raw);
-        }
-        i++;
+      if (!Object.prototype.hasOwnProperty.call(req.body, key)) continue;
+      sets.push(`${column} = $${i}`);
+      const raw = req.body[key];
+      if (key === "quantity") {
+        values.push(raw === "" || raw === undefined || raw === null ? null : Number(raw));
+      } else if (key === "status") {
+        const normalizedStatus = raw === "approved" ? "active" : raw;
+        const allowedStatuses = new Set(["draft", "pending", "active", "paused", "sold", "rejected", "removed"]);
+        if (!allowedStatuses.has(normalizedStatus)) throw Object.assign(new Error("Invalid listing status"), { statusCode: 400 });
+        values.push(normalizedStatus);
+      } else {
+        values.push(LISTING_JSON_FIELDS.has(key) ? JSON.stringify(raw) : raw);
       }
+      i++;
     }
-    if (sets.length === 0) {
-      return res.status(400).json({ error: "No valid fields to update" });
+    if (sets.length === 0) throw Object.assign(new Error("No valid fields to update"), { statusCode: 400 });
+    const nextStatusRaw = Object.prototype.hasOwnProperty.call(req.body, "status") ? req.body.status : existing.rows[0].status;
+    const nextStatus = nextStatusRaw === "approved" ? "active" : nextStatusRaw;
+    if (existing.rows[0].owner_id === req.user.id && nextStatus === "active") {
+      await assertSellerMayPublish(
+        client, req.user.id,
+        Object.prototype.hasOwnProperty.call(req.body, "price") ? req.body.price : existing.rows[0].price,
+        Object.prototype.hasOwnProperty.call(req.body, "quantity") ? req.body.quantity : existing.rows[0].quantity,
+        Number(req.params.id)
+      );
     }
     values.push(req.params.id);
-    const result = await pool.query(
-      `UPDATE listings SET ${sets.join(", ")} WHERE id = $${i} RETURNING *`,
-      values
-    );
-    if (result.rows.length === 0) return res.status(404).json({ error: "Listing not found" });
+    const result = await client.query(`UPDATE listings SET ${sets.join(", ")} WHERE id = $${i} RETURNING *`, values);
+    await client.query("COMMIT");
     if (existing.rows[0].owner_id !== req.user.id) {
       logAdminAction(req.user.id, "listing_moderated", `Updated listing "${result.rows[0].title}" (${Object.keys(req.body).join(", ")})`);
     }
-    if (req.body.status === "rejected") {
-      createNotification(existing.rows[0].owner_id, "listing_rejected", `Your listing "${result.rows[0].title}" was rejected`);
-    }
+    if (req.body.status === "rejected") createNotification(existing.rows[0].owner_id, "listing_rejected", `Your listing "${result.rows[0].title}" was rejected`);
     res.json({ listing: result.rows[0] });
-    if (Object.prototype.hasOwnProperty.call(req.body, "images")) {
-      moderateListingImagesAsync(result.rows[0].id, req.body.images);
-    }
+    if (Object.prototype.hasOwnProperty.call(req.body, "images")) moderateListingImagesAsync(result.rows[0].id, req.body.images);
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message, code: err.code, currentActiveValue: err.currentActiveValue, limit: err.limit });
     sendInternalError(res, err);
-  }
+  } finally { client.release(); }
 });
 
 app.patch("/listings/:id/dismiss-flag", authenticate, async (req, res) => {
@@ -9815,11 +10404,16 @@ const PORT = process.env.PORT || 3000;
 async function startServer() {
   try {
     await applyPendingMigrations();
+    await ensurePrivateVerificationBucket();
     await encryptLegacyTotpSecrets();
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
       setInterval(sendShipReminders, 60 * 60 * 1000).unref();
+      // Check hourly; the persisted report date and advisory lock guarantee a
+      // single daily send at/after 08:00 Africa/Lagos, even across restarts.
+      setInterval(() => sendDailyCasualSellerReport(false), 60 * 60 * 1000).unref();
       sendShipReminders();
+      sendDailyCasualSellerReport(false);
     });
   } catch (err) {
     // Fail the deployment instead of starting against a half-migrated schema.
