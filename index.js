@@ -2292,6 +2292,16 @@ const SCHEMA_MIGRATIONS = [
   { version: 54, name: "buyer-sends-delivery-token-to-seller", statements: [
     `ALTER TABLE order_items ADD COLUMN IF NOT EXISTS delivery_token_sent_at TIMESTAMP`,
   ] },
+  { version: 55, name: "buyer-cancellation-requests", statements: [
+    `ALTER TABLE order_items
+       ADD COLUMN IF NOT EXISTS cancellation_status TEXT,
+       ADD COLUMN IF NOT EXISTS cancellation_reason TEXT,
+       ADD COLUMN IF NOT EXISTS cancellation_requested_at TIMESTAMP,
+       ADD COLUMN IF NOT EXISTS cancellation_responded_at TIMESTAMP`,
+  ] },
+  { version: 56, name: "close-buyer-claims-after-payment-release", statements: [
+    `SELECT 1`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -5580,7 +5590,7 @@ app.patch("/orders/:id/release", authenticate, requirePermission("finance"), asy
     // shortcut around buyer protection.
     const itemResult = await client.query(
       `SELECT id, title, seller_id, fulfillment_status, buyer_confirmed_at, proof_of_delivery_url,
-         delivery_token_redeemed_at, return_status
+         delivery_token_redeemed_at, return_status, cancellation_status
        FROM order_items WHERE order_id = $1 FOR UPDATE`,
       [req.params.id]
     );
@@ -5614,6 +5624,9 @@ app.patch("/orders/:id/release", authenticate, requirePermission("finance"), asy
       }
       if (!item.delivery_token_redeemed_at) {
         safeguardProblems.push(`Item #${item.id} (${item.title}): buyer delivery token has not been redeemed`);
+      }
+      if (["requested", "approved"].includes(item.cancellation_status)) {
+        safeguardProblems.push(`Item #${item.id} (${item.title}): cancellation is ${item.cancellation_status}`);
       }
     }
 
@@ -6031,7 +6044,7 @@ app.patch("/orders/:id/dispute", authenticate, async (req, res) => {
   try {
     const { isDisputed, reason, statement, evidenceUrls } = req.body;
     await client.query("BEGIN");
-    const orderCheck = await client.query("SELECT buyer_id FROM orders WHERE id = $1 FOR UPDATE", [req.params.id]);
+    const orderCheck = await client.query("SELECT buyer_id, payment_status FROM orders WHERE id = $1 FOR UPDATE", [req.params.id]);
     if (orderCheck.rows.length === 0) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "Order not found" });
@@ -6055,6 +6068,10 @@ app.patch("/orders/:id/dispute", authenticate, async (req, res) => {
     if (!isDisputed && !isAdminResolver) {
       await client.query("ROLLBACK");
       return res.status(403).json({ error: "Only a dispute administrator can resolve an open case" });
+    }
+    if (isDisputed && orderCheck.rows[0].payment_status !== "held") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "A dispute cannot be opened after seller payment has been released" });
     }
 
     const result = await client.query(
@@ -6292,13 +6309,16 @@ const ORDER_ITEM_STATUSES = new Set(["new", "preparing", "shipped", "delivered",
 
 app.patch("/order-items/:id", authenticate, async (req, res) => {
   try {
-    const existing = await pool.query("SELECT seller_id FROM order_items WHERE id = $1", [req.params.id]);
+    const existing = await pool.query("SELECT seller_id, cancellation_status FROM order_items WHERE id = $1", [req.params.id]);
     if (existing.rows.length === 0) return res.status(404).json({ error: "Order item not found" });
     const isOwnSellerItem = existing.rows[0].seller_id === req.user.id;
     if (!isOwnSellerItem && !hasPermission(req.user, "order_management")) {
       return res.status(403).json({ error: "Only the seller, Order/Dispute Admin, or Super Admin can update fulfillment details" });
     }
     const { fulfillmentStatus, trackingNumber, carrier, proofOfDeliveryUrl } = req.body;
+    if (fulfillmentStatus && existing.rows[0].cancellation_status === "requested") {
+      return res.status(409).json({ error: "Approve or deny the buyer's cancellation request before changing fulfillment status" });
+    }
     if (fulfillmentStatus && !ORDER_ITEM_STATUSES.has(fulfillmentStatus)) {
       return res.status(400).json({ error: "Invalid fulfillment status" });
     }
@@ -6357,6 +6377,9 @@ async function markItemReceivedAndMaybeRelease(itemId) {
     }
     if (["requested", "approved"].includes(current.return_status)) {
       throw new Error("Payment is locked because a return is in progress");
+    }
+    if (["requested", "approved"].includes(current.cancellation_status)) {
+      throw new Error("Payment is locked because a cancellation is pending or approved");
     }
 
     const result = await client.query(
@@ -6440,6 +6463,10 @@ app.post("/order-items/:id/send-delivery-token", authenticate, codeRateLimit, as
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "The token cannot be sent while a dispute or return is active" });
     }
+    if (["requested", "approved"].includes(item.cancellation_status)) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "The token cannot be sent while a cancellation is pending or approved" });
+    }
     if (item.delivery_token_sent_at) {
       await client.query("ROLLBACK");
       return res.json({ item, alreadySent: true });
@@ -6499,6 +6526,9 @@ app.patch("/order-items/:id/confirm-receipt", authenticate, async (req, res) => 
     if (["requested", "approved"].includes(item.return_status)) {
       return res.status(409).json({ error: "You cannot release a delivery token while a return is in progress" });
     }
+    if (["requested", "approved"].includes(item.cancellation_status)) {
+      return res.status(409).json({ error: "You cannot confirm receipt while cancellation is pending or approved" });
+    }
     if (!["shipped", "delivered"].includes(item.fulfillment_status)) {
       return res.status(400).json({ error: "Confirm delivery only after the item has been shipped and received" });
     }
@@ -6523,6 +6553,100 @@ app.patch("/order-items/:id/confirm-receipt", authenticate, async (req, res) => 
       `Buyer confirmed delivery for "${item.title}". Ask the buyer for the delivery token only after handoff, then upload delivery proof and enter the token.`
     );
     res.json({ item: result.rows[0], token });
+  } catch (err) {
+    sendInternalError(res, err);
+  }
+});
+
+app.post("/order-items/:id/request-cancellation", authenticate, async (req, res) => {
+  try {
+    const reason = String(req.body?.reason || "").trim();
+    if (!reason) return res.status(400).json({ error: "Enter a reason for the cancellation request" });
+    if (reason.length > 1000) return res.status(400).json({ error: "Cancellation reason is too long" });
+    const existing = await pool.query(
+      `SELECT oi.*, o.buyer_id, o.payment_status, o.is_disputed
+       FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE oi.id = $1`,
+      [req.params.id]
+    );
+    if (!existing.rows.length) return res.status(404).json({ error: "Order item not found" });
+    const item = existing.rows[0];
+    if (Number(item.buyer_id) !== Number(req.user.id)) {
+      return res.status(403).json({ error: "Only the buyer can request cancellation" });
+    }
+    if (item.payment_status !== "held") return res.status(409).json({ error: "This order can no longer be cancelled" });
+    if (item.is_disputed || ["requested", "approved"].includes(item.return_status)) {
+      return res.status(409).json({ error: "Cancellation is unavailable while a dispute or return is active" });
+    }
+    if (item.fulfillment_status === "delivered" || item.buyer_confirmed_at || item.delivery_token_sent_at || item.delivery_token_redeemed_at) {
+      return res.status(409).json({ error: "Cancellation is allowed only before you receive the order or send its delivery token" });
+    }
+    if (["cancelled", "returned"].includes(item.fulfillment_status)) {
+      return res.status(409).json({ error: "This item is already cancelled or returned" });
+    }
+    if (item.cancellation_status === "requested" || item.cancellation_status === "approved") {
+      return res.status(409).json({ error: "A cancellation request already exists for this item" });
+    }
+    const result = await pool.query(
+      `UPDATE order_items SET cancellation_status = 'requested', cancellation_reason = $1,
+       cancellation_requested_at = NOW(), cancellation_responded_at = NULL
+       WHERE id = $2 AND fulfillment_status NOT IN ('delivered', 'cancelled', 'returned')
+         AND buyer_confirmed_at IS NULL AND delivery_token_sent_at IS NULL AND delivery_token_redeemed_at IS NULL
+         AND COALESCE(cancellation_status, '') NOT IN ('requested', 'approved')
+       RETURNING *`,
+      [reason, item.id]
+    );
+    if (!result.rows.length) return res.status(409).json({ error: "Cancellation is allowed only before you receive the order or send its delivery token" });
+    createNotification(item.seller_id, "cancellation_requested", `Buyer requested cancellation for order #${item.order_id}: ${item.title}`);
+    res.json({ item: result.rows[0] });
+  } catch (err) {
+    sendInternalError(res, err);
+  }
+});
+
+app.patch("/order-items/:id/cancellation-response", authenticate, async (req, res) => {
+  try {
+    const decision = String(req.body?.decision || "");
+    if (!["approved", "denied"].includes(decision)) {
+      return res.status(400).json({ error: "Decision must be approved or denied" });
+    }
+    const existing = await pool.query(
+      `SELECT oi.*, o.buyer_id, o.payment_status
+       FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE oi.id = $1`,
+      [req.params.id]
+    );
+    if (!existing.rows.length) return res.status(404).json({ error: "Order item not found" });
+    const item = existing.rows[0];
+    const isSeller = Number(item.seller_id) === Number(req.user.id);
+    if (!isSeller && !hasPermission(req.user, "order_management")) {
+      return res.status(403).json({ error: "Only the seller or Order Admin can answer this cancellation request" });
+    }
+    if (item.cancellation_status !== "requested") {
+      return res.status(409).json({ error: "There is no pending cancellation request for this item" });
+    }
+    if (decision === "approved" && (item.fulfillment_status === "delivered" || item.buyer_confirmed_at || item.delivery_token_sent_at || item.delivery_token_redeemed_at)) {
+      return res.status(409).json({ error: "This cancellation cannot be approved because the buyer has received the order or sent the delivery token" });
+    }
+    const result = await pool.query(
+      `UPDATE order_items SET cancellation_status = $1, cancellation_responded_at = NOW(),
+       fulfillment_status = CASE WHEN $1 = 'approved' THEN 'cancelled' ELSE fulfillment_status END,
+       delivery_token = CASE WHEN $1 = 'approved' THEN NULL ELSE delivery_token END
+       WHERE id = $2 AND cancellation_status = 'requested'
+         AND ($1 = 'denied' OR (fulfillment_status <> 'delivered' AND buyer_confirmed_at IS NULL
+           AND delivery_token_sent_at IS NULL AND delivery_token_redeemed_at IS NULL))
+       RETURNING *`,
+      [decision, item.id]
+    );
+    if (!result.rows.length) return res.status(409).json({ error: "This cancellation can no longer be approved" });
+    createNotification(item.buyer_id, "cancellation_response", `Your cancellation request for "${item.title}" was ${decision}.`);
+    if (decision === "approved") {
+      await pool.query(
+        `INSERT INTO notifications (user_id, type, message)
+         SELECT id, 'cancellation_refund_review', $1 FROM users
+         WHERE is_admin = true AND admin_role IN ('super_admin', 'finance')`,
+        [`Cancellation approved for order #${item.order_id}, item #${item.id}. Review the buyer refund.`]
+      ).catch((notifyErr) => console.error("Failed to notify finance about approved cancellation:", notifyErr.message));
+    }
+    res.json({ item: result.rows[0] });
   } catch (err) {
     sendInternalError(res, err);
   }
@@ -6687,6 +6811,9 @@ app.post("/order-items/:id/redeem-delivery-token", authenticate, codeRateLimit, 
     }
     if (["requested", "approved"].includes(item.return_status)) {
       return res.status(409).json({ error: "Payment is locked because a return is in progress" });
+    }
+    if (["requested", "approved"].includes(item.cancellation_status)) {
+      return res.status(409).json({ error: "Payment is locked because a cancellation is pending or approved" });
     }
     if (!item.proof_of_delivery_url) {
       return res.status(400).json({ error: "Upload a delivery picture before entering the buyer's code" });
@@ -7106,7 +7233,8 @@ async function queueAutomaticSellerPayouts(orderId, onlySellerId = null) {
          WHERE pending.order_id = o.id AND pending.seller_id = oi.seller_id
            AND pending.fulfillment_status NOT IN ('cancelled', 'returned')
            AND (COALESCE(pending.proof_of_delivery_url, '') = '' OR pending.delivery_token_redeemed_at IS NULL
-             OR pending.return_status IN ('requested', 'approved'))
+             OR pending.return_status IN ('requested', 'approved')
+             OR pending.cancellation_status IN ('requested', 'approved'))
        )
      GROUP BY oi.seller_id`,
     [orderId, onlySellerId]
