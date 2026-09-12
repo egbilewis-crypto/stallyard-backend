@@ -2591,6 +2591,22 @@ const SCHEMA_MIGRATIONS = [
     `UPDATE verified_seller_applications SET requested_limit = 10000000
        WHERE status = 'pending' AND requested_limit > 10000000`,
   ] },
+  { version: 67, name: "split-casual-and-verified-identity-requirements", statements: [
+    `ALTER TABLE casual_seller_applications
+       ALTER COLUMN id_type DROP NOT NULL,
+       ALTER COLUMN id_number_hash DROP NOT NULL,
+       ALTER COLUMN id_number_last4 DROP NOT NULL`,
+    `ALTER TABLE verified_seller_applications
+       ADD COLUMN IF NOT EXISTS id_type TEXT,
+       ADD COLUMN IF NOT EXISTS id_number_hash TEXT,
+       ADD COLUMN IF NOT EXISTS id_number_last4 TEXT,
+       ADD COLUMN IF NOT EXISTS id_expiration DATE,
+       ADD COLUMN IF NOT EXISTS id_front_path TEXT,
+       ADD COLUMN IF NOT EXISTS id_back_path TEXT`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_verified_seller_identity_once
+       ON verified_seller_applications(id_number_hash)
+       WHERE id_number_hash IS NOT NULL AND status IN ('pending', 'approved')`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -5234,16 +5250,15 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requir
   const uploadedPaths = [];
   try {
     const {
-      legalName, dateOfBirth, idType, idNumber, idExpiration, consent,
-      liveSelfie, holdingIdSelfie, idFront, idBack, challengeFrames, challenges,
+      legalName, dateOfBirth, consent,
+      liveSelfie, holdingIdSelfie, challengeFrames, challenges,
       faceDetectionSupported, faceChecks, faceMatch,
     } = req.body || {};
     if (consent !== true) return res.status(400).json({ error: "Consent is required before identity verification" });
-    if (!legalName || !dateOfBirth || !idNumber || !CASUAL_SELLER_ID_TYPES.has(idType)) {
-      return res.status(400).json({ error: "Complete your legal name, birth date, ID type, and ID number" });
+    if (!legalName || !dateOfBirth) {
+      return res.status(400).json({ error: "Complete your legal name and birth date" });
     }
     if (ageOnDate(dateOfBirth) < 18) return res.status(400).json({ error: "Casual sellers must be at least 18 years old" });
-    if (idExpiration && new Date(`${idExpiration}T23:59:59Z`) < new Date()) return res.status(400).json({ error: "This identification has expired" });
     if (!Array.isArray(challengeFrames) || challengeFrames.length !== 3 || !Array.isArray(challenges) || challenges.length !== 3) {
       return res.status(400).json({ error: "Complete all three live camera challenges" });
     }
@@ -5255,8 +5270,6 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requir
     const images = {
       live_selfie: parseVerificationJpeg(liveSelfie, "Live selfie"),
       holding_id_selfie: parseVerificationJpeg(holdingIdSelfie, "Selfie holding ID"),
-      id_front: parseVerificationJpeg(idFront, "ID front"),
-      ...(idBack ? { id_back: parseVerificationJpeg(idBack, "ID back") } : {}),
     };
     challengeFrames.forEach((frame, index) => { images[`challenge_${index + 1}`] = parseVerificationJpeg(frame, `Challenge photo ${index + 1}`); });
     const hashes = Object.values(images).map((image) => image.sha256);
@@ -5287,22 +5300,14 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requir
       emailVerified: true,
       phoneVerified: true,
       nameMatchesProfile: nameMatches,
-      evidenceFilesPresent: Object.keys(images).length >= 6,
+      evidenceFilesPresent: Object.keys(images).length >= 5,
       evidenceFilesDistinct: distinctEvidence,
       randomizedChallengesComplete: true,
       cameraFacePresenceChecks: clientFaceChecks,
-      liveSelfieMatchesId: faceMatch?.passed === true && Number(faceMatch?.distance) >= 0 && Number(faceMatch.distance) <= 0.5,
+      liveSelfieMatchesHoldingPhoto: faceMatch?.passed === true && Number(faceMatch?.distance) >= 0 && Number(faceMatch.distance) <= 0.5,
       validFaceDescriptor: !!faceDescriptor,
-      idNotExpired: true,
-      duplicateIdentityNotFound: true,
       duplicateFaceNotFound: true,
     };
-    const previousIdentity = await client.query(
-      `SELECT user_id FROM casual_seller_applications
-        WHERE id_number_hash = $1 AND user_id <> $2 AND status IN ('approved','review_required','suspended') LIMIT 1`,
-      [identityDigest(idNumber), req.user.id]
-    );
-    checks.duplicateIdentityNotFound = !previousIdentity.rows.length;
     if (faceDescriptor) {
       const previousFaces = await client.query(
         `SELECT user_id, face_descriptor FROM casual_seller_applications
@@ -5326,8 +5331,8 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requir
          status, decision_reason, consent_version, consented_at, submitted_ip_hash, submitted_user_agent, approved_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'{}'::jsonb,$9,$10,$11,$12,$13,$14,NOW(),$15,$16,
          CASE WHEN $12 = 'approved' THEN NOW() ELSE NULL END) RETURNING id`,
-      [reference, req.user.id, String(legalName).trim(), dateOfBirth, idType, identityDigest(idNumber), String(idNumber).slice(-4),
-       idExpiration || null, JSON.stringify(Object.fromEntries(Object.entries(images).map(([k, v]) => [k, v.sha256]))),
+      [reference, req.user.id, String(legalName).trim(), dateOfBirth, null, null, null,
+       null, JSON.stringify(Object.fromEntries(Object.entries(images).map(([k, v]) => [k, v.sha256]))),
        JSON.stringify(challenges), JSON.stringify(checks), status,
        approved ? "All automatic checks passed" : `Automatic verification needs attention: ${failedLabels.join(", ")}`,
        CASUAL_SELLER_CONSENT_VERSION, identityDigest(getClientIp(req) || "unknown"), String(req.headers["user-agent"] || "").slice(0, 500)]
@@ -5373,6 +5378,13 @@ app.post("/verified-seller/apply", authenticate, rejectAdminMarketplaceUse, requ
   try {
     if (req.body?.consent !== true) return res.status(400).json({ error: "Accept the verified-seller declaration before applying" });
     const document = parsePrivateApplicationDocument(req.body?.bankStatement, "Bank statement");
+    const idType = String(req.body?.idType || "").trim();
+    const idNumber = String(req.body?.idNumber || "").trim();
+    const idExpiration = String(req.body?.idExpiration || "").trim();
+    if (!CASUAL_SELLER_ID_TYPES.has(idType) || !idNumber) return res.status(400).json({ error: "Choose an accepted identification and enter its number" });
+    if (idExpiration && new Date(`${idExpiration}T23:59:59Z`) < new Date()) return res.status(400).json({ error: "This identification has expired" });
+    const idFront = parseVerificationJpeg(req.body?.idFront, "ID front");
+    const idBack = req.body?.idBack ? parseVerificationJpeg(req.body.idBack, "ID back") : null;
     await client.query("BEGIN");
     const userResult = await client.query(
       `SELECT id, username, is_approved, is_suspended, casual_seller_status, is_email_verified,
@@ -5395,16 +5407,28 @@ app.post("/verified-seller/apply", authenticate, rejectAdminMarketplaceUse, requ
     if (!addressResult.rows.length) throw Object.assign(new Error("Add a complete default Nigerian address before applying"), { statusCode: 400 });
     const existing = await client.query("SELECT reference FROM verified_seller_applications WHERE user_id=$1 AND status='pending'", [req.user.id]);
     if (existing.rows.length) throw Object.assign(new Error(`Your verified-seller application ${existing.rows[0].reference} is already awaiting review`), { statusCode: 409 });
+    const duplicateIdentity = await client.query(
+      `SELECT user_id FROM verified_seller_applications
+        WHERE id_number_hash=$1 AND user_id<>$2 AND status IN ('pending','approved') LIMIT 1`,
+      [identityDigest(idNumber), req.user.id]
+    );
+    if (duplicateIdentity.rows.length) throw Object.assign(new Error("This identification is already connected to another seller account"), { statusCode: 409, code: "DUPLICATE_IDENTITY" });
     const reference = `VSA-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
     const path = `user-${req.user.id}/verified-seller/${reference}/bank-statement-${document.sha256.slice(0, 12)}.${document.extension}`;
+    const idFrontPath = `user-${req.user.id}/verified-seller/${reference}/id-front-${idFront.sha256.slice(0, 12)}.jpg`;
+    const idBackPath = idBack ? `user-${req.user.id}/verified-seller/${reference}/id-back-${idBack.sha256.slice(0, 12)}.jpg` : null;
     await uploadPrivateVerificationObject(path, document.buffer, document.contentType);
+    await uploadPrivateVerificationObject(idFrontPath, idFront.buffer);
+    if (idBack && idBackPath) await uploadPrivateVerificationObject(idBackPath, idBack.buffer);
     const snapshot = { identityReference: identityResult.rows[0].reference, emailVerified: true, phoneVerified: true,
-      payoutBankVerified: true, address: addressResult.rows[0], requestedLimit: VERIFIED_SELLER_LIMIT_NGN };
+      payoutBankVerified: true, address: addressResult.rows[0], requestedLimit: VERIFIED_SELLER_LIMIT_NGN,
+      idType, idNumberLast4: idNumber.slice(-4), idExpiration: idExpiration || null };
     await client.query(
       `INSERT INTO verified_seller_applications(reference,user_id,casual_application_id,bank_statement_path,address_id,
-         requested_limit,requirements_snapshot,consented_at,status)
-       VALUES($1,$2,$3,$4,$5,$6,$7,NOW(),'pending')`,
-      [reference, req.user.id, identityResult.rows[0].id, path, addressResult.rows[0].id, VERIFIED_SELLER_LIMIT_NGN, JSON.stringify(snapshot)]
+         requested_limit,requirements_snapshot,consented_at,status,id_type,id_number_hash,id_number_last4,id_expiration,id_front_path,id_back_path)
+       VALUES($1,$2,$3,$4,$5,$6,$7,NOW(),'pending',$8,$9,$10,$11,$12,$13)`,
+      [reference, req.user.id, identityResult.rows[0].id, path, addressResult.rows[0].id, VERIFIED_SELLER_LIMIT_NGN, JSON.stringify(snapshot),
+       idType, identityDigest(idNumber), idNumber.slice(-4), idExpiration || null, idFrontPath, idBackPath]
     );
     await client.query("UPDATE users SET has_applied_to_sell=true, verification_status='pending', rejection_reason=NULL WHERE id=$1", [req.user.id]);
     await client.query("COMMIT");
@@ -5422,6 +5446,7 @@ app.get("/admin/verified-seller-applications", authenticate, requirePermission("
   try {
     const result = await pool.query(
       `SELECT a.id,a.reference,a.user_id,a.requested_limit,a.requirements_snapshot,a.status,a.decision_reason,
+              a.id_type,a.id_number_last4,a.id_expiration,(a.id_back_path IS NOT NULL) AS has_id_back,
               a.created_at,a.reviewed_at,u.username,u.display_name,u.email,u.phone
          FROM verified_seller_applications a JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT 500`
     );
@@ -5438,6 +5463,21 @@ app.get("/admin/verified-seller-applications/:id/bank-statement", authenticate, 
     logAdminAction(req.user.id, "verified_seller_bank_statement_viewed", `Viewed bank statement for ${result.rows[0].reference}`);
     res.setHeader("Content-Type", isPdf ? "application/pdf" : "image/jpeg");
     res.setHeader("Content-Disposition", `inline; filename="${result.rows[0].reference}-bank-statement.${isPdf ? "pdf" : "jpg"}"`);
+    res.setHeader("Cache-Control", "private, no-store");
+    res.send(bytes);
+  } catch (err) { sendInternalError(res, err); }
+});
+
+app.get("/admin/verified-seller-applications/:id/identification/:side", authenticate, requirePermission("seller_verification"), async (req, res) => {
+  try {
+    const column = req.params.side === "front" ? "id_front_path" : req.params.side === "back" ? "id_back_path" : null;
+    if (!column) return res.status(400).json({ error: "Invalid identification side" });
+    const result = await pool.query(`SELECT reference,${column} AS document_path FROM verified_seller_applications WHERE id=$1`, [req.params.id]);
+    if (!result.rows.length || !result.rows[0].document_path) return res.status(404).json({ error: "Identification image not found" });
+    const bytes = await fetchPrivateVerificationObject(result.rows[0].document_path);
+    logAdminAction(req.user.id, "verified_seller_identification_viewed", `Viewed ${req.params.side} identification for ${result.rows[0].reference}`);
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("Content-Disposition", `inline; filename="${result.rows[0].reference}-id-${req.params.side}.jpg"`);
     res.setHeader("Cache-Control", "private, no-store");
     res.send(bytes);
   } catch (err) { sendInternalError(res, err); }
@@ -5508,7 +5548,7 @@ async function buildCasualSellerReportPdf(applications, reportDate) {
       `Application: ${application.reference}`,
       `Applicant: ${application.legal_name} (@${application.username})`,
       `Email: ${application.email || "not provided"}   Phone: ${application.phone || "not provided"}`,
-      `ID: ${application.id_type} ending ${application.id_number_last4}`,
+      `Identity document: shown in holding-ID selfie; full document details required for Verified Seller upgrade`,
       `Date of birth: ${String(application.date_of_birth).slice(0, 10)}   Approved: ${new Date(application.approved_at).toISOString()}`,
       `Checks: ${Object.entries(application.automatic_checks || {}).map(([key, value]) => `${key}=${value ? "pass" : "fail"}`).join(", ")}`,
     ];
