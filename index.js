@@ -2302,6 +2302,11 @@ const SCHEMA_MIGRATIONS = [
   { version: 56, name: "close-buyer-claims-after-payment-release", statements: [
     `SELECT 1`,
   ] },
+  { version: 57, name: "automatic-buyer-refund-with-cancellation-fee", statements: [
+    `ALTER TABLE orders
+       ADD COLUMN IF NOT EXISTS cancellation_fee NUMERIC NOT NULL DEFAULT 0,
+       ADD COLUMN IF NOT EXISTS buyer_exit_type TEXT`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -5728,6 +5733,113 @@ app.patch("/orders/:id/release", authenticate, requirePermission("finance"), asy
   }
 });
 
+app.post("/orders/:id/buyer-cancel-refund", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  const client = await pool.connect();
+  let order;
+  try {
+    const reason = String(req.body?.reason || "").trim();
+    if (!reason) return res.status(400).json({ error: "Enter a reason for cancelling or refunding this order" });
+    if (reason.length > 1000) return res.status(400).json({ error: "Reason is too long" });
+    if (!process.env.PAYSTACK_SECRET_KEY) return res.status(500).json({ error: "Paystack refunds aren't configured — contact support" });
+
+    await client.query("BEGIN");
+    const orderResult = await client.query("SELECT * FROM orders WHERE id = $1 FOR UPDATE", [req.params.id]);
+    if (!orderResult.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Order not found" });
+    }
+    order = orderResult.rows[0];
+    if (Number(order.buyer_id) !== Number(req.user.id)) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Only the buyer can cancel or refund this order" });
+    }
+    if (order.payment_status !== "held") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "This order can no longer be cancelled or refunded" });
+    }
+    if (!order.paystack_reference) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "This order has no Paystack reference for an automatic refund" });
+    }
+    const itemsResult = await client.query("SELECT * FROM order_items WHERE order_id = $1 FOR UPDATE", [order.id]);
+    const items = itemsResult.rows;
+    if (!items.length || items.some((item) => item.delivery_token_sent_at || item.delivery_token_redeemed_at)) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Cancellation and refund are permanently closed because a delivery token was sent to a seller" });
+    }
+    const payoutLock = await client.query(
+      `SELECT 1 FROM seller_payouts WHERE order_id = $1 AND status IN ('queued', 'processing', 'request_unknown', 'paid') LIMIT 1`,
+      [order.id]
+    );
+    if (payoutLock.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Seller payout has already started, so this order cannot be refunded" });
+    }
+    if (order.is_disputed || items.some((item) => ["requested", "approved"].includes(item.return_status))) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Resolve the existing return or dispute before requesting this refund" });
+    }
+    const total = Number(order.total || 0);
+    const cancellationFee = Math.round(total * 0.02 * 100) / 100;
+    const refundAmount = Math.round((total - cancellationFee) * 100) / 100;
+    if (!(refundAmount > 0)) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "This order has no refundable balance" });
+    }
+    const received = items.some((item) => item.fulfillment_status === "delivered" || item.buyer_confirmed_at || item.proof_of_delivery_url);
+    const locked = await client.query(
+      `UPDATE orders SET payment_status = 'refund_pending', refund_status = 'requesting',
+       refund_previous_payment_status = 'held', refund_reason = $1, refund_requested_by = $2,
+       refund_type = 'buyer_cancellation', refund_amount = $3, cancellation_fee = $4,
+       buyer_exit_type = $5, refund_requested_at = NOW(), refunded_at = NULL, refund_failure_reason = NULL
+       WHERE id = $6 RETURNING *`,
+      [reason, req.user.id, refundAmount, cancellationFee, received ? "return_refund" : "cancellation", order.id]
+    );
+    order = locked.rows[0];
+    await client.query("COMMIT");
+
+    let paystackRes;
+    let paystackData;
+    try {
+      paystackRes = await fetch("https://api.paystack.co/refund", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          transaction: order.paystack_reference,
+          amount: Math.round(refundAmount * 100),
+          currency: order.currency || "NGN",
+          customer_note: `Stallyard ${received ? "return" : "cancellation"} refund for order #${order.id}; 2% cancellation fee retained.`,
+          merchant_note: `Automatic buyer refund for order #${order.id}; fee ${cancellationFee}.`,
+        }),
+      });
+      paystackData = await paystackRes.json();
+    } catch (err) {
+      await pool.query("UPDATE orders SET refund_status = 'request_unknown', refund_failure_reason = $1 WHERE id = $2", ["Could not confirm whether Paystack received the refund request.", order.id]);
+      return res.status(502).json({ error: "Refund submission could not be confirmed. The order remains locked while Stallyard verifies it." });
+    }
+    if (!paystackRes.ok || !paystackData.status) {
+      const message = paystackData.message || "Paystack rejected the refund request";
+      const restored = await pool.query(
+        `UPDATE orders SET payment_status = 'held', refund_status = 'failed', refund_failure_reason = $1 WHERE id = $2 RETURNING *`,
+        [message, order.id]
+      );
+      return res.status(400).json({ error: message, order: restored.rows[0] });
+    }
+    const refund = paystackData.data || {};
+    const updated = await pool.query(
+      `UPDATE orders SET refund_status = $1, paystack_refund_id = $2, refund_failure_reason = NULL WHERE id = $3 RETURNING *`,
+      [refund.status || "pending", refund.id || null, order.id]
+    );
+    createNotification(order.buyer_id, "refund_started", `Your ${formatMoneyServer(refundAmount, order.currency)} refund for order #${order.id} was submitted. Stallyard retained the disclosed ${formatMoneyServer(cancellationFee, order.currency)} cancellation fee.`);
+    res.json({ order: updated.rows[0], refundAmount, cancellationFee, buyerExitType: received ? "return_refund" : "cancellation" });
+  } catch (err) {
+    try { await client.query("ROLLBACK"); } catch {}
+    sendInternalError(res, err);
+  } finally {
+    client.release();
+  }
+});
+
 app.patch("/orders/:id/refund", authenticate, requirePermission("finance"), async (req, res) => {
   const client = await pool.connect();
   let order;
@@ -5753,6 +5865,19 @@ app.patch("/orders/:id/refund", authenticate, requirePermission("finance"), asyn
       return res.status(404).json({ error: "Order not found" });
     }
     order = orderResult.rows[0];
+
+    if (order.payment_status !== "held") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Refunds are closed because seller payment is no longer being held" });
+    }
+    const sentToken = await client.query(
+      "SELECT 1 FROM order_items WHERE order_id = $1 AND (delivery_token_sent_at IS NOT NULL OR delivery_token_redeemed_at IS NOT NULL) LIMIT 1",
+      [order.id]
+    );
+    if (sentToken.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Refunds are permanently closed because a delivery token was sent to a seller" });
+    }
 
     const sellerPayoutLock = await client.query(
       `SELECT id, status FROM seller_payouts
@@ -5896,6 +6021,18 @@ app.patch("/orders/:id/refund/partial", authenticate, requirePermission("finance
       return res.status(404).json({ error: "Order not found" });
     }
     order = orderResult.rows[0];
+    if (order.payment_status !== "held") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Refunds are closed because seller payment is no longer being held" });
+    }
+    const sentToken = await client.query(
+      "SELECT 1 FROM order_items WHERE order_id = $1 AND (delivery_token_sent_at IS NOT NULL OR delivery_token_redeemed_at IS NOT NULL) LIMIT 1",
+      [order.id]
+    );
+    if (sentToken.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Refunds are permanently closed because a delivery token was sent to a seller" });
+    }
     const startedSellerPayout = await client.query(
       `SELECT id FROM seller_payouts
        WHERE order_id = $1 AND status IN ('queued', 'processing', 'request_unknown', 'paid') LIMIT 1`,
@@ -6072,6 +6209,16 @@ app.patch("/orders/:id/dispute", authenticate, async (req, res) => {
     if (isDisputed && orderCheck.rows[0].payment_status !== "held") {
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "A dispute cannot be opened after seller payment has been released" });
+    }
+    if (isDisputed) {
+      const sentToken = await client.query(
+        "SELECT 1 FROM order_items WHERE order_id = $1 AND (delivery_token_sent_at IS NOT NULL OR delivery_token_redeemed_at IS NOT NULL) LIMIT 1",
+        [req.params.id]
+      );
+      if (sentToken.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "A case cannot be opened after a delivery token has been sent to a seller" });
+      }
     }
 
     const result = await client.query(
@@ -6560,6 +6707,8 @@ app.patch("/order-items/:id/confirm-receipt", authenticate, async (req, res) => 
 
 app.post("/order-items/:id/request-cancellation", authenticate, async (req, res) => {
   try {
+    return res.status(410).json({ error: "Item-level cancellation was replaced by the automatic whole-order refund with a 2% fee" });
+    /* Legacy handler retained below for deployed-request compatibility. */
     const reason = String(req.body?.reason || "").trim();
     if (!reason) return res.status(400).json({ error: "Enter a reason for the cancellation request" });
     if (reason.length > 1000) return res.status(400).json({ error: "Cancellation reason is too long" });
@@ -6654,6 +6803,8 @@ app.patch("/order-items/:id/cancellation-response", authenticate, async (req, re
 
 app.post("/order-items/:id/request-return", authenticate, async (req, res) => {
   try {
+    return res.status(410).json({ error: "Item-level returns were replaced by the automatic whole-order refund available before token handoff" });
+    /* Legacy handler retained below for deployed-request compatibility. */
     const { reason, note, evidenceUrls } = req.body;
     if (!reason) return res.status(400).json({ error: "Pick a reason for the return" });
     const existing = await pool.query(
@@ -6669,6 +6820,9 @@ app.post("/order-items/:id/request-return", authenticate, async (req, res) => {
     }
     if (item.payment_status !== "held") {
       return res.status(409).json({ error: "A return can no longer be opened because seller payment has already been released" });
+    }
+    if (item.delivery_token_sent_at || item.delivery_token_redeemed_at) {
+      return res.status(409).json({ error: "Returns and refunds are permanently closed because the delivery token was sent to the seller" });
     }
     if (!["shipped", "delivered"].includes(item.fulfillment_status)) {
       return res.status(400).json({ error: "This item hasn't been shipped yet" });
@@ -6912,7 +7066,7 @@ app.post("/webhook/paystack", async (req, res) => {
       if (transactionReference) {
         try {
           const orderResult = await pool.query(
-            "SELECT id, buyer_id, payment_status, refund_previous_payment_status, refund_type, refund_amount, currency FROM orders WHERE paystack_reference = $1",
+            "SELECT id, buyer_id, payment_status, refund_previous_payment_status, refund_type, refund_amount, cancellation_fee, buyer_exit_type, currency FROM orders WHERE paystack_reference = $1",
             [transactionReference]
           );
           if (orderResult.rows.length) {
@@ -6931,6 +7085,16 @@ app.post("/webhook/paystack", async (req, res) => {
                  WHERE id = $3`,
                 [isPartialRefund ? "released" : "refunded", data.id || null, order.id]
               );
+              if (order.refund_type === "buyer_cancellation") {
+                await pool.query(
+                  `UPDATE order_items SET
+                     fulfillment_status = CASE WHEN $1 = 'return_refund' THEN 'returned' ELSE 'cancelled' END,
+                     cancellation_status = 'approved', cancellation_responded_at = NOW(),
+                     delivery_token = NULL, delivery_token_generated_at = NULL
+                   WHERE order_id = $2 AND delivery_token_sent_at IS NULL AND delivery_token_redeemed_at IS NULL`,
+                  [order.buyer_exit_type, order.id]
+                );
+              }
 
               // Resolve only the matching financial outcome after Paystack
               // confirms the money movement. For partial refunds the remaining
@@ -6955,7 +7119,9 @@ app.post("/webhook/paystack", async (req, res) => {
                   logAdminAction(null, "dispute_auto_resolved_after_refund", `Resolved dispute #${row.id} after Paystack processed refund for order #${order.id}`);
                 }
               }
-              createNotification(order.buyer_id, "refund_processed", isPartialRefund
+              createNotification(order.buyer_id, "refund_processed", order.refund_type === "buyer_cancellation"
+                ? `Your refund of ${formatMoneyServer(order.refund_amount || 0, order.currency)} for order #${order.id} has been processed after the ${formatMoneyServer(order.cancellation_fee || 0, order.currency)} cancellation fee.`
+                : isPartialRefund
                 ? `Your partial refund of ${formatMoneyServer(order.refund_amount || 0, order.currency)} for order #${order.id} has been processed.`
                 : `Your refund for order #${order.id} has been processed.`);
             } else if (event.event === "refund.failed") {
