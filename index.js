@@ -2435,6 +2435,28 @@ const SCHEMA_MIGRATIONS = [
     `CREATE TRIGGER trg_dispute_status_event AFTER INSERT OR UPDATE ON dispute_cases
        FOR EACH ROW EXECUTE FUNCTION record_dispute_status_event()`,
   ] },
+  { version: 61, name: "buyer-seller-reports", statements: [
+    `CREATE TABLE IF NOT EXISTS seller_reports (
+       id SERIAL PRIMARY KEY,
+       reference TEXT NOT NULL UNIQUE,
+       reporter_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+       reported_seller_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+       order_id INTEGER REFERENCES orders(id) ON DELETE SET NULL,
+       reason TEXT NOT NULL,
+       details TEXT NOT NULL,
+       evidence_urls JSONB NOT NULL DEFAULT '[]'::jsonb,
+       status TEXT NOT NULL DEFAULT 'open',
+       admin_note TEXT,
+       reviewed_by INTEGER REFERENCES users(id),
+       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+       updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+       resolved_at TIMESTAMP
+     )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_seller_report
+       ON seller_reports(reporter_id, reported_seller_id, COALESCE(order_id, 0))
+       WHERE status IN ('open', 'in_review')`,
+    `CREATE INDEX IF NOT EXISTS idx_seller_reports_admin_queue ON seller_reports(status, created_at DESC)`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -9022,6 +9044,90 @@ app.patch("/review-reports/:id/resolve", authenticate, requirePermission("disput
   } catch (err) {
     sendInternalError(res, err);
   }
+});
+
+const SELLER_REPORT_REASONS = new Set(["fraud", "counterfeit", "harassment", "prohibited_item", "misleading_listing", "delivery_misconduct", "other"]);
+
+app.post("/seller-reports", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  try {
+    const sellerId = Number(req.body?.sellerId);
+    const orderId = req.body?.orderId ? Number(req.body.orderId) : null;
+    const reason = String(req.body?.reason || "").trim();
+    const details = String(req.body?.details || "").trim();
+    const evidenceUrls = Array.isArray(req.body?.evidenceUrls)
+      ? req.body.evidenceUrls.filter((url) => typeof url === "string" && (url.startsWith("https://") || url.startsWith("data:image/")) && url.length <= 2000000).slice(0, 5)
+      : [];
+    if (!Number.isInteger(sellerId) || sellerId <= 0) return res.status(400).json({ error: "Choose a seller to report" });
+    if (sellerId === Number(req.user.id)) return res.status(400).json({ error: "You cannot report your own account" });
+    if (!SELLER_REPORT_REASONS.has(reason)) return res.status(400).json({ error: "Choose a valid report reason" });
+    if (details.length < 10 || details.length > 2000) return res.status(400).json({ error: "Explain what happened in 10 to 2,000 characters" });
+    const seller = await pool.query("SELECT id, username FROM users WHERE id = $1", [sellerId]);
+    if (!seller.rows.length) return res.status(404).json({ error: "Seller not found" });
+    if (orderId) {
+      const related = await pool.query(
+        `SELECT 1 FROM orders o JOIN order_items oi ON oi.order_id = o.id
+         WHERE o.id = $1 AND o.buyer_id = $2 AND oi.seller_id = $3 LIMIT 1`,
+        [orderId, req.user.id, sellerId]
+      );
+      if (!related.rows.length) return res.status(403).json({ error: "That order is not connected to you and this seller" });
+    }
+    const reference = `SR-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
+    const result = await pool.query(
+      `INSERT INTO seller_reports(reference, reporter_id, reported_seller_id, order_id, reason, details, evidence_urls)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [reference, req.user.id, sellerId, orderId, reason, details, JSON.stringify(evidenceUrls)]
+    );
+    await pool.query(
+      `INSERT INTO notifications(user_id, type, message)
+       SELECT id, 'seller_report_received', $1 FROM users
+       WHERE is_admin = true AND admin_role IN ('super_admin', 'user_support', 'order_dispute')`,
+      [`Seller report ${reference} requires review.`]
+    ).catch(() => {});
+    res.status(201).json({ report: result.rows[0] });
+  } catch (err) {
+    if (err.code === "23505") return res.status(409).json({ error: "You already have an open report for this seller and order" });
+    sendInternalError(res, err);
+  }
+});
+
+app.get("/seller-reports/mine", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT sr.*, u.username AS seller_username, u.display_name AS seller_display_name
+       FROM seller_reports sr JOIN users u ON u.id = sr.reported_seller_id
+       WHERE sr.reporter_id = $1 ORDER BY sr.created_at DESC`, [req.user.id]
+    );
+    res.json({ reports: result.rows });
+  } catch (err) { sendInternalError(res, err); }
+});
+
+app.get("/seller-reports", authenticate, requirePermission("user_management"), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT sr.*, reporter.username AS reporter_username, reporter.display_name AS reporter_display_name,
+         seller.username AS seller_username, seller.display_name AS seller_display_name
+       FROM seller_reports sr JOIN users reporter ON reporter.id = sr.reporter_id
+       JOIN users seller ON seller.id = sr.reported_seller_id
+       ORDER BY CASE sr.status WHEN 'open' THEN 0 WHEN 'in_review' THEN 1 ELSE 2 END, sr.created_at DESC`
+    );
+    res.json({ reports: result.rows });
+  } catch (err) { sendInternalError(res, err); }
+});
+
+app.patch("/seller-reports/:id", authenticate, requirePermission("user_management"), async (req, res) => {
+  try {
+    const status = String(req.body?.status || "");
+    const adminNote = String(req.body?.adminNote || "").trim().slice(0, 2000);
+    if (!["in_review", "resolved", "dismissed"].includes(status)) return res.status(400).json({ error: "Invalid report status" });
+    const result = await pool.query(
+      `UPDATE seller_reports SET status=$1, admin_note=$2, reviewed_by=$3, updated_at=NOW(),
+         resolved_at=CASE WHEN $1 IN ('resolved','dismissed') THEN NOW() ELSE NULL END
+       WHERE id=$4 RETURNING *`, [status, adminNote || null, req.user.id, req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: "Seller report not found" });
+    logAdminAction(req.user.id, "seller_report_updated", `Seller report ${result.rows[0].reference} marked ${status}`);
+    res.json({ report: result.rows[0] });
+  } catch (err) { sendInternalError(res, err); }
 });
 
 app.post("/account-reports", authenticate, async (req, res) => {
