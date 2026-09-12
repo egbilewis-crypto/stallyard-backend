@@ -2248,6 +2248,40 @@ const SCHEMA_MIGRATIONS = [
         AND oi.buyer_confirmed_at IS NULL
         AND oi.delivery_token IS NOT NULL`,
   ] },
+  { version: 50, name: "private-delivery-location-details", statements: [
+    `ALTER TABLE user_addresses
+       ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT '',
+       ADD COLUMN IF NOT EXISTS phone TEXT NOT NULL DEFAULT '',
+       ADD COLUMN IF NOT EXISTS delivery_instructions TEXT NOT NULL DEFAULT '',
+       ADD COLUMN IF NOT EXISTS preferred_delivery_time TEXT NOT NULL DEFAULT '',
+       ADD COLUMN IF NOT EXISTS location_photos JSONB NOT NULL DEFAULT '[]'::jsonb`,
+  ] },
+  { version: 51, name: "automatic-seller-payouts", statements: [
+    `ALTER TABLE order_items ADD COLUMN IF NOT EXISTS delivery_token_redeemed_at TIMESTAMP`,
+    `UPDATE order_items oi SET delivery_token_redeemed_at = COALESCE(oi.buyer_confirmed_at, NOW())
+      FROM orders o WHERE o.id = oi.order_id AND o.payment_status = 'released'
+        AND oi.buyer_confirmed_at IS NOT NULL AND COALESCE(oi.proof_of_delivery_url, '') <> ''
+        AND oi.delivery_token_redeemed_at IS NULL`,
+    `CREATE TABLE IF NOT EXISTS seller_payouts (
+       id SERIAL PRIMARY KEY,
+       order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE RESTRICT,
+       seller_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+       amount NUMERIC NOT NULL CHECK (amount > 0),
+       currency TEXT NOT NULL DEFAULT 'NGN',
+       status TEXT NOT NULL DEFAULT 'queued',
+       paystack_reference TEXT NOT NULL UNIQUE,
+       paystack_transfer_code TEXT,
+       failure_reason TEXT,
+       initiated_at TIMESTAMP,
+       completed_at TIMESTAMP,
+       reversed_at TIMESTAMP,
+       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+       updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+       UNIQUE(order_id, seller_id)
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_seller_payouts_seller ON seller_payouts(seller_id, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_seller_payouts_order ON seller_payouts(order_id)`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -2503,9 +2537,9 @@ app.get("/addresses", authenticate, rejectAdminMarketplaceUse, async (req, res) 
 
 app.post("/addresses", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
-    const { label, street, city, state, zip, country, isDefault } = req.body;
-    if (!street || !city || !country) {
-      return res.status(400).json({ error: "Street, city, and country are required" });
+    const { label, fullName, phone, street, city, state, zip, country, deliveryInstructions, preferredDeliveryTime, locationPhotos, isDefault } = req.body;
+    if (!fullName || !phone || !street || !city || !country) {
+      return res.status(400).json({ error: "Recipient name, phone, street, city, and country are required" });
     }
     if (!isNigeriaCountry(country)) {
       return res.status(400).json({ error: "Stallyard shipping addresses must be in Nigeria" });
@@ -2515,10 +2549,13 @@ app.post("/addresses", authenticate, rejectAdminMarketplaceUse, async (req, res)
     if (shouldBeDefault) {
       await pool.query("UPDATE user_addresses SET is_default = false WHERE user_id = $1", [req.user.id]);
     }
+    const photos = Array.isArray(locationPhotos) ? locationPhotos.filter((p) => typeof p === "string" && p.startsWith("data:image/") && p.length <= 1500000).slice(0, 5) : [];
     const result = await pool.query(
-      `INSERT INTO user_addresses (user_id, label, street, city, state, zip, country, is_default)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-      [req.user.id, label || "", street, city, state || "", zip || "", country, shouldBeDefault]
+      `INSERT INTO user_addresses (user_id, label, full_name, phone, street, city, state, zip, country,
+         delivery_instructions, preferred_delivery_time, location_photos, is_default)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *`,
+      [req.user.id, label || "", fullName || "", phone || "", street, city, state || "", zip || "", country,
+       String(deliveryInstructions || "").slice(0, 1000), String(preferredDeliveryTime || "").slice(0, 200), JSON.stringify(photos), shouldBeDefault]
     );
     res.json(result.rows[0]);
   } catch (err) {
@@ -2533,22 +2570,31 @@ app.patch("/addresses/:id", authenticate, async (req, res) => {
     if (existing.rows[0].user_id !== req.user.id) {
       return res.status(403).json({ error: "You can only edit your own addresses" });
     }
-    const { label, street, city, state, zip, country } = req.body;
+    const { label, fullName, phone, street, city, state, zip, country, deliveryInstructions, preferredDeliveryTime, locationPhotos } = req.body;
     const current = existing.rows[0];
     const nextCountry = country ?? current.country;
     if (!isNigeriaCountry(nextCountry)) {
       return res.status(400).json({ error: "Stallyard shipping addresses must be in Nigeria" });
     }
+    const photos = locationPhotos === undefined
+      ? current.location_photos
+      : (Array.isArray(locationPhotos) ? locationPhotos.filter((p) => typeof p === "string" && p.startsWith("data:image/") && p.length <= 1500000).slice(0, 5) : []);
     const result = await pool.query(
-      `UPDATE user_addresses SET label = $1, street = $2, city = $3, state = $4, zip = $5, country = $6
-       WHERE id = $7 RETURNING *`,
+      `UPDATE user_addresses SET label = $1, full_name = $2, phone = $3, street = $4, city = $5, state = $6,
+         zip = $7, country = $8, delivery_instructions = $9, preferred_delivery_time = $10, location_photos = $11
+       WHERE id = $12 RETURNING *`,
       [
         label ?? current.label,
+        fullName ?? current.full_name,
+        phone ?? current.phone,
         street ?? current.street,
         city ?? current.city,
         state ?? current.state,
         zip ?? current.zip,
         country ?? current.country,
+        String(deliveryInstructions ?? current.delivery_instructions ?? "").slice(0, 1000),
+        String(preferredDeliveryTime ?? current.preferred_delivery_time ?? "").slice(0, 200),
+        JSON.stringify(photos || []),
         req.params.id,
       ]
     );
@@ -5129,6 +5175,29 @@ async function getTaxRate() {
   }
 }
 
+function normalizePrivateShippingAddress(input) {
+  const address = input && typeof input === "object" ? input : {};
+  const locationPhotos = Array.isArray(address.locationPhotos)
+    ? address.locationPhotos.filter((p) => typeof p === "string" && p.startsWith("data:image/") && p.length <= 1500000).slice(0, 5)
+    : [];
+  return {
+    fullName: String(address.fullName || "").trim().slice(0, 160),
+    phone: String(address.phone || "").trim().slice(0, 40),
+    street: String(address.street || "").trim().slice(0, 300),
+    city: String(address.city || "").trim().slice(0, 120),
+    state: String(address.state || "").trim().slice(0, 120),
+    zip: String(address.zip || "").trim().slice(0, 30),
+    country: "Nigeria",
+    deliveryInstructions: String(address.deliveryInstructions || "").trim().slice(0, 1000),
+    preferredDeliveryTime: String(address.preferredDeliveryTime || "").trim().slice(0, 200),
+    locationPhotos,
+  };
+}
+
+function privateShippingAddressIsComplete(address) {
+  return !!(address.fullName && address.phone && address.street && address.city && address.zip);
+}
+
 app.post("/checkout", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, (req, res) => {
   return res.status(410).json({
     error: "Legacy checkout is disabled. Use the protected Paystack checkout flow.",
@@ -5144,6 +5213,10 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, requir
     }
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "Cart is empty" });
+    }
+    const normalizedShippingAddress = normalizePrivateShippingAddress(shippingAddress);
+    if (!privateShippingAddressIsComplete(normalizedShippingAddress)) {
+      return res.status(400).json({ error: "Recipient name, phone, street, city, and postal code are required" });
     }
     if (!process.env.PAYSTACK_SECRET_KEY) {
       return res.status(500).json({ error: "Payments aren't configured — contact support" });
@@ -5189,7 +5262,7 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, requir
       await reservationClient.query("BEGIN");
       await createCheckoutIntent({
         reference, buyerId: req.user.id, buyerUsername: req.user.username, buyerEmail: email,
-        amountKobo, items: itemSnapshots, shippingAddress, saveCard: !!saveCard,
+        amountKobo, items: itemSnapshots, shippingAddress: normalizedShippingAddress, saveCard: !!saveCard,
       }, reservationClient);
       await reserveCheckoutListings(reservationClient, { buyerId: req.user.id, reference, items: itemSnapshots });
       await reservationClient.query("COMMIT");
@@ -5222,7 +5295,6 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, requir
           buyerId: req.user.id,
           buyerUsername: req.user.username,
           items: items.map((i) => ({ listingId: i.listingId, qty: Number(i.qty) })),
-          shippingAddress: shippingAddress || {},
           currency: "NGN",
           saveCard: !!saveCard,
         },
@@ -5288,6 +5360,10 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "Cart is empty" });
     }
+    const normalizedShippingAddress = normalizePrivateShippingAddress(shippingAddress);
+    if (!privateShippingAddressIsComplete(normalizedShippingAddress)) {
+      return res.status(400).json({ error: "Recipient name, phone, street, city, and postal code are required" });
+    }
     if (!cardId) return res.status(400).json({ error: "Pick a saved card" });
     if (!process.env.PAYSTACK_SECRET_KEY) {
       return res.status(500).json({ error: "Payments aren't configured — contact support" });
@@ -5337,7 +5413,7 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
       await reservationClient.query("BEGIN");
       await createCheckoutIntent({
         reference, buyerId: req.user.id, buyerUsername: req.user.username, buyerEmail: email,
-        amountKobo, items: itemSnapshots, shippingAddress, saveCard: false,
+        amountKobo, items: itemSnapshots, shippingAddress: normalizedShippingAddress, saveCard: false,
       }, reservationClient);
       await reserveCheckoutListings(reservationClient, { buyerId: req.user.id, reference, items: itemSnapshots });
       await reservationClient.query("COMMIT");
@@ -5370,7 +5446,6 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
           buyerId: req.user.id,
           buyerUsername: req.user.username,
           items: items.map((i) => ({ listingId: i.listingId, qty: Number(i.qty) })),
-          shippingAddress: shippingAddress || {},
           currency: "NGN",
         },
       }),
@@ -5397,7 +5472,7 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
   }
 });
 
-async function fetchOrdersWithItems(whereClause, params, { includeDeliveryTokens = false } = {}) {
+async function fetchOrdersWithItems(whereClause, params, { includeDeliveryTokens = false, payoutSellerId = null, includeAdminPayouts = false } = {}) {
   const ordersResult = await pool.query(
     `SELECT * FROM orders WHERE ${whereClause} ORDER BY created_at DESC`,
     params
@@ -5414,9 +5489,24 @@ async function fetchOrdersWithItems(whereClause, params, { includeDeliveryTokens
     const { delivery_token, ...safe } = item;
     return safe;
   });
+  let payouts = [];
+  if (payoutSellerId || includeAdminPayouts) {
+    const payoutParams = [orderIds];
+    let payoutWhere = "order_id = ANY($1)";
+    if (payoutSellerId) {
+      payoutParams.push(payoutSellerId);
+      payoutWhere += " AND seller_id = $2";
+    }
+    const payoutResult = await pool.query(
+      `SELECT * FROM seller_payouts WHERE ${payoutWhere} ORDER BY created_at DESC`,
+      payoutParams
+    );
+    payouts = payoutResult.rows;
+  }
   return orders.map((o) => ({
     ...o,
     items: safeItems.filter((i) => i.order_id === o.id),
+    payouts: payouts.filter((p) => p.order_id === o.id),
   }));
 }
 
@@ -5434,9 +5524,14 @@ app.get("/orders/selling", authenticate, rejectAdminMarketplaceUse, async (req, 
   try {
     const orders = await fetchOrdersWithItems(
       "id IN (SELECT order_id FROM order_items WHERE seller_id = $1)",
-      [req.user.id]
+      [req.user.id],
+      { payoutSellerId: req.user.id }
     );
-    res.json({ orders });
+    res.json({
+      orders: orders.map((order) => order.payment_status === "refunded"
+        ? { ...order, shipping_address: { accessRemoved: true } }
+        : order),
+    });
   } catch (err) {
     sendInternalError(res, err);
   }
@@ -5444,7 +5539,7 @@ app.get("/orders/selling", authenticate, rejectAdminMarketplaceUse, async (req, 
 
 app.get("/orders", authenticate, requirePermission("order_access"), async (req, res) => {
   try {
-    const orders = await fetchOrdersWithItems("TRUE", []);
+    const orders = await fetchOrdersWithItems("TRUE", [], { includeAdminPayouts: true });
     res.json({ orders });
   } catch (err) {
     sendInternalError(res, err);
@@ -5471,7 +5566,8 @@ app.patch("/orders/:id/release", authenticate, requirePermission("finance"), asy
     // bypass an active return. This keeps "emergency release" from becoming a
     // shortcut around buyer protection.
     const itemResult = await client.query(
-      `SELECT id, title, fulfillment_status, buyer_confirmed_at, proof_of_delivery_url, return_status
+      `SELECT id, title, seller_id, fulfillment_status, buyer_confirmed_at, proof_of_delivery_url,
+         delivery_token_redeemed_at, return_status
        FROM order_items WHERE order_id = $1 FOR UPDATE`,
       [req.params.id]
     );
@@ -5504,6 +5600,9 @@ app.patch("/orders/:id/release", authenticate, requirePermission("finance"), asy
         safeguardProblems.push(`Item #${item.id} (${item.title}): delivery picture is missing`);
       }
       if (!item.buyer_confirmed_at) {
+        safeguardProblems.push(`Item #${item.id} (${item.title}): buyer has not confirmed delivery`);
+      }
+      if (!item.delivery_token_redeemed_at) {
         safeguardProblems.push(`Item #${item.id} (${item.title}): buyer delivery token has not been redeemed`);
       }
     }
@@ -5580,6 +5679,11 @@ app.patch("/orders/:id/release", authenticate, requirePermission("finance"), asy
     );
     for (const row of sellerIds.rows) {
       createNotification(row.seller_id, "funds_released", "Funds released for order — payment is now in your available balance.");
+      if (!usedDeliveryOverride) {
+        await queueAutomaticSellerPayouts(Number(req.params.id), row.seller_id).catch((err) => {
+          console.error(`Automatic payout scheduling failed after finance release for order #${req.params.id}, seller #${row.seller_id}:`, err.message);
+        });
+      }
     }
     if (resolvedDispute) {
       const buyer = await pool.query("SELECT buyer_id FROM orders WHERE id = $1", [req.params.id]);
@@ -5626,6 +5730,20 @@ app.patch("/orders/:id/refund", authenticate, requirePermission("finance"), asyn
       return res.status(404).json({ error: "Order not found" });
     }
     order = orderResult.rows[0];
+
+    const sellerPayoutLock = await client.query(
+      `SELECT id, status FROM seller_payouts
+       WHERE order_id = $1 AND status IN ('queued', 'processing', 'request_unknown', 'paid')
+       LIMIT 1`,
+      [order.id]
+    );
+    if (sellerPayoutLock.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error: "A seller bank payout has already started for this order. Finance must resolve or recover that payout before refunding the buyer.",
+        code: "SELLER_PAYOUT_ALREADY_STARTED",
+      });
+    }
 
     if (!order.paystack_reference) {
       await client.query("ROLLBACK");
@@ -5755,6 +5873,15 @@ app.patch("/orders/:id/refund/partial", authenticate, requirePermission("finance
       return res.status(404).json({ error: "Order not found" });
     }
     order = orderResult.rows[0];
+    const startedSellerPayout = await client.query(
+      `SELECT id FROM seller_payouts
+       WHERE order_id = $1 AND status IN ('queued', 'processing', 'request_unknown', 'paid') LIMIT 1`,
+      [order.id]
+    );
+    if (startedSellerPayout.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "A seller bank payout has already started. Resolve or recover it before issuing a partial refund." });
+    }
     const disputeResult = await client.query(
       "SELECT * FROM dispute_cases WHERE id = $1 AND order_id = $2 FOR UPDATE",
       [disputeId, req.params.id]
@@ -6227,7 +6354,7 @@ async function markItemReceivedAndMaybeRelease(itemId) {
 
     const result = await client.query(
       `UPDATE order_items
-       SET delivery_token = NULL, delivery_token_generated_at = NULL
+       SET delivery_token = NULL, delivery_token_generated_at = NULL, delivery_token_redeemed_at = NOW()
        WHERE id = $1 AND delivery_token IS NOT NULL
        RETURNING *`,
       [itemId]
@@ -6241,7 +6368,7 @@ async function markItemReceivedAndMaybeRelease(itemId) {
     );
     const relevant = allItems.rows.filter((r) => !["cancelled", "returned"].includes(r.fulfillment_status));
     const allConfirmed = relevant.length > 0 && relevant.every(
-      (r) => r.buyer_confirmed_at && r.proof_of_delivery_url && !r.delivery_token &&
+      (r) => r.buyer_confirmed_at && r.proof_of_delivery_url && r.delivery_token_redeemed_at &&
         !["requested", "approved"].includes(r.return_status)
     );
     let order = null;
@@ -6262,6 +6389,13 @@ async function markItemReceivedAndMaybeRelease(itemId) {
       for (const sellerId of sellerIds) {
         createNotification(sellerId, "funds_released", "Funds released for order — payment is now in your available balance.");
       }
+    }
+    try {
+      await queueAutomaticSellerPayouts(item.order_id, item.seller_id);
+    } catch (payoutErr) {
+      // Delivery remains valid even if payout scheduling needs finance review.
+      // Never roll back or repeat a redeemed token after the token was accepted.
+      console.error(`Automatic payout scheduling failed for order #${item.order_id}, seller #${item.seller_id}:`, payoutErr.message);
     }
     return { item, order };
   } catch (err) {
@@ -6329,7 +6463,7 @@ app.post("/order-items/:id/request-return", authenticate, async (req, res) => {
     const { reason, note, evidenceUrls } = req.body;
     if (!reason) return res.status(400).json({ error: "Pick a reason for the return" });
     const existing = await pool.query(
-      `SELECT oi.*, o.buyer_id
+      `SELECT oi.*, o.buyer_id, o.payment_status
        FROM order_items oi JOIN orders o ON oi.order_id = o.id
        WHERE oi.id = $1`,
       [req.params.id]
@@ -6338,6 +6472,9 @@ app.post("/order-items/:id/request-return", authenticate, async (req, res) => {
     const item = existing.rows[0];
     if (item.buyer_id !== req.user.id) {
       return res.status(403).json({ error: "Only the buyer can request a return on this item" });
+    }
+    if (item.payment_status !== "held") {
+      return res.status(409).json({ error: "A return can no longer be opened because seller payment has already been released" });
     }
     if (!["shipped", "delivered"].includes(item.fulfillment_status)) {
       return res.status(400).json({ error: "This item hasn't been shipped yet" });
@@ -6538,6 +6675,43 @@ app.post("/webhook/paystack", async (req, res) => {
           await markCheckoutIntent(event.data.reference, "integrity_failed", err.message).catch(() => {});
         }
         console.error("Webhook order finalization blocked:", err.message);
+      }
+    }
+
+    if (["transfer.success", "transfer.failed", "transfer.reversed"].includes(event.event)) {
+      const data = event.data || {};
+      const reference = String(data.reference || "");
+      const transferCode = data.transfer_code || null;
+      const payoutResult = await pool.query(
+        `SELECT * FROM seller_payouts
+         WHERE paystack_reference = $1 OR ($2::text IS NOT NULL AND paystack_transfer_code = $2)
+         LIMIT 1`,
+        [reference, transferCode]
+      );
+      if (payoutResult.rows.length) {
+        const payout = payoutResult.rows[0];
+        if (event.event === "transfer.success") {
+          await pool.query(
+            `UPDATE seller_payouts SET status = 'paid', paystack_transfer_code = COALESCE($1, paystack_transfer_code),
+               completed_at = NOW(), failure_reason = NULL, updated_at = NOW() WHERE id = $2`,
+            [transferCode, payout.id]
+          );
+          createNotification(payout.seller_id, "payout_completed", `Paystack paid ${formatMoneyServer(payout.amount)} to your bank for order #${payout.order_id}.`);
+        } else if (event.event === "transfer.failed") {
+          await pool.query(
+            `UPDATE seller_payouts SET status = 'failed', paystack_transfer_code = COALESCE($1, paystack_transfer_code),
+               failure_reason = $2, updated_at = NOW() WHERE id = $3`,
+            [transferCode, data.reason || "Paystack reported that the transfer failed", payout.id]
+          );
+          createNotification(payout.seller_id, "payout_failed", `Your payout for order #${payout.order_id} failed. Stallyard support will review it.`);
+        } else {
+          await pool.query(
+            `UPDATE seller_payouts SET status = 'reversed', paystack_transfer_code = COALESCE($1, paystack_transfer_code),
+               reversed_at = NOW(), failure_reason = $2, updated_at = NOW() WHERE id = $3`,
+            [transferCode, data.reason || "Paystack reversed the transfer", payout.id]
+          );
+          createNotification(payout.seller_id, "payout_reversed", `Paystack reversed your payout for order #${payout.order_id}. The amount is protected while support reviews it.`);
+        }
       }
     }
 
@@ -6837,7 +7011,7 @@ app.post(
   }
 });
 
-async function sendPaystackTransfer(recipientCode, amountInKobo, reason) {
+async function sendPaystackTransfer(recipientCode, amountInKobo, reason, reference = null) {
   const transferRes = await fetch("https://api.paystack.co/transfer", {
     method: "POST",
     headers: {
@@ -6849,10 +7023,161 @@ async function sendPaystackTransfer(recipientCode, amountInKobo, reason) {
       amount: amountInKobo,
       recipient: recipientCode,
       reason: reason || "Stallyard seller payout",
+      ...(reference ? { reference } : {}),
     }),
   });
   return transferRes.json();
 }
+
+async function queueAutomaticSellerPayouts(orderId, onlySellerId = null) {
+  const proceeds = await pool.query(
+    `SELECT oi.seller_id,
+       ROUND(SUM((oi.price * oi.qty) - (oi.price * oi.qty * o.commission_rate) + (oi.shipping_fee * oi.qty))::numeric, 2) AS amount
+     FROM order_items oi JOIN orders o ON o.id = oi.order_id
+     WHERE o.id = $1 AND o.payment_status IN ('held', 'released') AND COALESCE(o.is_disputed, false) = false
+       AND ($2::int IS NULL OR oi.seller_id = $2)
+       AND oi.fulfillment_status NOT IN ('cancelled', 'returned')
+       AND NOT EXISTS (
+         SELECT 1 FROM order_items pending
+         WHERE pending.order_id = o.id AND pending.seller_id = oi.seller_id
+           AND pending.fulfillment_status NOT IN ('cancelled', 'returned')
+           AND (pending.buyer_confirmed_at IS NULL OR COALESCE(pending.proof_of_delivery_url, '') = ''
+             OR pending.delivery_token_redeemed_at IS NULL OR pending.return_status IN ('requested', 'approved'))
+       )
+     GROUP BY oi.seller_id`,
+    [orderId, onlySellerId]
+  );
+
+  for (const row of proceeds.rows) {
+    const sellerId = Number(row.seller_id);
+    const amount = Number(row.amount);
+    if (!(amount > 0)) continue;
+    const reference = `STL-PAYOUT-${orderId}-${sellerId}`;
+    const inserted = await pool.query(
+      `INSERT INTO seller_payouts (order_id, seller_id, amount, currency, status, paystack_reference)
+       VALUES ($1, $2, $3, 'NGN', 'queued', $4)
+       ON CONFLICT (order_id, seller_id) DO NOTHING
+       RETURNING *`,
+      [orderId, sellerId, amount, reference]
+    );
+    if (!inserted.rows.length) continue;
+    const payout = inserted.rows[0];
+    const userResult = await pool.query("SELECT paystack_recipient_code FROM users WHERE id = $1", [sellerId]);
+    const encryptedRecipient = userResult.rows[0]?.paystack_recipient_code;
+    if (!encryptedRecipient) {
+      await pool.query(
+        "UPDATE seller_payouts SET status = 'needs_bank', failure_reason = 'Seller bank details are missing', updated_at = NOW() WHERE id = $1",
+        [payout.id]
+      );
+      createNotification(sellerId, "payout_needs_bank", `Add verified bank details to receive your payout for order #${orderId}.`);
+      continue;
+    }
+    try {
+      await pool.query("UPDATE seller_payouts SET status = 'processing', initiated_at = NOW(), updated_at = NOW() WHERE id = $1", [payout.id]);
+      const recipientCode = decryptFieldSafe(encryptedRecipient);
+      const transferData = await sendPaystackTransfer(
+        recipientCode,
+        Math.round(amount * 100),
+        `Stallyard order #${orderId} automatic seller payout`,
+        reference
+      );
+      if (!transferData.status) {
+        await pool.query(
+          "UPDATE seller_payouts SET status = 'failed', failure_reason = $1, updated_at = NOW() WHERE id = $2",
+          [transferData.message || "Paystack rejected the payout", payout.id]
+        );
+        createNotification(sellerId, "payout_failed", `Automatic payout for order #${orderId} could not be initiated. Support will review it.`);
+        continue;
+      }
+      await pool.query(
+        `UPDATE seller_payouts SET status = 'processing', paystack_transfer_code = $1,
+           failure_reason = NULL, updated_at = NOW() WHERE id = $2`,
+        [transferData.data?.transfer_code || null, payout.id]
+      );
+      createNotification(sellerId, "payout_processing", `Paystack is sending ${formatMoneyServer(amount)} to your bank for order #${orderId}.`);
+    } catch (err) {
+      await pool.query(
+        "UPDATE seller_payouts SET status = 'request_unknown', failure_reason = $1, updated_at = NOW() WHERE id = $2",
+        ["Could not confirm whether Paystack received the payout request. Support must verify before retrying.", payout.id]
+      );
+      console.error(`Automatic payout request uncertain for order #${orderId}, seller #${sellerId}:`, err.message);
+    }
+  }
+}
+
+app.get("/seller-payouts/mine", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM seller_payouts WHERE seller_id = $1 ORDER BY created_at DESC",
+      [req.user.id]
+    );
+    res.json({ payouts: result.rows });
+  } catch (err) {
+    sendInternalError(res, err);
+  }
+});
+
+app.post("/seller-payouts/:id/retry", authenticate, requirePermission("finance"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const locked = await client.query("SELECT * FROM seller_payouts WHERE id = $1 FOR UPDATE", [req.params.id]);
+    if (!locked.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Seller payout not found" });
+    }
+    const payout = locked.rows[0];
+    if (!["failed", "reversed", "needs_bank"].includes(payout.status)) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Only confirmed failed, reversed, or bank-details-required payouts can be retried" });
+    }
+    const userResult = await client.query("SELECT paystack_recipient_code FROM users WHERE id = $1", [payout.seller_id]);
+    const encryptedRecipient = userResult.rows[0]?.paystack_recipient_code;
+    if (!encryptedRecipient) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "The seller must add verified bank details first" });
+    }
+    const retryReference = `STL-PAYOUT-${payout.order_id}-${payout.seller_id}-R${Date.now()}`;
+    await client.query(
+      `UPDATE seller_payouts SET status = 'processing', paystack_reference = $1,
+         paystack_transfer_code = NULL, failure_reason = NULL, initiated_at = NOW(), updated_at = NOW()
+       WHERE id = $2`,
+      [retryReference, payout.id]
+    );
+    await client.query("COMMIT");
+
+    try {
+      const transferData = await sendPaystackTransfer(
+        decryptFieldSafe(encryptedRecipient), Math.round(Number(payout.amount) * 100),
+        `Stallyard order #${payout.order_id} payout retry`, retryReference
+      );
+      if (!transferData.status) {
+        const failed = await pool.query(
+          "UPDATE seller_payouts SET status = 'failed', failure_reason = $1, updated_at = NOW() WHERE id = $2 RETURNING *",
+          [transferData.message || "Paystack rejected the payout retry", payout.id]
+        );
+        return res.status(400).json({ error: transferData.message || "Paystack rejected the payout retry", payout: failed.rows[0] });
+      }
+      const updated = await pool.query(
+        "UPDATE seller_payouts SET paystack_transfer_code = $1, updated_at = NOW() WHERE id = $2 RETURNING *",
+        [transferData.data?.transfer_code || null, payout.id]
+      );
+      logAdminAction(req.user.id, "seller_payout_retried", `Retried payout #${payout.id} for order #${payout.order_id}`);
+      res.json({ payout: updated.rows[0] });
+    } catch (err) {
+      await pool.query(
+        "UPDATE seller_payouts SET status = 'request_unknown', failure_reason = $1, updated_at = NOW() WHERE id = $2",
+        ["Could not confirm whether Paystack received the retry. Verify in Paystack before another attempt.", payout.id]
+      );
+      return res.status(502).json({ error: "Payout retry status is uncertain. Verify it in Paystack before retrying again." });
+    }
+  } catch (err) {
+    try { await client.query("ROLLBACK"); } catch {}
+    sendInternalError(res, err);
+  } finally {
+    client.release();
+  }
+});
 
 app.post("/sellers/payout", authenticate, requirePermission("finance"), async (req, res) => {
   try {
@@ -6905,13 +7230,15 @@ async function computeAvailableBalance(client, sellerId) {
     [sellerId]
   );
   const reservedResult = await client.query(
-    `SELECT COALESCE(SUM(amount), 0) AS reserved
-     FROM withdrawals WHERE seller_id = $1 AND status IN ('processing', 'paid')`,
+    `SELECT
+       COALESCE((SELECT SUM(amount) FROM withdrawals WHERE seller_id = $1 AND status IN ('processing', 'paid')), 0) +
+       COALESCE((SELECT SUM(amount) FROM seller_payouts WHERE seller_id = $1 AND status IN ('queued', 'processing', 'request_unknown', 'paid')), 0)
+       AS reserved`,
     [sellerId]
   );
   const released = Number(releasedResult.rows[0].released_total);
   const reserved = Number(reservedResult.rows[0].reserved);
-  return Math.round((released - reserved) * 100) / 100;
+  return Math.max(0, Math.round((released - reserved) * 100) / 100);
 }
 
 app.post("/withdrawals", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
