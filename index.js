@@ -476,6 +476,13 @@ const bankChangeConfirmRateLimit = rateLimit({
   message: "Too many bank-change code attempts — wait 15 minutes and request a new code.",
   keyFn: (req) => `bank-change-confirm:${req.user?.id || "unknown"}:${getClientIp(req) || "unknown"}`,
 });
+const bankAccountResolveRateLimit = rateLimit({
+  scope: "bank-account-resolve",
+  windowMs: 15 * 60 * 1000,
+  max: 12,
+  message: "Too many bank-account checks — wait 15 minutes and try again.",
+  keyFn: (req) => `user:${req.user?.id || "unknown"}:ip:${getClientIp(req) || "unknown"}`,
+});
 const BANK_CHANGE_RESEND_COOLDOWN_MS = 60 * 1000;
 const BANK_CHANGE_MAX_CODE_ATTEMPTS = 5;
 
@@ -2572,6 +2579,9 @@ const SCHEMA_MIGRATIONS = [
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_one_pending_verified_seller_application
        ON verified_seller_applications(user_id) WHERE status = 'pending'`,
     `CREATE INDEX IF NOT EXISTS idx_verified_seller_admin_queue ON verified_seller_applications(status, created_at DESC)`,
+  ] },
+  { version: 65, name: "verified-bank-account-owner-name", statements: [
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS bank_account_name TEXT`,
   ] },
 ];
 
@@ -8169,10 +8179,66 @@ app.get("/paystack/banks", authenticate, async (req, res) => {
   }
 });
 
-async function verifyAndSaveBankDetails(userId, bankCode, accountNumber) {
+function bankNameTokens(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z\s]/g, " ").split(/\s+/).filter((token) => token.length > 1);
+}
+
+function bankOwnerMatchesIdentity(accountName, identityNames) {
+  const accountTokens = new Set(bankNameTokens(accountName));
+  return identityNames.filter(Boolean).some((identityName) => {
+    const identityTokens = [...new Set(bankNameTokens(identityName))];
+    if (!identityTokens.length) return false;
+    const common = identityTokens.filter((token) => accountTokens.has(token)).length;
+    return identityTokens.length === 1 ? common === 1 : common >= 2;
+  });
+}
+
+async function resolvePaystackBankAccount(userId, bankCode, accountNumber) {
+  const normalizedCode = String(bankCode || "").trim();
+  const normalizedNumber = String(accountNumber || "").replace(/\D/g, "");
+  if (!normalizedCode || !/^\d{10}$/.test(normalizedNumber)) return { error: "Enter a valid 10-digit Nigerian account number", status: 400 };
+  const paystackRes = await fetch(`https://api.paystack.co/bank/resolve?account_number=${encodeURIComponent(normalizedNumber)}&bank_code=${encodeURIComponent(normalizedCode)}`, {
+    headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` },
+  });
+  const paystackData = await paystackRes.json().catch(() => ({}));
+  if (!paystackRes.ok || !paystackData.status || !paystackData.data?.account_name) {
+    return { error: paystackData.message || "Paystack could not verify that bank account", status: 400 };
+  }
+  const identityResult = await pool.query(
+    `SELECT u.first_name,u.last_name,u.display_name,
+            (SELECT legal_name FROM casual_seller_applications WHERE user_id=u.id AND status='approved' ORDER BY approved_at DESC LIMIT 1) AS verified_legal_name
+       FROM users u WHERE u.id=$1`, [userId]
+  );
+  if (!identityResult.rows.length) return { error: "User not found", status: 404 };
+  const identity = identityResult.rows[0];
+  const identityNames = [identity.verified_legal_name, `${identity.first_name || ""} ${identity.last_name || ""}`.trim(), identity.display_name];
+  const accountName = String(paystackData.data.account_name).trim();
+  return {
+    accountName,
+    accountNumber: String(paystackData.data.account_number || normalizedNumber),
+    bankCode: normalizedCode,
+    nameMatches: bankOwnerMatchesIdentity(accountName, identityNames),
+  };
+}
+
+app.post("/paystack/resolve-account", authenticate, rejectAdminMarketplaceUse, bankAccountResolveRateLimit, async (req, res) => {
+  try {
+    const result = await resolvePaystackBankAccount(req.user.id, req.body?.bankCode, req.body?.accountNumber);
+    if (result.error) return res.status(result.status).json({ error: result.error });
+    res.json({ accountName: result.accountName, accountNumber: result.accountNumber, bankCode: result.bankCode, nameMatches: result.nameMatches });
+  } catch (err) { sendInternalError(res, err, "bank account resolution"); }
+});
+
+async function verifyAndSaveBankDetails(userId, bankCode, accountNumber, expectedAccountName = null) {
   const userResult = await pool.query("SELECT display_name FROM users WHERE id = $1", [userId]);
   if (userResult.rows.length === 0) {
     return { error: "User not found", status: 404 };
+  }
+  const resolved = await resolvePaystackBankAccount(userId, bankCode, accountNumber);
+  if (resolved.error) return resolved;
+  if (!resolved.nameMatches) return { error: "The bank account owner name does not match your verified Stallyard identity", status: 400 };
+  if (expectedAccountName && resolved.accountName.toLowerCase() !== String(expectedAccountName).trim().toLowerCase()) {
+    return { error: "The bank account owner name changed during confirmation — start again", status: 409 };
   }
   const recipientRes = await fetch("https://api.paystack.co/transferrecipient", {
     method: "POST",
@@ -8182,7 +8248,7 @@ async function verifyAndSaveBankDetails(userId, bankCode, accountNumber) {
     },
     body: JSON.stringify({
       type: "nuban",
-      name: userResult.rows[0].display_name,
+      name: resolved.accountName,
       account_number: accountNumber,
       bank_code: bankCode,
       currency: "NGN",
@@ -8193,10 +8259,10 @@ async function verifyAndSaveBankDetails(userId, bankCode, accountNumber) {
     return { error: recipientData.message || "Could not verify bank details", status: 400 };
   }
   await pool.query(
-    "UPDATE users SET bank_code = $1, account_number = $2, paystack_recipient_code = $3 WHERE id = $4",
-    [encryptField(bankCode), encryptField(accountNumber), encryptField(recipientData.data.recipient_code), userId]
+    "UPDATE users SET bank_code = $1, account_number = $2, paystack_recipient_code = $3, bank_account_name = $4 WHERE id = $5",
+    [encryptField(bankCode), encryptField(accountNumber), encryptField(recipientData.data.recipient_code), encryptField(resolved.accountName), userId]
   );
-  return { recipientCode: recipientData.data.recipient_code };
+  return { recipientCode: recipientData.data.recipient_code, accountName: resolved.accountName };
 }
 
 app.post(
@@ -8206,7 +8272,7 @@ app.post(
   bankChangeSendUserRateLimit,
   async (req, res) => {
   try {
-    const { userId, bankCode, accountNumber, adminOverrideReason } = req.body;
+    const { userId, bankCode, accountNumber, adminOverrideReason, confirmedAccountName } = req.body;
 
     if (!userId || !bankCode || !accountNumber) {
       return res.status(400).json({ error: "Missing userId, bankCode, or accountNumber" });
@@ -8250,8 +8316,12 @@ app.post(
 
     const hadAccountBefore = !!existing.rows[0].account_number;
 
+    if (isOwnBankAccount && !String(confirmedAccountName || "").trim()) {
+      return res.status(400).json({ error: "Resolve and confirm the Paystack account owner name first" });
+    }
+
     if (!hadAccountBefore || isAdminOverride) {
-      const result = await verifyAndSaveBankDetails(targetUserId, bankCode, accountNumber);
+      const result = await verifyAndSaveBankDetails(targetUserId, bankCode, accountNumber, isOwnBankAccount ? confirmedAccountName : null);
       if (result.error) return res.status(result.status).json({ error: result.error });
 
       if (isAdminOverride) {
@@ -8267,7 +8337,7 @@ app.post(
         );
       }
 
-      return res.json({ success: true, recipientCode: result.recipientCode });
+      return res.json({ success: true, recipientCode: result.recipientCode, accountName: result.accountName });
     }
 
     const email = existing.rows[0].email;
@@ -8276,6 +8346,15 @@ app.post(
     }
     if (!process.env.RESEND_API_KEY) {
       return res.status(500).json({ error: "Bank-change confirmation isn't configured yet" });
+    }
+
+    const resolvedAccount = await resolvePaystackBankAccount(targetUserId, bankCode, accountNumber);
+    if (resolvedAccount.error) return res.status(resolvedAccount.status).json({ error: resolvedAccount.error });
+    if (isOwnBankAccount && resolvedAccount.accountName.toLowerCase() !== String(confirmedAccountName).trim().toLowerCase()) {
+      return res.status(409).json({ error: "The Paystack account owner name changed — resolve and confirm it again" });
+    }
+    if (!resolvedAccount.nameMatches && !isAdminOverride) {
+      return res.status(400).json({ error: "The bank account owner name does not match your verified Stallyard identity" });
     }
 
     const existingPendingChange = await getSecurityState("bank-change", req.user.id);
@@ -8308,6 +8387,7 @@ app.post(
       sentAt: Date.now(),
       bankCode,
       accountNumber,
+      accountName: resolvedAccount.accountName,
       failedAttempts: 0,
     }, BANK_CHANGE_CODE_TTL_MS);
     res.json({ confirmationRequired: true });
@@ -8354,9 +8434,9 @@ app.post(
     }
 
     await deleteSecurityState("bank-change", req.user.id);
-    const result = await verifyAndSaveBankDetails(req.user.id, pending.bankCode, pending.accountNumber);
+    const result = await verifyAndSaveBankDetails(req.user.id, pending.bankCode, pending.accountNumber, pending.accountName);
     if (result.error) return res.status(result.status).json({ error: result.error });
-    res.json({ success: true, recipientCode: result.recipientCode });
+    res.json({ success: true, recipientCode: result.recipientCode, accountName: result.accountName });
   } catch (err) {
     sendInternalError(res, err);
   }
