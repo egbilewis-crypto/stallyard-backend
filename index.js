@@ -2583,6 +2583,14 @@ const SCHEMA_MIGRATIONS = [
   { version: 65, name: "verified-bank-account-owner-name", statements: [
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS bank_account_name TEXT`,
   ] },
+  { version: 66, name: "verified-seller-10m-tier", statements: [
+    `ALTER TABLE users ALTER COLUMN seller_listing_limit SET DEFAULT 10000000`,
+    `UPDATE users SET seller_tier = 'verified', seller_listing_limit = 10000000
+       WHERE is_admin = false AND is_approved = true AND COALESCE(seller_tier, 'verified') <> 'premium'`,
+    `ALTER TABLE verified_seller_applications ALTER COLUMN requested_limit SET DEFAULT 10000000`,
+    `UPDATE verified_seller_applications SET requested_limit = 10000000
+       WHERE status = 'pending' AND requested_limit > 10000000`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -3723,7 +3731,7 @@ app.patch("/users/:id/approve", authenticate, requirePermission("seller_verifica
     }
     const result = await pool.query(
       `UPDATE users SET is_approved = true, verification_status = 'approved', rejection_reason = NULL,
-         seller_tier = 'verified', seller_listing_limit = 20000000
+         seller_tier = 'verified', seller_listing_limit = 10000000
        WHERE id = $1 RETURNING ${USER_RETURNING_FIELDS}`,
       [req.params.id]
     );
@@ -5065,7 +5073,7 @@ const LISTING_SUBCATEGORIES = {
 };
 
 const CASUAL_SELLER_LIMIT_NGN = 500000;
-const VERIFIED_SELLER_LIMIT_NGN = 20000000;
+const VERIFIED_SELLER_LIMIT_NGN = 10000000;
 const CASUAL_SELLER_ID_TYPES = new Set(["nin", "passport", "drivers_license", "voters_card"]);
 const CASUAL_SELLER_CONSENT_VERSION = "2026-09-12";
 const VERIFICATION_BUCKET = process.env.SUPABASE_VERIFICATION_BUCKET || "seller-verification-private";
