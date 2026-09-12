@@ -703,11 +703,12 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
            seller_id, seller_username, seller_name, fulfillment_status,
            delivery_token, delivery_token_generated_at
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'new', NULL, NULL)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'new', $11, NOW())
          RETURNING *`,
         [
           order.id, listing.id, listing.title, listing.emoji, price, qty, shippingFee,
           listing.owner_id, seller?.username, seller?.display_name,
+          generateDeliveryTokenValue(),
         ]
       );
       insertedItems.push(itemResult.rows[0]);
@@ -2281,6 +2282,12 @@ const SCHEMA_MIGRATIONS = [
      )`,
     `CREATE INDEX IF NOT EXISTS idx_seller_payouts_seller ON seller_payouts(seller_id, created_at DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_seller_payouts_order ON seller_payouts(order_id)`,
+  ] },
+  { version: 52, name: "delivery-token-created-after-payment", statements: [
+    `SELECT 1`,
+  ] },
+  { version: 53, name: "buyer-token-visible-after-payment", statements: [
+    `SELECT 1`,
   ] },
 ];
 
@@ -5485,6 +5492,8 @@ async function fetchOrdersWithItems(whereClause, params, { includeDeliveryTokens
     [orderIds]
   );
   const safeItems = itemsResult.rows.map((item) => {
+    // The paid buyer can see the token immediately; seller and admin order
+    // responses never receive the secret token value.
     if (includeDeliveryTokens) return item;
     const { delivery_token, ...safe } = item;
     return safe;
@@ -5598,9 +5607,6 @@ app.patch("/orders/:id/release", authenticate, requirePermission("finance"), asy
     for (const item of relevantItems) {
       if (!item.proof_of_delivery_url) {
         safeguardProblems.push(`Item #${item.id} (${item.title}): delivery picture is missing`);
-      }
-      if (!item.buyer_confirmed_at) {
-        safeguardProblems.push(`Item #${item.id} (${item.title}): buyer has not confirmed delivery`);
       }
       if (!item.delivery_token_redeemed_at) {
         safeguardProblems.push(`Item #${item.id} (${item.title}): buyer delivery token has not been redeemed`);
@@ -6342,9 +6348,6 @@ async function markItemReceivedAndMaybeRelease(itemId) {
     );
     if (!locked.rows.length) throw new Error("Order item not found");
     const current = locked.rows[0];
-    if (!current.buyer_confirmed_at) {
-      throw new Error("Buyer must confirm delivery before the delivery token can be redeemed");
-    }
     if (current.payment_status !== "held" || current.is_disputed) {
       throw new Error("Payment is no longer eligible for release");
     }
@@ -6368,7 +6371,7 @@ async function markItemReceivedAndMaybeRelease(itemId) {
     );
     const relevant = allItems.rows.filter((r) => !["cancelled", "returned"].includes(r.fulfillment_status));
     const allConfirmed = relevant.length > 0 && relevant.every(
-      (r) => r.buyer_confirmed_at && r.proof_of_delivery_url && r.delivery_token_redeemed_at &&
+      (r) => r.proof_of_delivery_url && r.delivery_token_redeemed_at &&
         !["requested", "approved"].includes(r.return_status)
     );
     let order = null;
@@ -6569,9 +6572,6 @@ app.post("/order-items/:id/generate-delivery-token", authenticate, async (req, r
     if (item.buyer_id !== req.user.id) {
       return res.status(403).json({ error: "Only the buyer can access a delivery code for this item" });
     }
-    if (!item.buyer_confirmed_at) {
-      return res.status(400).json({ error: "Confirm that you received and inspected the item before requesting the delivery token" });
-    }
     if (item.payment_status !== "held") {
       return res.status(400).json({ error: "This order is no longer awaiting delivery confirmation" });
     }
@@ -6580,8 +6580,8 @@ app.post("/order-items/:id/generate-delivery-token", authenticate, async (req, r
     }
     if (item.delivery_token) return res.json({ token: item.delivery_token });
 
-    // Recovery path only: if a confirmed buyer's token is missing because of a
-    // legacy order or interrupted response, create a fresh one after confirmation.
+    // Recovery path only: if a paid buyer's token is missing because of a
+    // legacy order or interrupted response, create a fresh one immediately.
     const token = generateDeliveryTokenValue();
     await pool.query(
       "UPDATE order_items SET delivery_token = $1, delivery_token_generated_at = NOW() WHERE id = $2",
@@ -6620,9 +6620,6 @@ app.post("/order-items/:id/redeem-delivery-token", authenticate, codeRateLimit, 
     }
     if (["requested", "approved"].includes(item.return_status)) {
       return res.status(409).json({ error: "Payment is locked because a return is in progress" });
-    }
-    if (!item.buyer_confirmed_at) {
-      return res.status(400).json({ error: "The buyer has not confirmed delivery yet" });
     }
     if (!item.proof_of_delivery_url) {
       return res.status(400).json({ error: "Upload a delivery picture before entering the buyer's code" });
@@ -7041,8 +7038,8 @@ async function queueAutomaticSellerPayouts(orderId, onlySellerId = null) {
          SELECT 1 FROM order_items pending
          WHERE pending.order_id = o.id AND pending.seller_id = oi.seller_id
            AND pending.fulfillment_status NOT IN ('cancelled', 'returned')
-           AND (pending.buyer_confirmed_at IS NULL OR COALESCE(pending.proof_of_delivery_url, '') = ''
-             OR pending.delivery_token_redeemed_at IS NULL OR pending.return_status IN ('requested', 'approved'))
+           AND (COALESCE(pending.proof_of_delivery_url, '') = '' OR pending.delivery_token_redeemed_at IS NULL
+             OR pending.return_status IN ('requested', 'approved'))
        )
      GROUP BY oi.seller_id`,
     [orderId, onlySellerId]
