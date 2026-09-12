@@ -2457,6 +2457,19 @@ const SCHEMA_MIGRATIONS = [
        WHERE status IN ('open', 'in_review')`,
     `CREATE INDEX IF NOT EXISTS idx_seller_reports_admin_queue ON seller_reports(status, created_at DESC)`,
   ] },
+  { version: 62, name: "refund-progress-updated-at", statements: [
+    `ALTER TABLE orders ADD COLUMN IF NOT EXISTS refund_updated_at TIMESTAMP`,
+    `CREATE OR REPLACE FUNCTION set_refund_progress_updated_at() RETURNS TRIGGER AS $$
+     BEGIN
+       IF NEW.refund_status IS DISTINCT FROM OLD.refund_status OR NEW.payment_status IS DISTINCT FROM OLD.payment_status THEN
+         NEW.refund_updated_at = NOW();
+       END IF;
+       RETURN NEW;
+     END; $$ LANGUAGE plpgsql`,
+    `DROP TRIGGER IF EXISTS trg_refund_progress_updated_at ON orders`,
+    `CREATE TRIGGER trg_refund_progress_updated_at BEFORE UPDATE ON orders
+       FOR EACH ROW EXECUTE FUNCTION set_refund_progress_updated_at()`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
