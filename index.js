@@ -2607,6 +2607,13 @@ const SCHEMA_MIGRATIONS = [
        ON verified_seller_applications(id_number_hash)
        WHERE id_number_hash IS NOT NULL AND status IN ('pending', 'approved')`,
   ] },
+  { version: 68, name: "member-other-name", statements: [
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS other_name TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS date_of_birth DATE`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS gender TEXT`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS nationality TEXT`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS state_of_residence TEXT`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -2708,7 +2715,7 @@ app.post("/signup", authRateLimit, async (req, res) => {
          is_email_verified, profile_complete
        )
        VALUES ($1, $2, $3, $4, $5, $6, true, false)
-       RETURNING id, username, email, phone, display_name, first_name, last_name, office_location,
+       RETURNING id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, office_location,
          country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type,
          id_country, license_number, license_photos, id_verification_exempt,
          is_email_verified, profile_complete, created_at, token_version`,
@@ -2729,7 +2736,7 @@ app.post("/signup", authRateLimit, async (req, res) => {
 app.patch("/profile/complete", authenticate, async (req, res) => {
   try {
     const {
-      firstName, lastName, phone, officeLocation, country, accountType,
+      firstName, lastName, otherName, dateOfBirth, gender, nationality, stateOfResidence, phone, officeLocation, country, accountType,
       idType, idCountry, licenseNumber, licensePhotos, idVerificationExempt,
     } = req.body;
 
@@ -2745,7 +2752,19 @@ app.patch("/profile/complete", authenticate, async (req, res) => {
       }
     }
 
-    const hasCore = firstName && lastName && country;
+    if (!dateOfBirth || ageOnDate(dateOfBirth) < 18) {
+      return res.status(400).json({ error: "You must be at least 18 years old" });
+    }
+    const normalizedGender = String(gender || "").trim().toLowerCase();
+    if (!["male", "female", "prefer_not_to_say"].includes(normalizedGender)) {
+      return res.status(400).json({ error: "Select a valid gender" });
+    }
+    const normalizedNationality = String(nationality || "").trim();
+    if (!normalizedNationality) return res.status(400).json({ error: "Enter your nationality" });
+    const normalizedState = String(stateOfResidence || "").trim();
+    if (!normalizedState) return res.status(400).json({ error: "Select your state of residence" });
+
+    const hasCore = firstName && lastName && dateOfBirth && normalizedGender && normalizedNationality && normalizedState && country;
     const hasId = !!idVerificationExempt || (idType && licenseNumber);
     const nowComplete = !!(hasCore && (accountType === "personal" || hasId));
 
@@ -2753,23 +2772,28 @@ app.patch("/profile/complete", authenticate, async (req, res) => {
       `UPDATE users SET
          first_name = COALESCE($1, first_name),
          last_name = COALESCE($2, last_name),
-         phone = COALESCE($3, phone),
-         office_location = COALESCE($4, office_location),
-         country = COALESCE($5, country),
-         account_type = COALESCE($6, account_type),
-         id_type = COALESCE($7, id_type),
-         id_country = COALESCE($8, id_country),
-         license_number = COALESCE($9, license_number),
-         license_photos = COALESCE($10, license_photos),
-         id_verification_exempt = COALESCE($11, id_verification_exempt),
-         profile_complete = $12
-       WHERE id = $13
-       RETURNING id, username, email, phone, display_name, first_name, last_name, office_location,
+         other_name = COALESCE($3, other_name),
+         date_of_birth = COALESCE($4, date_of_birth),
+         gender = COALESCE($5, gender),
+         nationality = COALESCE($6, nationality),
+         state_of_residence = COALESCE($7, state_of_residence),
+         phone = COALESCE($8, phone),
+         office_location = COALESCE($9, office_location),
+         country = COALESCE($10, country),
+         account_type = COALESCE($11, account_type),
+         id_type = COALESCE($12, id_type),
+         id_country = COALESCE($13, id_country),
+         license_number = COALESCE($14, license_number),
+         license_photos = COALESCE($15, license_photos),
+         id_verification_exempt = COALESCE($16, id_verification_exempt),
+         profile_complete = $17
+       WHERE id = $18
+       RETURNING id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, office_location,
          country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type,
          id_country, license_number, license_photos, id_verification_exempt,
          is_email_verified, profile_complete, created_at`,
       [
-        firstName || null, lastName || null, phone || null, officeLocation || null,
+        firstName || null, lastName || null, otherName?.trim() || null, dateOfBirth, normalizedGender, normalizedNationality, normalizedState, phone || null, officeLocation || null,
         country || null, accountType || null, idType || null, idCountry || null,
         licenseNumber || null, licensePhotos ? JSON.stringify(licensePhotos) : null,
         idVerificationExempt === undefined ? null : !!idVerificationExempt,
@@ -3314,7 +3338,7 @@ app.post("/profile/apply-to-sell", authenticate, requireNigeriaMarketplaceUser, 
 const USER_PUBLIC_FIELDS = `id, username, display_name, country, account_type, created_at,
   avatar_url, store_bio, store_policies`;
 
-const USER_FULL_FIELDS = `id, username, email, phone, display_name, first_name, last_name, office_location,
+const USER_FULL_FIELDS = `id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, office_location,
   country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
   bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
@@ -3323,7 +3347,7 @@ const USER_FULL_FIELDS = `id, username, email, phone, display_name, first_name, 
 // Safe staff directory fields for admin roles that do not need seller-verification
 // documents. This intentionally excludes email/phone, ID/license data, document
 // URLs, bank statements, and seller-verification rejection details.
-const USER_ADMIN_SAFE_FIELDS = `id, username, display_name, first_name, last_name, office_location,
+const USER_ADMIN_SAFE_FIELDS = `id, username, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, office_location,
   country, is_admin, is_approved, is_verified, is_suspended, account_type, verification_status, created_at,
   avatar_url, store_bio, store_policies, two_factor_enabled, is_email_verified, is_phone_verified, admin_role`;
 
@@ -3383,7 +3407,7 @@ app.get("/users", async (req, res) => {
   }
 });
 
-const USER_RETURNING_FIELDS = `id, username, email, phone, display_name, first_name, last_name, office_location,
+const USER_RETURNING_FIELDS = `id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, office_location,
   country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
   bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
@@ -4059,7 +4083,7 @@ app.post("/admin/login", authRateLimit, async (req, res) => {
 // Keep session restoration deliberately small. This endpoint is called on page
 // load, so it must never return seller verification documents, bank data,
 // government-ID details, or other private profile records.
-const SESSION_USER_FIELDS = `id, username, email, phone, display_name, first_name, last_name,
+const SESSION_USER_FIELDS = `id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence,
   country, is_admin, is_approved, is_verified, is_suspended, account_type,
   has_applied_to_sell, verification_status, avatar_url, store_bio, store_policies,
   two_factor_enabled, is_email_verified, is_phone_verified, token_version, admin_role,
@@ -5277,7 +5301,7 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requir
 
     await client.query("BEGIN");
     const accountResult = await client.query(
-      `SELECT id, username, email, phone, first_name, last_name, display_name, country,
+      `SELECT id, username, email, phone, first_name, last_name, other_name, display_name, country,
               is_email_verified, is_phone_verified, is_suspended, is_approved, casual_seller_status
          FROM users WHERE id = $1 FOR UPDATE`, [req.user.id]
     );
@@ -5287,7 +5311,7 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requir
     if (!account.is_email_verified || !account.is_phone_verified) {
       throw Object.assign(new Error("Verify both your email and phone number before applying"), { statusCode: 400, code: "CONTACT_VERIFICATION_REQUIRED" });
     }
-    const accountName = normalizedPersonName(`${account.first_name || ""}${account.last_name || ""}`) || normalizedPersonName(account.display_name);
+    const accountName = normalizedPersonName(`${account.last_name || ""} ${account.first_name || ""} ${account.other_name || ""}`) || normalizedPersonName(account.display_name);
     const submittedName = normalizedPersonName(legalName);
     const nameMatches = !!accountName && (submittedName.includes(accountName) || accountName.includes(submittedName));
     const clientFaceChecks = faceDetectionSupported === true && Array.isArray(faceChecks) && faceChecks.length >= 5 && faceChecks.every(Boolean);
@@ -8253,13 +8277,13 @@ async function resolvePaystackBankAccount(userId, bankCode, accountNumber) {
     return { error: paystackData.message || "Paystack could not verify that bank account", status: 400 };
   }
   const identityResult = await pool.query(
-    `SELECT u.first_name,u.last_name,u.display_name,
+    `SELECT u.first_name,u.last_name,u.other_name,u.display_name,
             (SELECT legal_name FROM casual_seller_applications WHERE user_id=u.id AND status='approved' ORDER BY approved_at DESC LIMIT 1) AS verified_legal_name
        FROM users u WHERE u.id=$1`, [userId]
   );
   if (!identityResult.rows.length) return { error: "User not found", status: 404 };
   const identity = identityResult.rows[0];
-  const identityNames = [identity.verified_legal_name, `${identity.first_name || ""} ${identity.last_name || ""}`.trim(), identity.display_name];
+  const identityNames = [identity.verified_legal_name, `${identity.last_name || ""} ${identity.first_name || ""} ${identity.other_name || ""}`.trim(), identity.display_name];
   const accountName = String(paystackData.data.account_name).trim();
   return {
     accountName,
