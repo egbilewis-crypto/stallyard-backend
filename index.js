@@ -6355,7 +6355,9 @@ function publicListingRow(row) {
 }
 
 // Public listing discovery is enforced here on the server. Anonymous callers
-// only receive active listings belonging to approved, unsuspended sellers.
+// only receive active listings belonging to eligible, unsuspended sellers.
+// Eligibility includes both fully approved sellers and automatically approved
+// Casual Sellers, whose combined active-listing value is capped separately.
 // A signed-in marketplace user additionally receives their own listings in all
 // statuses so drafts/pending items still appear in My Stall. Moderation-only
 // fields are never exposed for somebody else's listing.
@@ -6377,12 +6379,13 @@ app.get("/listings", async (req, res) => {
 
     const result = await pool.query(
       `SELECT listings.*, users.display_name AS seller_name, users.username AS owner_username,
-              users.is_approved AS seller_is_approved, users.is_suspended AS seller_is_suspended
+              users.is_approved AS seller_is_approved, users.casual_seller_status,
+              users.is_suspended AS seller_is_suspended
        FROM listings
        JOIN users ON listings.owner_id = users.id
        WHERE (
          listings.status = 'active'
-         AND users.is_approved = true
+         AND (users.is_approved = true OR users.casual_seller_status = 'approved')
          AND users.is_suspended = false
        )
        OR ($1::integer IS NOT NULL AND listings.owner_id = $1)
@@ -6392,7 +6395,7 @@ app.get("/listings", async (req, res) => {
 
     const rows = result.rows.map((row) => {
       if (validUserId && row.owner_id === validUserId) {
-        const { seller_is_approved, seller_is_suspended, ...ownRow } = row;
+        const { seller_is_approved, casual_seller_status, seller_is_suspended, ...ownRow } = row;
         return ownRow;
       }
       return publicListingRow(row);
