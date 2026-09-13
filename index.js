@@ -249,7 +249,7 @@ async function authenticate(req, res, next) {
   }
   try {
     const result = await pool.query(
-      "SELECT is_admin, is_suspended, token_version, admin_role, two_factor_enabled, country FROM users WHERE id = $1",
+      "SELECT is_admin, is_suspended, token_version, admin_role, two_factor_enabled, country, profile_complete FROM users WHERE id = $1",
       [requester.id]
     );
     if (result.rows.length === 0) {
@@ -268,6 +268,7 @@ async function authenticate(req, res, next) {
       adminRole: result.rows[0].admin_role || null,
       twoFactorEnabled: !!result.rows[0].two_factor_enabled,
       country: result.rows[0].country || "",
+      profileComplete: !!result.rows[0].profile_complete,
     };
 
     if (req.user.isAdmin) {
@@ -335,6 +336,14 @@ function requireNigeriaMarketplaceUser(req, res, next) {
     });
   }
   next();
+}
+
+function requireCompleteProfile(req, res, next) {
+  if (req.user?.isAdmin || req.user?.profileComplete) return next();
+  return res.status(403).json({
+    error: "Complete your profile before using this marketplace feature.",
+    code: "PROFILE_INCOMPLETE",
+  });
 }
 
 const ADMIN_ROLES = new Set([
@@ -787,6 +796,13 @@ async function recordPaymentAttempt(userId, { reference = null, method = "checko
 
 function normalizePhoneForRateLimit(phone) {
   return String(phone || "").replace(/[^0-9]/g, "");
+}
+
+function normalizeNigerianPhone(phone) {
+  let digits = String(phone || "").replace(/[^0-9]/g, "");
+  if (digits.startsWith("0") && digits.length === 11) digits = `234${digits.slice(1)}`;
+  if (digits.length === 10 && /^[789]/.test(digits)) digits = `234${digits}`;
+  return /^234[789]\d{9}$/.test(digits) ? `+${digits}` : null;
 }
 
 // SMS is a paid, abuse-sensitive channel, so protect it twice:
@@ -2657,6 +2673,13 @@ const SCHEMA_MIGRATIONS = [
   { version: 71, name: "casual-seller-report-passwords", statements: [
     `ALTER TABLE casual_seller_daily_reports ADD COLUMN IF NOT EXISTS password_encrypted TEXT`,
   ] },
+  { version: 72, name: "standard-account-onboarding", statements: [
+    `ALTER TABLE users
+       ADD COLUMN IF NOT EXISTS onboarding_intent TEXT NOT NULL DEFAULT 'buy',
+       ADD COLUMN IF NOT EXISTS onboarding_completed_at TIMESTAMP`,
+    `UPDATE users SET onboarding_intent = CASE WHEN COALESCE(has_applied_to_sell, false) OR COALESCE(casual_seller_status, 'none') <> 'none' OR COALESCE(is_approved, false) THEN 'sell' ELSE 'buy' END
+       WHERE onboarding_intent IS NULL OR onboarding_intent NOT IN ('buy','sell')`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -2731,6 +2754,7 @@ app.get("/admin/schema-status", authenticate, requirePermission("role_assignment
 app.post("/signup", authRateLimit, async (req, res) => {
   try {
     const { username, email, password, displayName } = req.body;
+    const onboardingIntent = req.body?.onboardingIntent === "sell" ? "sell" : "buy";
 
     if (!username || !email || !password) {
       return res.status(400).json({ error: "Missing required fields" });
@@ -2755,14 +2779,14 @@ app.post("/signup", authRateLimit, async (req, res) => {
     const result = await pool.query(
       `INSERT INTO users (
          username, email, password_hash, display_name, is_admin, is_approved,
-         is_email_verified, profile_complete
+         is_email_verified, profile_complete, onboarding_intent
        )
-       VALUES ($1, $2, $3, $4, $5, $6, true, false)
+       VALUES ($1, $2, $3, $4, $5, $6, true, false, $7)
        RETURNING id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, office_location,
          country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type,
          id_country, license_number, license_photos, id_verification_exempt,
-         is_email_verified, profile_complete, created_at, token_version`,
-      [username, email, passwordHash, displayName || username, isFirstUser, isFirstUser]
+         is_email_verified, profile_complete, onboarding_intent, onboarding_completed_at, created_at, token_version`,
+      [username, email, passwordHash, displayName || username, isFirstUser, isFirstUser, onboardingIntent]
     );
 
     await deleteSecurityState("email-verified", email.toLowerCase());
@@ -2779,20 +2803,24 @@ app.post("/signup", authRateLimit, async (req, res) => {
 app.patch("/profile/complete", authenticate, async (req, res) => {
   try {
     const {
-      firstName, lastName, otherName, dateOfBirth, gender, nationality, stateOfResidence, phone, officeLocation, country, accountType,
-      idType, idCountry, licenseNumber, licensePhotos, idVerificationExempt,
+      firstName, lastName, otherName, dateOfBirth, gender, nationality, stateOfResidence, phone, country,
     } = req.body;
+
+    if (!String(firstName || "").trim() || !String(lastName || "").trim()) {
+      return res.status(400).json({ error: "Enter your surname and first name" });
+    }
 
     const normalizedCountry = (country || "").trim().toLowerCase();
     if (normalizedCountry && !isNigeriaCountry(normalizedCountry)) {
       return res.status(403).json({ error: "Stallyard is available in Nigeria only" });
     }
 
-    if (phone) {
-      const phoneCheck = await checkPhoneNumber(phone);
-      if (phoneCheck?.blocked) {
-        return res.status(400).json({ error: phoneCheck.reason });
-      }
+    if (!phone) return res.status(400).json({ error: "Enter your Nigerian phone number" });
+    const normalizedPhone = normalizeNigerianPhone(phone);
+    if (!normalizedPhone) return res.status(400).json({ error: "Enter a valid Nigerian phone number" });
+    const phoneCheck = await checkPhoneNumber(normalizedPhone);
+    if (phoneCheck?.blocked) {
+      return res.status(400).json({ error: phoneCheck.reason });
     }
 
     if (!dateOfBirth || ageOnDate(dateOfBirth) < 18) {
@@ -2807,40 +2835,34 @@ app.patch("/profile/complete", authenticate, async (req, res) => {
     const normalizedState = String(stateOfResidence || "").trim();
     if (!normalizedState) return res.status(400).json({ error: "Select your state of residence" });
 
-    const hasCore = firstName && lastName && dateOfBirth && normalizedGender && normalizedNationality && normalizedState && country;
-    const hasId = !!idVerificationExempt || (idType && licenseNumber);
-    const nowComplete = !!(hasCore && (accountType === "personal" || hasId));
+    const existing = await pool.query("SELECT date_of_birth, profile_complete FROM users WHERE id=$1", [req.user.id]);
+    if (!existing.rows.length) return res.status(404).json({ error: "User not found" });
+    if (existing.rows[0].profile_complete && existing.rows[0].date_of_birth && String(existing.rows[0].date_of_birth).slice(0, 10) !== dateOfBirth) {
+      return res.status(409).json({ error: "Date of birth cannot be changed after account setup. Contact Stallyard support if it is incorrect." });
+    }
 
     const result = await pool.query(
       `UPDATE users SET
-         first_name = COALESCE($1, first_name),
-         last_name = COALESCE($2, last_name),
+         first_name = $1,
+         last_name = $2,
          other_name = COALESCE($3, other_name),
          date_of_birth = COALESCE($4, date_of_birth),
          gender = COALESCE($5, gender),
          nationality = COALESCE($6, nationality),
          state_of_residence = COALESCE($7, state_of_residence),
-         phone = COALESCE($8, phone),
-         office_location = COALESCE($9, office_location),
-         country = COALESCE($10, country),
-         account_type = COALESCE($11, account_type),
-         id_type = COALESCE($12, id_type),
-         id_country = COALESCE($13, id_country),
-         license_number = COALESCE($14, license_number),
-         license_photos = COALESCE($15, license_photos),
-         id_verification_exempt = COALESCE($16, id_verification_exempt),
-         profile_complete = $17
-       WHERE id = $18
+         phone = $8,
+         country = 'Nigeria',
+         account_type = 'personal',
+         profile_complete = true,
+         onboarding_completed_at = COALESCE(onboarding_completed_at, NOW())
+       WHERE id = $9
        RETURNING id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, office_location,
          country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type,
          id_country, license_number, license_photos, id_verification_exempt,
-         is_email_verified, profile_complete, created_at`,
+         is_email_verified, is_phone_verified, profile_complete, onboarding_intent, onboarding_completed_at, created_at`,
       [
-        firstName || null, lastName || null, otherName?.trim() || null, dateOfBirth, normalizedGender, normalizedNationality, normalizedState, phone || null, officeLocation || null,
-        country || null, accountType || null, idType || null, idCountry || null,
-        licenseNumber || null, licensePhotos ? JSON.stringify(licensePhotos) : null,
-        idVerificationExempt === undefined ? null : !!idVerificationExempt,
-        nowComplete, req.user.id,
+        String(firstName).trim(), String(lastName).trim(), otherName?.trim() || null, dateOfBirth,
+        normalizedGender, normalizedNationality, normalizedState, normalizedPhone, req.user.id,
       ]
     );
     if (!result.rows.length) return res.status(404).json({ error: "User not found" });
@@ -2927,7 +2949,7 @@ app.get("/addresses", authenticate, rejectAdminMarketplaceUse, async (req, res) 
   }
 });
 
-app.post("/addresses", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+app.post("/addresses", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, async (req, res) => {
   try {
     const { label, fullName, phone, street, city, state, zip, country, deliveryInstructions, preferredDeliveryTime, locationPhotos, isDefault } = req.body;
     if (!fullName || !phone || !street || !city || !country) {
@@ -3385,7 +3407,7 @@ const USER_FULL_FIELDS = `id, username, email, phone, display_name, first_name, 
   country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
   bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
-  is_email_verified, is_phone_verified, admin_role`;
+  is_email_verified, is_phone_verified, admin_role, profile_complete, onboarding_intent, onboarding_completed_at`;
 
 // Safe staff directory fields for admin roles that do not need seller-verification
 // documents. This intentionally excludes email/phone, ID/license data, document
@@ -3455,7 +3477,8 @@ const USER_RETURNING_FIELDS = `id, username, email, phone, display_name, first_n
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
   bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
   is_email_verified, is_phone_verified, token_version, admin_role, casual_seller_status,
-  casual_seller_limit, casual_seller_approved_at, seller_tier, seller_listing_limit`;
+  casual_seller_limit, casual_seller_approved_at, seller_tier, seller_listing_limit,
+  profile_complete, onboarding_intent, onboarding_completed_at`;
 
 app.patch("/users/:id/verify", authenticate, requirePermission("user_management"), async (req, res) => {
   try {
@@ -4141,7 +4164,8 @@ const SESSION_USER_FIELDS = `id, username, email, phone, display_name, first_nam
   country, is_admin, is_approved, is_verified, is_suspended, account_type,
   has_applied_to_sell, verification_status, avatar_url, store_bio, store_policies,
   two_factor_enabled, is_email_verified, is_phone_verified, token_version, admin_role,
-  casual_seller_status, casual_seller_limit, casual_seller_approved_at, seller_tier, seller_listing_limit`;
+  casual_seller_status, casual_seller_limit, casual_seller_approved_at, seller_tier, seller_listing_limit,
+  profile_complete, onboarding_intent, onboarding_completed_at`;
 
 app.get("/session/me", authenticate, async (req, res) => {
   try {
@@ -5353,7 +5377,7 @@ app.get("/casual-seller/status", authenticate, rejectAdminMarketplaceUse, async 
   } catch (err) { sendInternalError(res, err); }
 });
 
-app.post("/casual-seller/rekognition/session", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser,
+app.post("/casual-seller/rekognition/session", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser,
   rekognitionSessionUserLimit, rekognitionSessionIpLimit, async (req, res) => {
     try {
       const roleArn = String(process.env.AWS_LIVENESS_ROLE_ARN || "").trim();
@@ -5387,7 +5411,7 @@ app.post("/casual-seller/rekognition/session", authenticate, rejectAdminMarketpl
   }
 );
 
-app.post("/casual-seller/rekognition/complete", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, async (req, res) => {
+app.post("/casual-seller/rekognition/complete", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   try {
     const issued = await getSecurityState("rekognition-liveness-session", req.user.id);
     const sessionId = String(req.body?.sessionId || "");
@@ -5411,7 +5435,7 @@ app.post("/casual-seller/rekognition/complete", authenticate, rejectAdminMarketp
   } catch (err) { sendInternalError(res, err, "complete Rekognition liveness session"); }
 });
 
-app.post("/casual-seller/challenge", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, async (req, res) => {
+app.post("/casual-seller/challenge", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   try {
     const poolValues = ["blink", "turn_left", "turn_right", "smile", "move_closer"];
     for (let index = poolValues.length - 1; index > 0; index--) {
@@ -5426,7 +5450,7 @@ app.post("/casual-seller/challenge", authenticate, rejectAdminMarketplaceUse, re
   } catch (err) { sendInternalError(res, err, "casual seller liveness challenge"); }
 });
 
-app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, async (req, res) => {
+app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   const client = await pool.connect();
   const uploadedPaths = [];
   try {
@@ -5577,7 +5601,7 @@ function parsePrivateApplicationDocument(dataUrl, label) {
   return { buffer, contentType: match[1], extension: match[1] === "application/pdf" ? "pdf" : "jpg", sha256: crypto.createHash("sha256").update(buffer).digest("hex") };
 }
 
-app.post("/verified-seller/apply", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, async (req, res) => {
+app.post("/verified-seller/apply", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   const client = await pool.connect();
   const uploadedPaths = [];
   try {
@@ -6345,7 +6369,7 @@ app.post("/admin/verified-seller-reports/run", authenticate, requireSuperAdmin, 
   res.json(result);
 });
 
-app.post("/listings", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, async (req, res) => {
+app.post("/listings", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   const client = await pool.connect();
   try {
     const {
@@ -6807,14 +6831,14 @@ function privateShippingAddressIsComplete(address) {
   return !!(address.fullName && address.phone && address.street && address.city && address.zip);
 }
 
-app.post("/checkout", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, (req, res) => {
+app.post("/checkout", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, (req, res) => {
   return res.status(410).json({
     error: "Legacy checkout is disabled. Use the protected Paystack checkout flow.",
     code: "LEGACY_CHECKOUT_DISABLED",
   });
 });
 
-app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, async (req, res) => {
+app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   try {
     const { items, shippingAddress, currency, saveCard } = req.body;
     if (!isNigeriaCountry(shippingAddress?.country)) {
@@ -6960,7 +6984,7 @@ app.post("/checkout/verify/:reference", authenticate, async (req, res) => {
   }
 });
 
-app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, async (req, res) => {
+app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   try {
     const { items, shippingAddress, currency, cardId } = req.body;
     if (!isNigeriaCountry(shippingAddress?.country)) {
@@ -8668,7 +8692,7 @@ app.post("/order-items/:id/redeem-delivery-token", authenticate, codeRateLimit, 
   }
 });
 
-app.post("/checkout/single-item-payment", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, (req, res) => {
+app.post("/checkout/single-item-payment", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, (req, res) => {
   return res.status(410).json({
     error: "Legacy single-item payment is disabled. Use the protected Paystack checkout flow.",
     code: "LEGACY_PAYMENT_DISABLED",
