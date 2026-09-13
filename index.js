@@ -2648,6 +2648,9 @@ const SCHEMA_MIGRATIONS = [
   { version: 70, name: "verified-seller-report-passwords", statements: [
     `ALTER TABLE verified_seller_daily_reports ADD COLUMN IF NOT EXISTS password_encrypted TEXT`,
   ] },
+  { version: 71, name: "casual-seller-report-passwords", statements: [
+    `ALTER TABLE casual_seller_daily_reports ADD COLUMN IF NOT EXISTS password_encrypted TEXT`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -5728,7 +5731,7 @@ function assemblePdf(objects, rootId, userPassword = "") {
   return Buffer.concat(chunks);
 }
 
-async function buildCasualSellerReportPdf(applications, reportDate) {
+async function buildCasualSellerReportPdf(applications, reportDate, reportPassword) {
   const objects = [null];
   const addObject = (value) => { objects.push(Buffer.isBuffer(value) ? value : Buffer.from(value)); return objects.length - 1; };
   const fontId = addObject("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
@@ -5775,7 +5778,7 @@ async function buildCasualSellerReportPdf(applications, reportDate) {
     pageIds.push(pageId);
   }
   objects[pagesId] = Buffer.from(`<< /Type /Pages /Count ${pageIds.length} /Kids [${pageIds.map((id) => `${id} 0 R`).join(" ")}] >>`);
-  return assemblePdf(objects, catalogId);
+  return assemblePdf(objects, catalogId, reportPassword);
 }
 
 async function buildVerifiedSellerReportPdf(applications, reportDate, reportPassword) {
@@ -5873,11 +5876,12 @@ async function sendDailyCasualSellerReport(force = false) {
       [date, applicationsResult.rows.length, JSON.stringify(recipients)]
     );
     const reportId = reportRow.rows[0].id;
-    const pdf = await buildCasualSellerReportPdf(applicationsResult.rows, date);
+    const reportPassword = `STY-${crypto.randomBytes(9).toString("base64url")}`;
+    const pdf = await buildCasualSellerReportPdf(applicationsResult.rows, date, reportPassword);
     const pdfHash = crypto.createHash("sha256").update(pdf).digest("hex");
     const pdfPath = `daily-reports/${date}/casual-seller-approved-${reportId}-${pdfHash.slice(0, 12)}-${crypto.randomBytes(4).toString("hex")}.pdf`;
     await uploadPrivateVerificationObject(pdfPath, pdf, "application/pdf");
-    await lockClient.query("UPDATE casual_seller_daily_reports SET pdf_storage_path=$1, pdf_sha256=$2 WHERE id=$3", [pdfPath, pdfHash, reportId]);
+    await lockClient.query("UPDATE casual_seller_daily_reports SET pdf_storage_path=$1, pdf_sha256=$2, password_encrypted=$3 WHERE id=$4", [pdfPath, pdfHash, encryptField(reportPassword), reportId]);
     if (!process.env.RESEND_API_KEY) throw new Error("RESEND_API_KEY is not configured");
     const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
     const emailResponse = await fetch("https://api.resend.com/emails", {
@@ -5886,7 +5890,7 @@ async function sendDailyCasualSellerReport(force = false) {
       body: JSON.stringify({
         from: fromAddress, to: recipients,
         subject: `Stallyard approved casual sellers — ${date}`,
-        html: `<p>Attached is the protected daily record of ${applicationsResult.rows.length} automatically approved casual-seller application(s).</p><p>This document contains sensitive identity information. Do not forward it.</p>`,
+        html: `<p>Attached is the password-protected daily record of ${applicationsResult.rows.length} automatically approved casual-seller application(s).</p><p>The password is not included in this email. An authorized Super Admin must retrieve it from the Stallyard admin dashboard.</p><p>This document contains sensitive identity information. Do not forward it.</p>`,
         attachments: [{ filename: `stallyard-casual-sellers-${date}.pdf`, content: pdf.toString("base64") }],
       }),
     });
@@ -5960,7 +5964,7 @@ async function sendDailyVerifiedSellerReport(force = false) {
         from: fromAddress,
         to: recipients,
         subject: `Stallyard approved Verified Sellers — ${date}`,
-        html: `<p>Attached is the protected daily approval record for ${applicationsResult.rows.length} Verified Seller application(s).</p><p>This document contains sensitive identity and financial information. It is for Super Admin access only and must not be forwarded.</p>`,
+        html: `<p>Attached is the password-protected daily approval record for ${applicationsResult.rows.length} Verified Seller application(s).</p><p>The password is not included in this email. An authorized Super Admin must retrieve it from the Stallyard admin dashboard.</p><p>This document contains sensitive identity and financial information. It is for Super Admin access only and must not be forwarded.</p>`,
         attachments: [{ filename: `stallyard-verified-sellers-${date}.pdf`, content: pdf.toString("base64") }],
       }),
     });
@@ -6048,6 +6052,17 @@ app.get("/admin/casual-seller-reports/:id/download", authenticate, requireSuperA
     res.setHeader("Content-Disposition", `attachment; filename="stallyard-casual-sellers-${result.rows[0].report_date}.pdf"`);
     res.setHeader("Cache-Control", "private, no-store");
     res.send(pdf);
+  } catch (err) { sendInternalError(res, err); }
+});
+
+app.get("/admin/casual-seller-reports/:id/password", authenticate, requireSuperAdmin, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT password_encrypted FROM casual_seller_daily_reports WHERE id=$1", [req.params.id]);
+    if (!result.rows[0]?.password_encrypted) return res.status(404).json({ error: "Report password not found" });
+    const password = decryptFieldSafe(result.rows[0].password_encrypted);
+    await pool.query("INSERT INTO casual_seller_access_log(report_id,admin_id,action) VALUES($1,$2,'revealed_password')", [req.params.id, req.user.id]);
+    res.setHeader("Cache-Control", "private, no-store");
+    res.json({ password });
   } catch (err) { sendInternalError(res, err); }
 });
 
