@@ -5480,6 +5480,88 @@ app.get("/admin/verified-seller-applications", authenticate, requirePermission("
   } catch (err) { sendInternalError(res, err); }
 });
 
+app.patch("/admin/verified-seller-applications/:id/auto-verify", authenticate, requireSuperAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const applicationResult = await client.query(
+      `SELECT a.*, u.username, u.is_suspended, u.casual_seller_status,
+              u.is_email_verified, u.is_phone_verified, u.paystack_recipient_code
+         FROM verified_seller_applications a
+         JOIN users u ON u.id = a.user_id
+        WHERE a.id = $1 FOR UPDATE`,
+      [req.params.id]
+    );
+    if (!applicationResult.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Verified Seller application not found" });
+    }
+    const application = applicationResult.rows[0];
+    if (application.status !== "pending") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Only a pending Verified Seller application can be auto-verified" });
+    }
+
+    const addressResult = await client.query(
+      `SELECT id FROM user_addresses
+        WHERE id = $1 AND user_id = $2 AND is_default = true
+          AND street <> '' AND city <> '' AND state <> '' AND LOWER(country) = 'nigeria'`,
+      [application.address_id, application.user_id]
+    );
+    const failedChecks = [];
+    if (application.is_suspended) failedChecks.push("account is suspended");
+    if (application.casual_seller_status !== "approved") failedChecks.push("Casual Seller verification is not approved");
+    if (!application.is_email_verified) failedChecks.push("email is not verified");
+    if (!application.is_phone_verified) failedChecks.push("phone is not verified");
+    if (!application.paystack_recipient_code) failedChecks.push("payout bank account is not verified");
+    if (!addressResult.rows.length) failedChecks.push("complete default Nigerian address is missing");
+    if (!CASUAL_SELLER_ID_TYPES.has(application.id_type)) failedChecks.push("accepted identification type is missing");
+    if (!application.id_front_path) failedChecks.push("front identification image is missing");
+    if (!application.bank_statement_path) failedChecks.push("bank statement is missing");
+    if (!application.consented_at) failedChecks.push("seller declaration was not accepted");
+    if (Number(application.requested_limit) !== VERIFIED_SELLER_LIMIT_NGN) failedChecks.push("requested limit is invalid");
+    if (failedChecks.length) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error: `Automatic verification could not approve this application: ${failedChecks.join("; ")}`,
+        failedChecks,
+      });
+    }
+
+    const userResult = await client.query(
+      `UPDATE users SET is_approved = true, verification_status = 'approved', rejection_reason = NULL,
+         seller_tier = 'verified', seller_listing_limit = $1
+       WHERE id = $2 RETURNING ${USER_RETURNING_FIELDS}`,
+      [VERIFIED_SELLER_LIMIT_NGN, application.user_id]
+    );
+    await client.query(
+      `UPDATE verified_seller_applications
+          SET status = 'approved', decision_reason = 'Approved by Super Admin automatic record checks',
+              reviewed_by = $1, reviewed_at = NOW(), updated_at = NOW()
+        WHERE id = $2`,
+      [req.user.id, application.id]
+    );
+    await client.query("COMMIT");
+    logAdminAction(req.user.id, "verified_seller_auto_verified", `Auto-verified ${application.username}'s Verified Seller application ${application.reference}`);
+    createNotification(
+      application.user_id,
+      "seller_application",
+      "Your Verified Seller application was approved. You may now maintain up to ₦10,000,000 in combined active listings."
+    );
+    res.json({
+      user: userResult.rows[0],
+      applicationId: application.id,
+      checksPassed: ["casual seller", "email", "phone", "payout bank", "address", "ID image", "bank statement", "consent"],
+      notice: "Automatic record checks do not authenticate the identification with its issuing government agency.",
+    });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    sendInternalError(res, err, "verified seller automatic verification");
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/admin/verified-seller-applications/:id/bank-statement", authenticate, requirePermission("seller_verification"), async (req, res) => {
   try {
     const result = await pool.query("SELECT reference,bank_statement_path FROM verified_seller_applications WHERE id=$1", [req.params.id]);
