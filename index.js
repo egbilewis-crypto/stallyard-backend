@@ -2614,6 +2614,37 @@ const SCHEMA_MIGRATIONS = [
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS nationality TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS state_of_residence TEXT`,
   ] },
+  { version: 69, name: "verified-seller-daily-reports", statements: [
+    `CREATE TABLE IF NOT EXISTS verified_seller_daily_reports (
+       id BIGSERIAL PRIMARY KEY,
+       report_date DATE NOT NULL UNIQUE,
+       application_count INTEGER NOT NULL DEFAULT 0,
+       pdf_storage_path TEXT,
+       pdf_sha256 TEXT,
+       email_recipients JSONB NOT NULL DEFAULT '[]'::jsonb,
+       email_status TEXT NOT NULL DEFAULT 'pending',
+       email_error TEXT,
+       emailed_at TIMESTAMP,
+       created_at TIMESTAMP NOT NULL DEFAULT NOW()
+     )`,
+    `ALTER TABLE verified_seller_applications ADD COLUMN IF NOT EXISTS included_in_report_id BIGINT`,
+    `DO $$ BEGIN
+       IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'verified_seller_applications_report_fk') THEN
+         ALTER TABLE verified_seller_applications ADD CONSTRAINT verified_seller_applications_report_fk
+         FOREIGN KEY (included_in_report_id) REFERENCES verified_seller_daily_reports(id) ON DELETE SET NULL;
+       END IF;
+     END $$`,
+    `CREATE INDEX IF NOT EXISTS idx_verified_seller_daily_report_queue
+       ON verified_seller_applications(status, reviewed_at)
+       WHERE status = 'approved' AND included_in_report_id IS NULL`,
+    `CREATE TABLE IF NOT EXISTS verified_seller_report_access_log (
+       id BIGSERIAL PRIMARY KEY,
+       report_id BIGINT NOT NULL REFERENCES verified_seller_daily_reports(id) ON DELETE RESTRICT,
+       admin_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+       action TEXT NOT NULL,
+       created_at TIMESTAMP NOT NULL DEFAULT NOW()
+     )`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -5679,6 +5710,66 @@ async function buildCasualSellerReportPdf(applications, reportDate) {
   return assemblePdf(objects, catalogId);
 }
 
+async function buildVerifiedSellerReportPdf(applications, reportDate) {
+  const objects = [null];
+  const addObject = (value) => { objects.push(Buffer.isBuffer(value) ? value : Buffer.from(value)); return objects.length - 1; };
+  const fontId = addObject("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+  const pagesId = addObject("");
+  const catalogId = addObject(`<< /Type /Catalog /Pages ${pagesId} 0 R >>`);
+  const pageIds = [];
+  for (const application of applications) {
+    const documentSlots = [
+      [application.id_front_path, "Identification front"],
+      [application.id_back_path, "Identification back"],
+      [application.bank_statement_path?.toLowerCase().endsWith(".jpg") ? application.bank_statement_path : null, "Bank statement"],
+    ].filter(([path]) => path);
+    const imageObjects = [];
+    for (const [path, label] of documentSlots) {
+      const bytes = await fetchPrivateVerificationObject(path);
+      const dimensions = jpegDimensions(bytes);
+      const header = Buffer.from(`<< /Type /XObject /Subtype /Image /Width ${dimensions.width} /Height ${dimensions.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${bytes.length} >>\nstream\n`);
+      const imageId = addObject(Buffer.concat([header, bytes, Buffer.from("\nendstream")]));
+      imageObjects.push({ imageId, label, ...dimensions });
+    }
+    const fullName = [application.last_name, application.first_name, application.other_name].filter(Boolean).join(" ") || application.display_name || application.username;
+    const approvalMethod = String(application.decision_reason || "Manual administrative approval");
+    const lines = [
+      `Daily report: ${reportDate}`,
+      `Application: ${application.reference}`,
+      `Seller: ${fullName} (@${application.username})`,
+      `Email: ${application.email || "not provided"}   Phone: ${application.phone || "not provided"}`,
+      `Nationality: ${application.nationality || "not provided"}   State: ${application.state_of_residence || application.address_state || "not provided"}`,
+      `Identification: ${application.id_type || "not provided"}`,
+      `Payout account: ${application.bank_account_name || "verified account on file"}`,
+      `Address: ${[application.address_street, application.address_city, application.address_state].filter(Boolean).join(", ")}`,
+      `Seller level: Verified Seller   Combined active-listing limit: NGN 10,000,000`,
+      `Approved: ${application.reviewed_at ? new Date(application.reviewed_at).toISOString() : "not recorded"}`,
+      `Approval method: ${approvalMethod}`,
+      `Reviewed by: ${application.reviewer_name || application.reviewer_username || "authorized administrator"}`,
+      application.bank_statement_path?.toLowerCase().endsWith(".pdf")
+        ? "Bank statement: original PDF retained securely in the Verified Seller application record"
+        : "Bank statement: image reproduced below and original retained securely",
+    ];
+    let content = "BT /F1 15 Tf 40 812 Td (Stallyard Verified Seller Approval) Tj ET\n";
+    lines.forEach((line, index) => { content += `BT /F1 ${index >= 7 ? 7 : 8} Tf 40 ${791 - index * 13} Td (${pdfText(line).slice(0, 150)}) Tj ET\n`; });
+    const placements = [[40, 385], [308, 385], [40, 85]];
+    imageObjects.forEach((image, index) => {
+      const [x, y] = placements[index];
+      const maxW = 247, maxH = index === 2 ? 250 : 270;
+      const scale = Math.min(maxW / image.width, maxH / image.height);
+      const width = Math.max(1, image.width * scale), height = Math.max(1, image.height * scale);
+      content += `BT /F1 9 Tf ${x} ${y + maxH + 8} Td (${pdfText(image.label)}) Tj ET\nq ${width.toFixed(2)} 0 0 ${height.toFixed(2)} ${x} ${y} cm /Im${index + 1} Do Q\n`;
+    });
+    const contentBuffer = Buffer.from(content);
+    const contentId = addObject(Buffer.concat([Buffer.from(`<< /Length ${contentBuffer.length} >>\nstream\n`), contentBuffer, Buffer.from("endstream")]));
+    const xObjects = imageObjects.map((image, index) => `/Im${index + 1} ${image.imageId} 0 R`).join(" ");
+    const pageId = addObject(`<< /Type /Page /Parent ${pagesId} 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 ${fontId} 0 R >> /XObject << ${xObjects} >> >> /Contents ${contentId} 0 R >>`);
+    pageIds.push(pageId);
+  }
+  objects[pagesId] = Buffer.from(`<< /Type /Pages /Count ${pageIds.length} /Kids [${pageIds.map((id) => `${id} 0 R`).join(" ")}] >>`);
+  return assemblePdf(objects, catalogId);
+}
+
 function lagosDateParts(now = new Date()) {
   const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Lagos", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hourCycle: "h23" })
     .formatToParts(now).reduce((out, part) => ({ ...out, [part.type]: part.value }), {});
@@ -5747,6 +5838,79 @@ async function sendDailyCasualSellerReport(force = false) {
     return { sent: false, error: err.message };
   } finally {
     await lockClient.query("SELECT pg_advisory_unlock($1)", [830500001]).catch(() => {});
+    lockClient.release();
+  }
+}
+
+async function sendDailyVerifiedSellerReport(force = false) {
+  const { date, hour } = lagosDateParts();
+  if (!force && hour < 8) return { skipped: true, reason: "before_schedule" };
+  const lockClient = await pool.connect();
+  try {
+    const locked = await lockClient.query("SELECT pg_try_advisory_lock($1) AS locked", [830500002]);
+    if (!locked.rows[0]?.locked) return { skipped: true, reason: "already_running" };
+    const existing = await lockClient.query("SELECT id, email_status FROM verified_seller_daily_reports WHERE report_date = $1", [date]);
+    if (existing.rows[0]?.email_status === "sent") return { skipped: true, reason: "already_sent" };
+    const applicationsResult = await lockClient.query(
+      `SELECT a.*, u.username, u.display_name, u.email, u.phone, u.first_name, u.last_name, u.other_name,
+              u.nationality, u.state_of_residence, u.bank_account_name,
+              addr.street AS address_street, addr.city AS address_city, addr.state AS address_state,
+              reviewer.username AS reviewer_username, reviewer.display_name AS reviewer_name
+         FROM verified_seller_applications a
+         JOIN users u ON u.id = a.user_id
+         LEFT JOIN user_addresses addr ON addr.id = a.address_id
+         LEFT JOIN users reviewer ON reviewer.id = a.reviewed_by
+        WHERE a.status = 'approved' AND a.included_in_report_id IS NULL
+        ORDER BY a.reviewed_at, a.id`
+    );
+    if (!applicationsResult.rows.length) return { skipped: true, reason: "no_applications" };
+    const recipientsResult = await lockClient.query(
+      `SELECT email FROM users WHERE is_admin = true AND COALESCE(admin_role, 'super_admin') = 'super_admin'
+         AND is_suspended = false AND email IS NOT NULL AND email <> ''`
+    );
+    const recipients = [...new Set(recipientsResult.rows.map((row) => row.email.toLowerCase()))];
+    if (!recipients.length) throw new Error("No active super-admin email address is configured");
+    const reportRow = await lockClient.query(
+      `INSERT INTO verified_seller_daily_reports(report_date, application_count, email_recipients)
+       VALUES ($1,$2,$3) ON CONFLICT(report_date) DO UPDATE SET application_count = EXCLUDED.application_count,
+       email_recipients = EXCLUDED.email_recipients, email_status = 'pending', email_error = NULL RETURNING id`,
+      [date, applicationsResult.rows.length, JSON.stringify(recipients)]
+    );
+    const reportId = reportRow.rows[0].id;
+    const pdf = await buildVerifiedSellerReportPdf(applicationsResult.rows, date);
+    const pdfHash = crypto.createHash("sha256").update(pdf).digest("hex");
+    const pdfPath = `daily-reports/${date}/verified-seller-approved-${reportId}-${pdfHash.slice(0, 12)}-${crypto.randomBytes(4).toString("hex")}.pdf`;
+    await uploadPrivateVerificationObject(pdfPath, pdf, "application/pdf");
+    await lockClient.query("UPDATE verified_seller_daily_reports SET pdf_storage_path=$1, pdf_sha256=$2 WHERE id=$3", [pdfPath, pdfHash, reportId]);
+    if (!process.env.RESEND_API_KEY) throw new Error("RESEND_API_KEY is not configured");
+    const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
+    const emailResponse = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
+      body: JSON.stringify({
+        from: fromAddress,
+        to: recipients,
+        subject: `Stallyard approved Verified Sellers — ${date}`,
+        html: `<p>Attached is the protected daily approval record for ${applicationsResult.rows.length} Verified Seller application(s).</p><p>This document contains sensitive identity and financial information. It is for Super Admin access only and must not be forwarded.</p>`,
+        attachments: [{ filename: `stallyard-verified-sellers-${date}.pdf`, content: pdf.toString("base64") }],
+      }),
+    });
+    if (!emailResponse.ok) throw new Error(`Verified Seller report email failed (${emailResponse.status})`);
+    await lockClient.query("BEGIN");
+    await lockClient.query("UPDATE verified_seller_daily_reports SET email_status='sent', emailed_at=NOW(), email_error=NULL WHERE id=$1", [reportId]);
+    await lockClient.query("UPDATE verified_seller_applications SET included_in_report_id=$1 WHERE id = ANY($2::bigint[])", [reportId, applicationsResult.rows.map((row) => row.id)]);
+    await lockClient.query("COMMIT");
+    return { sent: true, reportId, applicationCount: applicationsResult.rows.length };
+  } catch (err) {
+    await lockClient.query("ROLLBACK").catch(() => {});
+    console.error("Daily Verified Seller report failed:", err.message);
+    await lockClient.query(
+      `UPDATE verified_seller_daily_reports SET email_status='failed', email_error=$1 WHERE report_date=$2`,
+      [String(err.message).slice(0, 500), date]
+    ).catch(() => {});
+    return { sent: false, error: err.message };
+  } finally {
+    await lockClient.query("SELECT pg_advisory_unlock($1)", [830500002]).catch(() => {});
     lockClient.release();
   }
 }
@@ -5821,6 +5985,34 @@ app.get("/admin/casual-seller-reports/:id/download", authenticate, requireSuperA
 app.post("/admin/casual-seller-reports/run", authenticate, requireSuperAdmin, async (req, res) => {
   const result = await sendDailyCasualSellerReport(true);
   if (result.error) return res.status(502).json({ error: "The report could not be completed", details: result.error });
+  res.json(result);
+});
+
+app.get("/admin/verified-seller-reports", authenticate, requireSuperAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT id, report_date, application_count, email_status, emailed_at, created_at FROM verified_seller_daily_reports ORDER BY report_date DESC LIMIT 365"
+    );
+    res.json({ reports: result.rows });
+  } catch (err) { sendInternalError(res, err); }
+});
+
+app.get("/admin/verified-seller-reports/:id/download", authenticate, requireSuperAdmin, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT report_date,pdf_storage_path FROM verified_seller_daily_reports WHERE id=$1", [req.params.id]);
+    if (!result.rows[0]?.pdf_storage_path) return res.status(404).json({ error: "Report file not found" });
+    const pdf = await fetchPrivateVerificationObject(result.rows[0].pdf_storage_path);
+    await pool.query("INSERT INTO verified_seller_report_access_log(report_id,admin_id,action) VALUES($1,$2,'downloaded_pdf')", [req.params.id, req.user.id]);
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="stallyard-verified-sellers-${result.rows[0].report_date}.pdf"`);
+    res.setHeader("Cache-Control", "private, no-store");
+    res.send(pdf);
+  } catch (err) { sendInternalError(res, err); }
+});
+
+app.post("/admin/verified-seller-reports/run", authenticate, requireSuperAdmin, async (req, res) => {
+  const result = await sendDailyVerifiedSellerReport(true);
+  if (result.error) return res.status(502).json({ error: "The Verified Seller report could not be completed", details: result.error });
   res.json(result);
 });
 
@@ -10786,8 +10978,10 @@ async function startServer() {
       // Check hourly; the persisted report date and advisory lock guarantee a
       // single daily send at/after 08:00 Africa/Lagos, even across restarts.
       setInterval(() => sendDailyCasualSellerReport(false), 60 * 60 * 1000).unref();
+      setInterval(() => sendDailyVerifiedSellerReport(false), 60 * 60 * 1000).unref();
       sendShipReminders();
       sendDailyCasualSellerReport(false);
+      sendDailyVerifiedSellerReport(false);
     });
   } catch (err) {
     // Fail the deployment instead of starting against a half-migrated schema.
