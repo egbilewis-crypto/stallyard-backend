@@ -5164,6 +5164,7 @@ const CASUAL_SELLER_LIMIT_NGN = 500000;
 const VERIFIED_SELLER_LIMIT_NGN = 10000000;
 const CASUAL_SELLER_ID_TYPES = new Set(["nin", "passport", "drivers_license", "voters_card", "cerpac"]);
 const CASUAL_SELLER_CONSENT_VERSION = "2026-09-12";
+const CASUAL_LIVENESS_TTL_MS = 10 * 60 * 1000;
 const VERIFICATION_BUCKET = process.env.SUPABASE_VERIFICATION_BUCKET || "seller-verification-private";
 
 function verificationStorageConfig() {
@@ -5230,6 +5231,19 @@ async function fetchPrivateVerificationObject(path) {
   const response = await fetch(endpoint, { headers: { apikey: key, Authorization: `Bearer ${key}` } });
   if (!response.ok) throw new Error(`Private verification object could not be read (${response.status})`);
   return Buffer.from(await response.arrayBuffer());
+}
+
+async function deletePrivateVerificationObject(path) {
+  if (!path) return;
+  const { url, key } = verificationStorageConfig();
+  if (!url || !key) return;
+  const endpoint = `${url}/storage/v1/object/${encodeURIComponent(VERIFICATION_BUCKET)}`;
+  const response = await fetch(endpoint, {
+    method: "DELETE",
+    headers: { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ prefixes: [path] }),
+  });
+  if (!response.ok && response.status !== 404) console.error("Private verification cleanup failed:", response.status);
 }
 
 function identityDigest(value) {
@@ -5317,6 +5331,21 @@ app.get("/casual-seller/status", authenticate, rejectAdminMarketplaceUse, async 
   } catch (err) { sendInternalError(res, err); }
 });
 
+app.post("/casual-seller/challenge", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, async (req, res) => {
+  try {
+    const poolValues = ["blink", "turn_left", "turn_right", "smile", "move_closer"];
+    for (let index = poolValues.length - 1; index > 0; index--) {
+      const swap = crypto.randomInt(index + 1);
+      [poolValues[index], poolValues[swap]] = [poolValues[swap], poolValues[index]];
+    }
+    const challenges = poolValues.slice(0, 3);
+    const token = crypto.randomBytes(24).toString("base64url");
+    await setSecurityState("casual-liveness", req.user.id, { token, challenges }, CASUAL_LIVENESS_TTL_MS);
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ token, challenges, expiresInSeconds: CASUAL_LIVENESS_TTL_MS / 1000 });
+  } catch (err) { sendInternalError(res, err, "casual seller liveness challenge"); }
+});
+
 app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, async (req, res) => {
   const client = await pool.connect();
   const uploadedPaths = [];
@@ -5324,7 +5353,7 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requir
     const {
       legalName, dateOfBirth, consent,
       liveSelfie, holdingIdSelfie, challengeFrames, challenges,
-      faceDetectionSupported, faceChecks, faceMatch,
+      faceDetectionSupported, faceChecks, faceMatch, challengeToken,
     } = req.body || {};
     if (consent !== true) return res.status(400).json({ error: "Consent is required before identity verification" });
     if (!legalName || !dateOfBirth) {
@@ -5338,6 +5367,13 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requir
     if (new Set(challenges).size !== 3 || challenges.some((item) => !acceptedChallenges.has(item))) {
       return res.status(400).json({ error: "The live camera challenge is invalid — restart verification" });
     }
+    const issuedChallenge = await getSecurityState("casual-liveness", req.user.id);
+    const submittedToken = Buffer.from(String(challengeToken || ""));
+    const storedToken = Buffer.from(String(issuedChallenge?.token || ""));
+    const challengeValid = !!issuedChallenge && submittedToken.length > 0 && submittedToken.length === storedToken.length &&
+      crypto.timingSafeEqual(submittedToken, storedToken) && JSON.stringify(challenges) === JSON.stringify(issuedChallenge.challenges);
+    if (!challengeValid) return res.status(400).json({ error: "Your secure camera challenge expired or is invalid — restart verification" });
+    await deleteSecurityState("casual-liveness", req.user.id);
 
     const images = {
       live_selfie: parseVerificationJpeg(liveSelfie, "Live selfie"),
@@ -5375,6 +5411,7 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requir
       evidenceFilesPresent: Object.keys(images).length >= 5,
       evidenceFilesDistinct: distinctEvidence,
       randomizedChallengesComplete: true,
+      serverIssuedChallengeValid: true,
       cameraFacePresenceChecks: clientFaceChecks,
       liveSelfieMatchesHoldingPhoto: faceMatch?.passed === true && Number(faceMatch?.distance) >= 0 && Number(faceMatch.distance) <= 0.5,
       validFaceDescriptor: !!faceDescriptor,
@@ -5429,6 +5466,7 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requir
     res.status(201).json({ reference, status, checks, limit: CASUAL_SELLER_LIMIT_NGN });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
+    await Promise.all(uploadedPaths.map((path) => deletePrivateVerificationObject(path))).catch(() => {});
     if (err.code === "23505") return res.status(409).json({ error: "This identity is already connected to another seller account", code: "DUPLICATE_IDENTITY" });
     if (err.statusCode) return res.status(err.statusCode).json({ error: err.message, code: err.code, currentActiveValue: err.currentActiveValue, limit: err.limit });
     sendInternalError(res, err, "casual seller application");
@@ -5447,6 +5485,7 @@ function parsePrivateApplicationDocument(dataUrl, label) {
 
 app.post("/verified-seller/apply", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, async (req, res) => {
   const client = await pool.connect();
+  const uploadedPaths = [];
   try {
     if (req.body?.consent !== true) return res.status(400).json({ error: "Accept the verified-seller declaration before applying" });
     const document = parsePrivateApplicationDocument(req.body?.bankStatement, "Bank statement");
@@ -5481,8 +5520,10 @@ app.post("/verified-seller/apply", authenticate, rejectAdminMarketplaceUse, requ
     const idFrontPath = `user-${req.user.id}/verified-seller/${reference}/id-front-${idFront.sha256.slice(0, 12)}.jpg`;
     const idBackPath = idBack ? `user-${req.user.id}/verified-seller/${reference}/id-back-${idBack.sha256.slice(0, 12)}.jpg` : null;
     await uploadPrivateVerificationObject(path, document.buffer, document.contentType);
+    uploadedPaths.push(path);
     await uploadPrivateVerificationObject(idFrontPath, idFront.buffer);
-    if (idBack && idBackPath) await uploadPrivateVerificationObject(idBackPath, idBack.buffer);
+    uploadedPaths.push(idFrontPath);
+    if (idBack && idBackPath) { await uploadPrivateVerificationObject(idBackPath, idBack.buffer); uploadedPaths.push(idBackPath); }
     const snapshot = { identityReference: identityResult.rows[0].reference, emailVerified: true, phoneVerified: true,
       payoutBankVerified: true, address: addressResult.rows[0], requestedLimit: VERIFIED_SELLER_LIMIT_NGN,
       idType };
@@ -5499,6 +5540,7 @@ app.post("/verified-seller/apply", authenticate, rejectAdminMarketplaceUse, requ
     res.status(201).json({ reference, status: "pending", requestedLimit: VERIFIED_SELLER_LIMIT_NGN });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
+    await Promise.all(uploadedPaths.map((path) => deletePrivateVerificationObject(path))).catch(() => {});
     if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
     if (err.code === "23505") return res.status(409).json({ error: "A verified-seller application is already pending" });
     sendInternalError(res, err, "verified seller application");
@@ -5811,7 +5853,7 @@ async function buildVerifiedSellerReportPdf(applications, reportDate, reportPass
       `Email: ${application.email || "not provided"}   Phone: ${application.phone || "not provided"}`,
       `Nationality: ${application.nationality || "not provided"}   State: ${application.state_of_residence || application.address_state || "not provided"}`,
       `Identification: ${application.id_type || "not provided"}`,
-      `Payout account: ${application.bank_account_name || "verified account on file"}`,
+      `Payout account: ${decryptFieldSafe(application.bank_account_name) || "verified account on file"}`,
       `Address: ${[application.address_street, application.address_city, application.address_state].filter(Boolean).join(", ")}`,
       `Seller level: Verified Seller   Combined active-listing limit: NGN 10,000,000`,
       `Approved: ${application.reviewed_at ? new Date(application.reviewed_at).toISOString() : "not recorded"}`,
@@ -5988,6 +6030,84 @@ async function sendDailyVerifiedSellerReport(force = false) {
   }
 }
 
+async function ensureCasualSellerReportProtected(reportId) {
+  const client = await pool.connect();
+  let replacementPath = null;
+  try {
+    await client.query("BEGIN");
+    const reportResult = await client.query("SELECT * FROM casual_seller_daily_reports WHERE id=$1 FOR UPDATE", [reportId]);
+    const report = reportResult.rows[0];
+    if (!report) throw Object.assign(new Error("Report not found"), { statusCode: 404 });
+    if (report.password_encrypted) { await client.query("COMMIT"); return report; }
+    const applications = await client.query(
+      `SELECT a.*, u.username, u.email, u.phone FROM casual_seller_applications a
+        JOIN users u ON u.id=a.user_id WHERE a.included_in_report_id=$1 ORDER BY a.approved_at,a.id`, [reportId]
+    );
+    if (!applications.rows.length) throw new Error("The original report applications could not be reconstructed");
+    const password = `STY-${crypto.randomBytes(9).toString("base64url")}`;
+    const pdf = await buildCasualSellerReportPdf(applications.rows, String(report.report_date).slice(0, 10), password);
+    const hash = crypto.createHash("sha256").update(pdf).digest("hex");
+    replacementPath = `daily-reports/${String(report.report_date).slice(0, 10)}/casual-seller-protected-${reportId}-${hash.slice(0, 12)}-${crypto.randomBytes(4).toString("hex")}.pdf`;
+    await uploadPrivateVerificationObject(replacementPath, pdf, "application/pdf");
+    await client.query("UPDATE casual_seller_daily_reports SET pdf_storage_path=$1,pdf_sha256=$2,password_encrypted=$3 WHERE id=$4", [replacementPath, hash, encryptField(password), reportId]);
+    await client.query("COMMIT");
+    await deletePrivateVerificationObject(report.pdf_storage_path);
+    return { ...report, pdf_storage_path: replacementPath, password_encrypted: encryptField(password) };
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (replacementPath) await deletePrivateVerificationObject(replacementPath).catch(() => {});
+    throw err;
+  } finally { client.release(); }
+}
+
+async function ensureVerifiedSellerReportProtected(reportId) {
+  const client = await pool.connect();
+  let replacementPath = null;
+  try {
+    await client.query("BEGIN");
+    const reportResult = await client.query("SELECT * FROM verified_seller_daily_reports WHERE id=$1 FOR UPDATE", [reportId]);
+    const report = reportResult.rows[0];
+    if (!report) throw Object.assign(new Error("Report not found"), { statusCode: 404 });
+    if (report.password_encrypted) { await client.query("COMMIT"); return report; }
+    const applications = await client.query(
+      `SELECT a.*, u.username,u.display_name,u.email,u.phone,u.first_name,u.last_name,u.other_name,u.nationality,u.state_of_residence,u.bank_account_name,
+              addr.street AS address_street,addr.city AS address_city,addr.state AS address_state,
+              reviewer.username AS reviewer_username,reviewer.display_name AS reviewer_name
+         FROM verified_seller_applications a JOIN users u ON u.id=a.user_id
+         LEFT JOIN user_addresses addr ON addr.id=a.address_id LEFT JOIN users reviewer ON reviewer.id=a.reviewed_by
+        WHERE a.included_in_report_id=$1 ORDER BY a.reviewed_at,a.id`, [reportId]
+    );
+    if (!applications.rows.length) throw new Error("The original report applications could not be reconstructed");
+    const password = `STY-${crypto.randomBytes(9).toString("base64url")}`;
+    const pdf = await buildVerifiedSellerReportPdf(applications.rows, String(report.report_date).slice(0, 10), password);
+    const hash = crypto.createHash("sha256").update(pdf).digest("hex");
+    replacementPath = `daily-reports/${String(report.report_date).slice(0, 10)}/verified-seller-protected-${reportId}-${hash.slice(0, 12)}-${crypto.randomBytes(4).toString("hex")}.pdf`;
+    await uploadPrivateVerificationObject(replacementPath, pdf, "application/pdf");
+    const encryptedPassword = encryptField(password);
+    await client.query("UPDATE verified_seller_daily_reports SET pdf_storage_path=$1,pdf_sha256=$2,password_encrypted=$3 WHERE id=$4", [replacementPath, hash, encryptedPassword, reportId]);
+    await client.query("COMMIT");
+    await deletePrivateVerificationObject(report.pdf_storage_path);
+    return { ...report, pdf_storage_path: replacementPath, password_encrypted: encryptedPassword };
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    if (replacementPath) await deletePrivateVerificationObject(replacementPath).catch(() => {});
+    throw err;
+  } finally { client.release(); }
+}
+
+async function protectLegacySellerReports() {
+  const [casual, verified] = await Promise.all([
+    pool.query("SELECT id FROM casual_seller_daily_reports WHERE password_encrypted IS NULL AND pdf_storage_path IS NOT NULL ORDER BY id"),
+    pool.query("SELECT id FROM verified_seller_daily_reports WHERE password_encrypted IS NULL AND pdf_storage_path IS NOT NULL ORDER BY id"),
+  ]);
+  for (const row of casual.rows) {
+    await ensureCasualSellerReportProtected(row.id).catch((err) => console.error(`Could not protect legacy Casual Seller report ${row.id}:`, err.message));
+  }
+  for (const row of verified.rows) {
+    await ensureVerifiedSellerReportProtected(row.id).catch((err) => console.error(`Could not protect legacy Verified Seller report ${row.id}:`, err.message));
+  }
+}
+
 app.get("/admin/casual-seller-applications", authenticate, requireSuperAdmin, async (req, res) => {
   try {
     const result = await pool.query(
@@ -6044,6 +6164,7 @@ app.get("/admin/casual-seller-reports", authenticate, requireSuperAdmin, async (
 
 app.get("/admin/casual-seller-reports/:id/download", authenticate, requireSuperAdmin, async (req, res) => {
   try {
+    await ensureCasualSellerReportProtected(req.params.id);
     const result = await pool.query("SELECT report_date,pdf_storage_path FROM casual_seller_daily_reports WHERE id=$1", [req.params.id]);
     if (!result.rows[0]?.pdf_storage_path) return res.status(404).json({ error: "Report file not found" });
     const pdf = await fetchPrivateVerificationObject(result.rows[0].pdf_storage_path);
@@ -6057,6 +6178,7 @@ app.get("/admin/casual-seller-reports/:id/download", authenticate, requireSuperA
 
 app.get("/admin/casual-seller-reports/:id/password", authenticate, requireSuperAdmin, async (req, res) => {
   try {
+    await ensureCasualSellerReportProtected(req.params.id);
     const result = await pool.query("SELECT password_encrypted FROM casual_seller_daily_reports WHERE id=$1", [req.params.id]);
     if (!result.rows[0]?.password_encrypted) return res.status(404).json({ error: "Report password not found" });
     const password = decryptFieldSafe(result.rows[0].password_encrypted);
@@ -6083,6 +6205,7 @@ app.get("/admin/verified-seller-reports", authenticate, requireSuperAdmin, async
 
 app.get("/admin/verified-seller-reports/:id/download", authenticate, requireSuperAdmin, async (req, res) => {
   try {
+    await ensureVerifiedSellerReportProtected(req.params.id);
     const result = await pool.query("SELECT report_date,pdf_storage_path FROM verified_seller_daily_reports WHERE id=$1", [req.params.id]);
     if (!result.rows[0]?.pdf_storage_path) return res.status(404).json({ error: "Report file not found" });
     const pdf = await fetchPrivateVerificationObject(result.rows[0].pdf_storage_path);
@@ -6096,6 +6219,7 @@ app.get("/admin/verified-seller-reports/:id/download", authenticate, requireSupe
 
 app.get("/admin/verified-seller-reports/:id/password", authenticate, requireSuperAdmin, async (req, res) => {
   try {
+    await ensureVerifiedSellerReportProtected(req.params.id);
     const result = await pool.query("SELECT password_encrypted FROM verified_seller_daily_reports WHERE id=$1", [req.params.id]);
     if (!result.rows[0]?.password_encrypted) return res.status(404).json({ error: "Report password not found" });
     const password = decryptFieldSafe(result.rows[0].password_encrypted);
@@ -11066,6 +11190,7 @@ async function startServer() {
   try {
     await applyPendingMigrations();
     await ensurePrivateVerificationBucket();
+    await protectLegacySellerReports();
     await encryptLegacyTotpSecrets();
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
