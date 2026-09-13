@@ -5547,7 +5547,7 @@ app.post("/verified-seller/apply", authenticate, rejectAdminMarketplaceUse, requ
   } finally { client.release(); }
 });
 
-app.get("/admin/verified-seller-applications", authenticate, requirePermission("seller_verification"), async (req, res) => {
+app.get("/admin/verified-seller-applications", authenticate, requireSuperAdmin, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT a.id,a.reference,a.user_id,a.requested_limit,a.requirements_snapshot,a.status,a.decision_reason,
@@ -5641,7 +5641,7 @@ app.patch("/admin/verified-seller-applications/:id/auto-verify", authenticate, r
   }
 });
 
-app.get("/admin/verified-seller-applications/:id/bank-statement", authenticate, requirePermission("seller_verification"), async (req, res) => {
+app.get("/admin/verified-seller-applications/:id/bank-statement", authenticate, requireSuperAdmin, async (req, res) => {
   try {
     const result = await pool.query("SELECT reference,bank_statement_path FROM verified_seller_applications WHERE id=$1", [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: "Application not found" });
@@ -5655,7 +5655,7 @@ app.get("/admin/verified-seller-applications/:id/bank-statement", authenticate, 
   } catch (err) { sendInternalError(res, err); }
 });
 
-app.get("/admin/verified-seller-applications/:id/identification/:side", authenticate, requirePermission("seller_verification"), async (req, res) => {
+app.get("/admin/verified-seller-applications/:id/identification/:side", authenticate, requireSuperAdmin, async (req, res) => {
   try {
     const column = req.params.side === "front" ? "id_front_path" : req.params.side === "back" ? "id_back_path" : null;
     if (!column) return res.status(400).json({ error: "Invalid identification side" });
