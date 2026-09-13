@@ -435,6 +435,13 @@ function rateLimit({ scope, windowMs, max, message, keyFn }) {
           retryAfterSeconds,
         });
       }
+      req.rateLimitState = req.rateLimitState || {};
+      req.rateLimitState[scope] = {
+        used: Number(row.hit_count),
+        limit: max,
+        remaining: Math.max(0, max - Number(row.hit_count)),
+        resetsAt: row.expires_at,
+      };
       // Opportunistic cleanup keeps the table compact without a separate worker.
       if (crypto.randomInt(0, 100) === 0) {
         pool.query("DELETE FROM security_rate_limits WHERE expires_at < NOW() - INTERVAL '1 day'")
@@ -5205,7 +5212,7 @@ function stsClient() { return new STSClient({ region: awsRegion() }); }
 
 const rekognitionSessionUserLimit = rateLimit({
   scope: "rekognition-liveness-user", windowMs: 24 * 60 * 60 * 1000, max: 3,
-  message: "You have reached today's identity-check attempt limit. Try again tomorrow.",
+  message: "You have used all 3 identity-check attempts allowed in 24 hours. Try again after the limit resets.",
   keyFn: (req) => `user:${req.user?.id || "unknown"}`,
 });
 const rekognitionSessionIpLimit = rateLimit({
@@ -5406,6 +5413,9 @@ app.post("/casual-seller/rekognition/session", authenticate, rejectAdminMarketpl
           sessionToken: credentials.SessionToken,
           expiration: credentials.Expiration,
         },
+        remainingAttempts: req.rateLimitState?.["rekognition-liveness-user"]?.remaining ?? 0,
+        attemptLimit: 3,
+        attemptsResetAt: req.rateLimitState?.["rekognition-liveness-user"]?.resetsAt || null,
       });
     } catch (err) { sendInternalError(res, err, "create Rekognition liveness session"); }
   }
