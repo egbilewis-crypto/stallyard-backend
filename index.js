@@ -6033,6 +6033,7 @@ async function sendDailyVerifiedSellerReport(force = false) {
 async function ensureCasualSellerReportProtected(reportId) {
   const client = await pool.connect();
   let replacementPath = null;
+  let committed = false;
   try {
     await client.query("BEGIN");
     const reportResult = await client.query("SELECT * FROM casual_seller_daily_reports WHERE id=$1 FOR UPDATE", [reportId]);
@@ -6051,11 +6052,18 @@ async function ensureCasualSellerReportProtected(reportId) {
     await uploadPrivateVerificationObject(replacementPath, pdf, "application/pdf");
     await client.query("UPDATE casual_seller_daily_reports SET pdf_storage_path=$1,pdf_sha256=$2,password_encrypted=$3 WHERE id=$4", [replacementPath, hash, encryptField(password), reportId]);
     await client.query("COMMIT");
-    await deletePrivateVerificationObject(report.pdf_storage_path);
+    committed = true;
+    if (report.pdf_storage_path && report.pdf_storage_path !== replacementPath) {
+      await deletePrivateVerificationObject(report.pdf_storage_path).catch((err) => {
+        console.error(`Could not delete superseded Casual Seller report ${reportId}:`, err.message);
+      });
+    }
     return { ...report, pdf_storage_path: replacementPath, password_encrypted: encryptField(password) };
   } catch (err) {
-    await client.query("ROLLBACK").catch(() => {});
-    if (replacementPath) await deletePrivateVerificationObject(replacementPath).catch(() => {});
+    if (!committed) {
+      await client.query("ROLLBACK").catch(() => {});
+      if (replacementPath) await deletePrivateVerificationObject(replacementPath).catch(() => {});
+    }
     throw err;
   } finally { client.release(); }
 }
@@ -6063,6 +6071,7 @@ async function ensureCasualSellerReportProtected(reportId) {
 async function ensureVerifiedSellerReportProtected(reportId) {
   const client = await pool.connect();
   let replacementPath = null;
+  let committed = false;
   try {
     await client.query("BEGIN");
     const reportResult = await client.query("SELECT * FROM verified_seller_daily_reports WHERE id=$1 FOR UPDATE", [reportId]);
@@ -6086,11 +6095,18 @@ async function ensureVerifiedSellerReportProtected(reportId) {
     const encryptedPassword = encryptField(password);
     await client.query("UPDATE verified_seller_daily_reports SET pdf_storage_path=$1,pdf_sha256=$2,password_encrypted=$3 WHERE id=$4", [replacementPath, hash, encryptedPassword, reportId]);
     await client.query("COMMIT");
-    await deletePrivateVerificationObject(report.pdf_storage_path);
+    committed = true;
+    if (report.pdf_storage_path && report.pdf_storage_path !== replacementPath) {
+      await deletePrivateVerificationObject(report.pdf_storage_path).catch((err) => {
+        console.error(`Could not delete superseded Verified Seller report ${reportId}:`, err.message);
+      });
+    }
     return { ...report, pdf_storage_path: replacementPath, password_encrypted: encryptedPassword };
   } catch (err) {
-    await client.query("ROLLBACK").catch(() => {});
-    if (replacementPath) await deletePrivateVerificationObject(replacementPath).catch(() => {});
+    if (!committed) {
+      await client.query("ROLLBACK").catch(() => {});
+      if (replacementPath) await deletePrivateVerificationObject(replacementPath).catch(() => {});
+    }
     throw err;
   } finally { client.release(); }
 }
