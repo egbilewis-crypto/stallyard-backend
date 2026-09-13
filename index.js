@@ -5414,10 +5414,7 @@ app.post("/verified-seller/apply", authenticate, rejectAdminMarketplaceUse, requ
     if (req.body?.consent !== true) return res.status(400).json({ error: "Accept the verified-seller declaration before applying" });
     const document = parsePrivateApplicationDocument(req.body?.bankStatement, "Bank statement");
     const idType = String(req.body?.idType || "").trim();
-    const idNumber = String(req.body?.idNumber || "").trim();
-    const idExpiration = String(req.body?.idExpiration || "").trim();
-    if (!CASUAL_SELLER_ID_TYPES.has(idType) || !idNumber) return res.status(400).json({ error: "Choose an accepted identification and enter its number" });
-    if (idExpiration && new Date(`${idExpiration}T23:59:59Z`) < new Date()) return res.status(400).json({ error: "This identification has expired" });
+    if (!CASUAL_SELLER_ID_TYPES.has(idType)) return res.status(400).json({ error: "Choose an accepted identification" });
     const idFront = parseVerificationJpeg(req.body?.idFront, "ID front");
     const idBack = req.body?.idBack ? parseVerificationJpeg(req.body.idBack, "ID back") : null;
     await client.query("BEGIN");
@@ -5442,12 +5439,6 @@ app.post("/verified-seller/apply", authenticate, rejectAdminMarketplaceUse, requ
     if (!addressResult.rows.length) throw Object.assign(new Error("Add a complete default Nigerian address before applying"), { statusCode: 400 });
     const existing = await client.query("SELECT reference FROM verified_seller_applications WHERE user_id=$1 AND status='pending'", [req.user.id]);
     if (existing.rows.length) throw Object.assign(new Error(`Your verified-seller application ${existing.rows[0].reference} is already awaiting review`), { statusCode: 409 });
-    const duplicateIdentity = await client.query(
-      `SELECT user_id FROM verified_seller_applications
-        WHERE id_number_hash=$1 AND user_id<>$2 AND status IN ('pending','approved') LIMIT 1`,
-      [identityDigest(idNumber), req.user.id]
-    );
-    if (duplicateIdentity.rows.length) throw Object.assign(new Error("This identification is already connected to another seller account"), { statusCode: 409, code: "DUPLICATE_IDENTITY" });
     const reference = `VSA-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
     const path = `user-${req.user.id}/verified-seller/${reference}/bank-statement-${document.sha256.slice(0, 12)}.${document.extension}`;
     const idFrontPath = `user-${req.user.id}/verified-seller/${reference}/id-front-${idFront.sha256.slice(0, 12)}.jpg`;
@@ -5457,13 +5448,13 @@ app.post("/verified-seller/apply", authenticate, rejectAdminMarketplaceUse, requ
     if (idBack && idBackPath) await uploadPrivateVerificationObject(idBackPath, idBack.buffer);
     const snapshot = { identityReference: identityResult.rows[0].reference, emailVerified: true, phoneVerified: true,
       payoutBankVerified: true, address: addressResult.rows[0], requestedLimit: VERIFIED_SELLER_LIMIT_NGN,
-      idType, idNumberLast4: idNumber.slice(-4), idExpiration: idExpiration || null };
+      idType };
     await client.query(
       `INSERT INTO verified_seller_applications(reference,user_id,casual_application_id,bank_statement_path,address_id,
          requested_limit,requirements_snapshot,consented_at,status,id_type,id_number_hash,id_number_last4,id_expiration,id_front_path,id_back_path)
        VALUES($1,$2,$3,$4,$5,$6,$7,NOW(),'pending',$8,$9,$10,$11,$12,$13)`,
       [reference, req.user.id, identityResult.rows[0].id, path, addressResult.rows[0].id, VERIFIED_SELLER_LIMIT_NGN, JSON.stringify(snapshot),
-       idType, identityDigest(idNumber), idNumber.slice(-4), idExpiration || null, idFrontPath, idBackPath]
+       idType, null, null, null, idFrontPath, idBackPath]
     );
     await client.query("UPDATE users SET has_applied_to_sell=true, verification_status='pending', rejection_reason=NULL WHERE id=$1", [req.user.id]);
     await client.query("COMMIT");
@@ -5481,7 +5472,7 @@ app.get("/admin/verified-seller-applications", authenticate, requirePermission("
   try {
     const result = await pool.query(
       `SELECT a.id,a.reference,a.user_id,a.requested_limit,a.requirements_snapshot,a.status,a.decision_reason,
-              a.id_type,a.id_number_last4,a.id_expiration,(a.id_back_path IS NOT NULL) AS has_id_back,
+              a.id_type,(a.id_back_path IS NOT NULL) AS has_id_back,
               a.created_at,a.reviewed_at,u.username,u.display_name,u.email,u.phone
          FROM verified_seller_applications a JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT 500`
     );
