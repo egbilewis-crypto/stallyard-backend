@@ -3782,6 +3782,11 @@ app.patch("/users/:id/approve", authenticate, requirePermission("seller_verifica
       [req.user.id, req.params.id]
     );
     logAdminAction(req.user.id, "seller_approved", `Approved ${result.rows[0].username}'s seller application`);
+    createNotification(
+      req.params.id,
+      "seller_application",
+      "Your Verified Seller application was approved. You may now maintain up to ₦10,000,000 in combined active listings."
+    );
     res.json({ user: result.rows[0] });
   } catch (err) {
     sendInternalError(res, err);
@@ -3791,6 +3796,12 @@ app.patch("/users/:id/approve", authenticate, requirePermission("seller_verifica
 app.patch("/users/:id/reject", authenticate, requirePermission("seller_verification"), async (req, res) => {
   try {
     const { reason } = req.body;
+    const pendingApplication = await pool.query(
+      "SELECT id FROM verified_seller_applications WHERE user_id=$1 AND status='pending' ORDER BY created_at DESC LIMIT 1", [req.params.id]
+    );
+    if (!pendingApplication.rows.length) {
+      return res.status(409).json({ error: "A pending Verified Seller application is required before rejection" });
+    }
     const result = await pool.query(
       `UPDATE users SET is_approved = false, verification_status = 'rejected', rejection_reason = $1
        WHERE id = $2 RETURNING ${USER_RETURNING_FIELDS}`,
