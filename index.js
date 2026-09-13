@@ -346,6 +346,28 @@ function requireCompleteProfile(req, res, next) {
   });
 }
 
+async function requireVerifiedEmailAndPhone(req, res, next) {
+  try {
+    if (req.user?.isAdmin) return next();
+    const result = await pool.query(
+      `SELECT is_email_verified, is_phone_verified FROM users WHERE id = $1 LIMIT 1`,
+      [req.user.id]
+    );
+    const account = result.rows[0];
+    if (!account?.is_email_verified || !account?.is_phone_verified) {
+      return res.status(403).json({
+        error: "Verify both your email address and phone number before starting face verification.",
+        code: "CONTACT_VERIFICATION_REQUIRED",
+        emailVerified: !!account?.is_email_verified,
+        phoneVerified: !!account?.is_phone_verified,
+      });
+    }
+    next();
+  } catch (err) {
+    sendInternalError(res, err);
+  }
+}
+
 const ADMIN_ROLES = new Set([
   "super_admin", "seller_verification", "listing_moderator",
   "order_dispute", "finance", "customer_support",
@@ -5384,7 +5406,7 @@ app.get("/casual-seller/status", authenticate, rejectAdminMarketplaceUse, async 
   } catch (err) { sendInternalError(res, err); }
 });
 
-app.post("/casual-seller/rekognition/session", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser,
+app.post("/casual-seller/rekognition/session", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireVerifiedEmailAndPhone, requireNigeriaMarketplaceUser,
   rekognitionSessionUserLimit, rekognitionSessionIpLimit, async (req, res) => {
     try {
       const roleArn = String(process.env.AWS_LIVENESS_ROLE_ARN || "").trim();
