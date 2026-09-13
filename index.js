@@ -5541,7 +5541,6 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requir
       awsLivenessVerified: Number(awsLiveness.confidence || 0) >= REKOGNITION_LIVENESS_MIN_CONFIDENCE,
       cameraFacePresenceChecks: clientFaceChecks,
       liveSelfieMatchesHoldingPhoto: serverFaceMatched,
-      validFaceDescriptor: !!faceDescriptor,
       duplicateFaceNotFound: true,
     };
     if (faceDescriptor) {
