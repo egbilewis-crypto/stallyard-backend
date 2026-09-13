@@ -2643,7 +2643,10 @@ const SCHEMA_MIGRATIONS = [
        admin_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
        action TEXT NOT NULL,
        created_at TIMESTAMP NOT NULL DEFAULT NOW()
-     )`,
+    )`,
+  ] },
+  { version: 70, name: "verified-seller-report-passwords", statements: [
+    `ALTER TABLE verified_seller_daily_reports ADD COLUMN IF NOT EXISTS password_encrypted TEXT`,
   ] },
 ];
 
@@ -5641,7 +5644,71 @@ function pdfText(value) {
   return String(value ?? "").replace(/[^\x20-\x7E]/g, "?").replace(/([\\()])/g, "\\$1");
 }
 
-function assemblePdf(objects, rootId) {
+const PDF_PASSWORD_PADDING = Buffer.from([
+  0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41, 0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08,
+  0x2e, 0x2e, 0x00, 0xb6, 0xd0, 0x68, 0x3e, 0x80, 0x2f, 0x0c, 0xa9, 0xfe, 0x64, 0x53, 0x69, 0x7a,
+]);
+
+function rc4(key, input) {
+  const state = Array.from({ length: 256 }, (_, index) => index);
+  let j = 0;
+  for (let i = 0; i < 256; i++) {
+    j = (j + state[i] + key[i % key.length]) & 255;
+    [state[i], state[j]] = [state[j], state[i]];
+  }
+  const output = Buffer.alloc(input.length);
+  let i = 0;
+  j = 0;
+  for (let offset = 0; offset < input.length; offset++) {
+    i = (i + 1) & 255;
+    j = (j + state[i]) & 255;
+    [state[i], state[j]] = [state[j], state[i]];
+    output[offset] = input[offset] ^ state[(state[i] + state[j]) & 255];
+  }
+  return output;
+}
+
+function padPdfPassword(password) {
+  const bytes = Buffer.from(String(password || ""), "latin1").subarray(0, 32);
+  return Buffer.concat([bytes, PDF_PASSWORD_PADDING]).subarray(0, 32);
+}
+
+function encryptPdfStreamObject(object, objectId, fileKey) {
+  const streamMarker = Buffer.from("stream\n");
+  const streamAt = object.indexOf(streamMarker);
+  if (streamAt < 0) return object;
+  const prefixEnd = streamAt + streamMarker.length;
+  const lengthMatch = object.subarray(0, streamAt).toString().match(/\/Length\s+(\d+)/);
+  if (!lengthMatch) return object;
+  const streamLength = Number(lengthMatch[1]);
+  const streamEnd = prefixEnd + streamLength;
+  if (!Number.isSafeInteger(streamLength) || streamEnd > object.length) throw new Error("Invalid PDF stream length");
+  const suffix = Buffer.alloc(5);
+  suffix[0] = objectId & 255;
+  suffix[1] = (objectId >> 8) & 255;
+  suffix[2] = (objectId >> 16) & 255;
+  const objectKey = crypto.createHash("md5").update(Buffer.concat([fileKey, suffix])).digest().subarray(0, Math.min(fileKey.length + 5, 16));
+  return Buffer.concat([object.subarray(0, prefixEnd), rc4(objectKey, object.subarray(prefixEnd, streamEnd)), object.subarray(streamEnd)]);
+}
+
+function assemblePdf(objects, rootId, userPassword = "") {
+  let encryptId = null;
+  let fileId = null;
+  if (userPassword) {
+    fileId = crypto.randomBytes(16);
+    const userPad = padPdfPassword(userPassword);
+    const ownerKey = crypto.createHash("md5").update(padPdfPassword(crypto.randomBytes(24).toString("base64url"))).digest().subarray(0, 5);
+    const ownerEntry = rc4(ownerKey, userPad);
+    const permissions = Buffer.alloc(4);
+    permissions.writeInt32LE(-64, 0);
+    const fileKey = crypto.createHash("md5").update(Buffer.concat([userPad, ownerEntry, permissions, fileId])).digest().subarray(0, 5);
+    const userEntry = rc4(fileKey, PDF_PASSWORD_PADDING);
+    objects.push(Buffer.from(`<< /Filter /Standard /V 1 /R 2 /Length 40 /O <${ownerEntry.toString("hex")}> /U <${userEntry.toString("hex")}> /P -64 >>`));
+    encryptId = objects.length - 1;
+    for (let id = 1; id < objects.length; id++) {
+      if (id !== encryptId) objects[id] = encryptPdfStreamObject(objects[id], id, fileKey);
+    }
+  }
   const chunks = [Buffer.from("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n", "binary")];
   const offsets = [0];
   let position = chunks[0].length;
@@ -5655,7 +5722,8 @@ function assemblePdf(objects, rootId) {
   const xrefOffset = position;
   let xref = `xref\n0 ${objects.length}\n0000000000 65535 f \n`;
   for (let id = 1; id < objects.length; id++) xref += `${String(offsets[id]).padStart(10, "0")} 00000 n \n`;
-  xref += `trailer\n<< /Size ${objects.length} /Root ${rootId} 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+  const securityTrailer = encryptId ? ` /Encrypt ${encryptId} 0 R /ID [<${fileId.toString("hex")}><${fileId.toString("hex")}>]` : "";
+  xref += `trailer\n<< /Size ${objects.length} /Root ${rootId} 0 R${securityTrailer} >>\nstartxref\n${xrefOffset}\n%%EOF`;
   chunks.push(Buffer.from(xref));
   return Buffer.concat(chunks);
 }
@@ -5710,7 +5778,7 @@ async function buildCasualSellerReportPdf(applications, reportDate) {
   return assemblePdf(objects, catalogId);
 }
 
-async function buildVerifiedSellerReportPdf(applications, reportDate) {
+async function buildVerifiedSellerReportPdf(applications, reportDate, reportPassword) {
   const objects = [null];
   const addObject = (value) => { objects.push(Buffer.isBuffer(value) ? value : Buffer.from(value)); return objects.length - 1; };
   const fontId = addObject("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
@@ -5767,7 +5835,7 @@ async function buildVerifiedSellerReportPdf(applications, reportDate) {
     pageIds.push(pageId);
   }
   objects[pagesId] = Buffer.from(`<< /Type /Pages /Count ${pageIds.length} /Kids [${pageIds.map((id) => `${id} 0 R`).join(" ")}] >>`);
-  return assemblePdf(objects, catalogId);
+  return assemblePdf(objects, catalogId, reportPassword);
 }
 
 function lagosDateParts(now = new Date()) {
@@ -5877,11 +5945,12 @@ async function sendDailyVerifiedSellerReport(force = false) {
       [date, applicationsResult.rows.length, JSON.stringify(recipients)]
     );
     const reportId = reportRow.rows[0].id;
-    const pdf = await buildVerifiedSellerReportPdf(applicationsResult.rows, date);
+    const reportPassword = `STY-${crypto.randomBytes(9).toString("base64url")}`;
+    const pdf = await buildVerifiedSellerReportPdf(applicationsResult.rows, date, reportPassword);
     const pdfHash = crypto.createHash("sha256").update(pdf).digest("hex");
     const pdfPath = `daily-reports/${date}/verified-seller-approved-${reportId}-${pdfHash.slice(0, 12)}-${crypto.randomBytes(4).toString("hex")}.pdf`;
     await uploadPrivateVerificationObject(pdfPath, pdf, "application/pdf");
-    await lockClient.query("UPDATE verified_seller_daily_reports SET pdf_storage_path=$1, pdf_sha256=$2 WHERE id=$3", [pdfPath, pdfHash, reportId]);
+    await lockClient.query("UPDATE verified_seller_daily_reports SET pdf_storage_path=$1, pdf_sha256=$2, password_encrypted=$3 WHERE id=$4", [pdfPath, pdfHash, encryptField(reportPassword), reportId]);
     if (!process.env.RESEND_API_KEY) throw new Error("RESEND_API_KEY is not configured");
     const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
     const emailResponse = await fetch("https://api.resend.com/emails", {
@@ -6007,6 +6076,17 @@ app.get("/admin/verified-seller-reports/:id/download", authenticate, requireSupe
     res.setHeader("Content-Disposition", `attachment; filename="stallyard-verified-sellers-${result.rows[0].report_date}.pdf"`);
     res.setHeader("Cache-Control", "private, no-store");
     res.send(pdf);
+  } catch (err) { sendInternalError(res, err); }
+});
+
+app.get("/admin/verified-seller-reports/:id/password", authenticate, requireSuperAdmin, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT password_encrypted FROM verified_seller_daily_reports WHERE id=$1", [req.params.id]);
+    if (!result.rows[0]?.password_encrypted) return res.status(404).json({ error: "Report password not found" });
+    const password = decryptFieldSafe(result.rows[0].password_encrypted);
+    await pool.query("INSERT INTO verified_seller_report_access_log(report_id,admin_id,action) VALUES($1,$2,'revealed_password')", [req.params.id, req.user.id]);
+    res.setHeader("Cache-Control", "private, no-store");
+    res.json({ password });
   } catch (err) { sendInternalError(res, err); }
 });
 
