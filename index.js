@@ -5,6 +5,8 @@ const fetch = require("node-fetch");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
+const { RekognitionClient, CreateFaceLivenessSessionCommand, GetFaceLivenessSessionResultsCommand, CompareFacesCommand } = require("@aws-sdk/client-rekognition");
+const { STSClient, AssumeRoleCommand } = require("@aws-sdk/client-sts");
 
 const app = express();
 
@@ -37,6 +39,10 @@ function validateProductionSecrets() {
     "PAYSTACK_SECRET_KEY",
     "SUPABASE_URL",
     "RESEND_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_REGION",
+    "AWS_LIVENESS_ROLE_ARN",
   ];
   for (const name of required) {
     const v = value(name);
@@ -5165,7 +5171,23 @@ const VERIFIED_SELLER_LIMIT_NGN = 10000000;
 const CASUAL_SELLER_ID_TYPES = new Set(["nin", "passport", "drivers_license", "voters_card", "cerpac"]);
 const CASUAL_SELLER_CONSENT_VERSION = "2026-09-12";
 const CASUAL_LIVENESS_TTL_MS = 10 * 60 * 1000;
+const REKOGNITION_LIVENESS_MIN_CONFIDENCE = 90;
+const REKOGNITION_FACE_MIN_SIMILARITY = 90;
 const VERIFICATION_BUCKET = process.env.SUPABASE_VERIFICATION_BUCKET || "seller-verification-private";
+
+function awsRegion() { return String(process.env.AWS_REGION || "us-east-2").trim(); }
+function rekognitionClient() { return new RekognitionClient({ region: awsRegion() }); }
+function stsClient() { return new STSClient({ region: awsRegion() }); }
+
+const rekognitionSessionUserLimit = rateLimit({
+  scope: "rekognition-liveness-user", windowMs: 24 * 60 * 60 * 1000, max: 3,
+  message: "You have reached today's identity-check attempt limit. Try again tomorrow.",
+  keyFn: (req) => `user:${req.user?.id || "unknown"}`,
+});
+const rekognitionSessionIpLimit = rateLimit({
+  scope: "rekognition-liveness-ip", windowMs: 24 * 60 * 60 * 1000, max: 8,
+  message: "Too many identity checks were started from this connection. Try again tomorrow.",
+});
 
 function verificationStorageConfig() {
   return {
@@ -5331,6 +5353,64 @@ app.get("/casual-seller/status", authenticate, rejectAdminMarketplaceUse, async 
   } catch (err) { sendInternalError(res, err); }
 });
 
+app.post("/casual-seller/rekognition/session", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser,
+  rekognitionSessionUserLimit, rekognitionSessionIpLimit, async (req, res) => {
+    try {
+      const roleArn = String(process.env.AWS_LIVENESS_ROLE_ARN || "").trim();
+      if (!roleArn) throw new Error("AWS_LIVENESS_ROLE_ARN is not configured");
+      const session = await rekognitionClient().send(new CreateFaceLivenessSessionCommand({
+        Settings: { AuditImagesLimit: 0 },
+      }));
+      if (!session.SessionId) throw new Error("AWS did not create a liveness session");
+      const assumed = await stsClient().send(new AssumeRoleCommand({
+        RoleArn: roleArn,
+        RoleSessionName: `stallyard-liveness-${req.user.id}-${Date.now()}`.slice(0, 64),
+        DurationSeconds: 900,
+      }));
+      const credentials = assumed.Credentials;
+      if (!credentials?.AccessKeyId || !credentials?.SecretAccessKey || !credentials?.SessionToken) {
+        throw new Error("AWS did not issue temporary liveness credentials");
+      }
+      await setSecurityState("rekognition-liveness-session", req.user.id, { sessionId: session.SessionId }, 15 * 60 * 1000);
+      res.setHeader("Cache-Control", "no-store");
+      res.json({
+        sessionId: session.SessionId,
+        region: awsRegion(),
+        credentials: {
+          accessKeyId: credentials.AccessKeyId,
+          secretAccessKey: credentials.SecretAccessKey,
+          sessionToken: credentials.SessionToken,
+          expiration: credentials.Expiration,
+        },
+      });
+    } catch (err) { sendInternalError(res, err, "create Rekognition liveness session"); }
+  }
+);
+
+app.post("/casual-seller/rekognition/complete", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, async (req, res) => {
+  try {
+    const issued = await getSecurityState("rekognition-liveness-session", req.user.id);
+    const sessionId = String(req.body?.sessionId || "");
+    if (!issued?.sessionId || sessionId !== issued.sessionId) return res.status(400).json({ error: "The liveness session is invalid or expired" });
+    const result = await rekognitionClient().send(new GetFaceLivenessSessionResultsCommand({ SessionId: sessionId }));
+    if (result.Status !== "SUCCEEDED" || !result.ReferenceImage?.Bytes) {
+      return res.status(409).json({ error: "AWS could not confirm the liveness check. Please try again." });
+    }
+    const confidence = Number(result.Confidence || 0);
+    if (confidence < REKOGNITION_LIVENESS_MIN_CONFIDENCE) {
+      return res.status(409).json({ error: "The liveness confidence was too low. Improve the lighting and try again." });
+    }
+    const verificationToken = crypto.randomBytes(24).toString("base64url");
+    await setSecurityState("rekognition-liveness-result", req.user.id, {
+      sessionId, verificationToken, confidence,
+      referenceImage: Buffer.from(result.ReferenceImage.Bytes).toString("base64"),
+    }, CASUAL_LIVENESS_TTL_MS);
+    await deleteSecurityState("rekognition-liveness-session", req.user.id);
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ verified: true, confidence, verificationToken });
+  } catch (err) { sendInternalError(res, err, "complete Rekognition liveness session"); }
+});
+
 app.post("/casual-seller/challenge", authenticate, rejectAdminMarketplaceUse, requireNigeriaMarketplaceUser, async (req, res) => {
   try {
     const poolValues = ["blink", "turn_left", "turn_right", "smile", "move_closer"];
@@ -5353,7 +5433,7 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requir
     const {
       legalName, dateOfBirth, consent,
       liveSelfie, holdingIdSelfie, challengeFrames, challenges,
-      faceDetectionSupported, faceChecks, faceMatch, challengeToken,
+      faceDetectionSupported, faceChecks, faceMatch, challengeToken, rekognitionVerificationToken,
     } = req.body || {};
     if (consent !== true) return res.status(400).json({ error: "Consent is required before identity verification" });
     if (!legalName || !dateOfBirth) {
@@ -5380,6 +5460,18 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requir
       holding_id_selfie: parseVerificationJpeg(holdingIdSelfie, "Selfie holding ID"),
     };
     challengeFrames.forEach((frame, index) => { images[`challenge_${index + 1}`] = parseVerificationJpeg(frame, `Challenge photo ${index + 1}`); });
+    const awsLiveness = await getSecurityState("rekognition-liveness-result", req.user.id);
+    if (!awsLiveness?.verificationToken || rekognitionVerificationToken !== awsLiveness.verificationToken || !awsLiveness.referenceImage) {
+      return res.status(400).json({ error: "Complete the secure AWS face-liveness check before submitting" });
+    }
+    const faceComparison = await rekognitionClient().send(new CompareFacesCommand({
+      SourceImage: { Bytes: Buffer.from(awsLiveness.referenceImage, "base64") },
+      TargetImage: { Bytes: images.holding_id_selfie.buffer },
+      SimilarityThreshold: REKOGNITION_FACE_MIN_SIMILARITY,
+      QualityFilter: "AUTO",
+    }));
+    const serverFaceSimilarity = Math.max(0, ...((faceComparison.FaceMatches || []).map((match) => Number(match.Similarity || 0))));
+    const serverFaceMatched = serverFaceSimilarity >= REKOGNITION_FACE_MIN_SIMILARITY;
     const hashes = Object.values(images).map((image) => image.sha256);
     const distinctEvidence = new Set(hashes).size === hashes.length;
 
@@ -5412,8 +5504,9 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requir
       evidenceFilesDistinct: distinctEvidence,
       randomizedChallengesComplete: true,
       serverIssuedChallengeValid: true,
+      awsLivenessVerified: Number(awsLiveness.confidence || 0) >= REKOGNITION_LIVENESS_MIN_CONFIDENCE,
       cameraFacePresenceChecks: clientFaceChecks,
-      liveSelfieMatchesHoldingPhoto: faceMatch?.passed === true && Number(faceMatch?.distance) >= 0 && Number(faceMatch.distance) <= 0.5,
+      liveSelfieMatchesHoldingPhoto: serverFaceMatched,
       validFaceDescriptor: !!faceDescriptor,
       duplicateFaceNotFound: true,
     };
@@ -5460,10 +5553,11 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requir
        WHERE id = $2`, [status, req.user.id]
     );
     await client.query("COMMIT");
+    await deleteSecurityState("rekognition-liveness-result", req.user.id).catch(() => {});
     createNotification(req.user.id, approved ? "seller_verified" : "verification_problem",
       approved ? "Your casual-seller identity verification passed. You may publish up to ₦500,000 in combined active listings."
         : "Your automatic identity verification needs attention. Please review the results and try again.");
-    res.status(201).json({ reference, status, checks, limit: CASUAL_SELLER_LIMIT_NGN });
+    res.status(201).json({ reference, status, checks, livenessConfidence: awsLiveness.confidence, faceSimilarity: serverFaceSimilarity, limit: CASUAL_SELLER_LIMIT_NGN });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     await Promise.all(uploadedPaths.map((path) => deletePrivateVerificationObject(path))).catch(() => {});
