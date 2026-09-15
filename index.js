@@ -5459,9 +5459,11 @@ async function assertSellerMayPublish(client, ownerId, proposedPrice, proposedQu
   const current = await activeListingValue(client, ownerId, excludeListingId);
   if (seller.is_approved) {
     const verifiedLimit = Number(seller.seller_listing_limit || VERIFIED_SELLER_LIMIT_NGN);
+    const approvedTier = seller.seller_tier === "premium" ? "Premium Seller" : "Verified Seller";
+    const limitCode = seller.seller_tier === "premium" ? "PREMIUM_LISTING_LIMIT" : "VERIFIED_LISTING_LIMIT";
     if (!Number.isFinite(price) || price <= 0 || current + price * quantity > verifiedLimit) {
-      throw Object.assign(new Error(`Verified sellers may have no more than ₦${verifiedLimit.toLocaleString("en-NG")} in combined active listings.`), {
-        statusCode: 409, code: "VERIFIED_LISTING_LIMIT", currentActiveValue: current, limit: verifiedLimit,
+      throw Object.assign(new Error(`${approvedTier}s may have no more than ₦${verifiedLimit.toLocaleString("en-NG")} in combined active listings.`), {
+        statusCode: 409, code: limitCode, currentActiveValue: current, limit: verifiedLimit,
       });
     }
     return seller;
@@ -6042,12 +6044,26 @@ app.patch("/admin/premium-seller-applications/:id/approve", authenticate, requir
       "SELECT id FROM verified_seller_applications WHERE id=$1 AND user_id=$2 AND status='approved'",
       [application.verified_application_id, application.user_id]
     );
+    const currentAddress = await client.query(
+      `SELECT id FROM user_addresses WHERE user_id=$1 AND is_default=true
+        AND street<>'' AND city<>'' AND state<>'' AND LOWER(country)='nigeria' LIMIT 1`,
+      [application.user_id]
+    );
+    let supportingDocumentAvailable = false;
+    if (application.supporting_document_path) {
+      supportingDocumentAvailable = await fetchPrivateVerificationObject(application.supporting_document_path)
+        .then((bytes) => bytes.length > 0)
+        .catch(() => false);
+    }
     const failedChecks = [];
     if (application.is_suspended || application.seller_suspended) failedChecks.push("seller account is suspended");
     if (!application.is_approved || application.seller_tier !== "verified") failedChecks.push("Verified Seller approval is no longer active");
     if (!application.is_email_verified || !application.is_phone_verified) failedChecks.push("email and phone must remain verified");
     if (!application.paystack_recipient_code) failedChecks.push("verified payout bank is missing");
     if (!verifiedRecord.rows.length) failedChecks.push("approved Verified Seller record is missing");
+    if (!currentAddress.rows.length) failedChecks.push("complete default Nigerian address is missing");
+    if (!supportingDocumentAvailable) failedChecks.push("Premium supporting document is missing");
+    if (!application.consented_at) failedChecks.push("Premium Seller declaration is missing");
     if (failedChecks.length) {
       await client.query("ROLLBACK");
       return res.status(409).json({ error:`Premium Seller cannot be approved: ${failedChecks.join("; ")}`, failedChecks });
