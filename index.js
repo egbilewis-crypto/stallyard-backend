@@ -589,13 +589,21 @@ async function createCheckoutIntent({ reference, buyerId, buyerUsername, buyerEm
 const CHECKOUT_RESERVATION_MINUTES = 15;
 
 async function reserveCheckoutListings(client, { buyerId, reference, items }) {
-  const listingIds = [...new Set((items || []).map((item) => Number(item.listingId)))].filter(Number.isInteger).sort((a, b) => a - b);
+  const requestedByListing = new Map();
+  for (const item of items || []) {
+    const listingId = Number(item.listingId);
+    const qty = Number(item.qty);
+    if (Number.isInteger(listingId) && Number.isInteger(qty) && qty > 0) {
+      requestedByListing.set(listingId, (requestedByListing.get(listingId) || 0) + qty);
+    }
+  }
+  const listingIds = [...requestedByListing.keys()].sort((a, b) => a - b);
   if (!listingIds.length) throw new Error("Checkout has no valid listings to reserve");
 
   for (const listingId of listingIds) {
     // Lock the listing row so two checkout transactions cannot reserve it simultaneously.
     const listingResult = await client.query(
-      `SELECT listings.id, listings.status FROM listings
+      `SELECT listings.id, listings.status, listings.quantity FROM listings
         JOIN users ON users.id = listings.owner_id
        WHERE listings.id = $1
          AND users.is_suspended = false
@@ -607,6 +615,12 @@ async function reserveCheckoutListings(client, { buyerId, reference, items }) {
     );
     if (!listingResult.rows.length || listingResult.rows[0].status !== "active") {
       const err = new Error(`Listing ${listingId} isn't available`);
+      err.code = "LISTING_UNAVAILABLE";
+      throw err;
+    }
+    const availableQuantity = Math.max(1, Number(listingResult.rows[0].quantity || 1));
+    if (requestedByListing.get(listingId) > availableQuantity) {
+      const err = new Error(`Only ${availableQuantity} unit${availableQuantity === 1 ? " is" : "s are"} available for listing ${listingId}`);
       err.code = "LISTING_UNAVAILABLE";
       throw err;
     }
@@ -711,6 +725,98 @@ async function markCheckoutIntent(reference, status, failureReason = null, clien
   );
 }
 
+async function cancelOpenCheckoutsForSeller(client, sellerId, reason) {
+  const cancelled = await client.query(
+    `UPDATE checkout_intents AS intent
+        SET status = 'cancelled', failure_reason = $2
+      WHERE intent.status = 'initialized'
+        AND EXISTS (
+          SELECT 1
+            FROM jsonb_array_elements(intent.items) AS item
+            JOIN listings ON listings.id = (item ->> 'listingId')::integer
+           WHERE listings.owner_id = $1
+        )
+      RETURNING reference`,
+    [sellerId, String(reason || "Seller became unavailable").slice(0, 1000)]
+  );
+  const references = cancelled.rows.map((row) => row.reference);
+  if (references.length) {
+    await client.query("DELETE FROM listing_checkout_reservations WHERE reference = ANY($1::text[])", [references]);
+  }
+  return references;
+}
+
+async function requestAutomaticCheckoutRefund(reference, reason) {
+  if (!process.env.PAYSTACK_SECRET_KEY) throw new Error("Paystack refunds are not configured");
+  const client = await pool.connect();
+  let intent;
+  try {
+    await client.query("BEGIN");
+    const result = await client.query("SELECT * FROM checkout_intents WHERE reference = $1 FOR UPDATE", [reference]);
+    intent = result.rows[0];
+    if (!intent) throw new Error("Checkout intent not found for automatic refund");
+    if (intent.status === "finalized") {
+      await client.query("ROLLBACK");
+      return { alreadyHandled: true, status: "finalized" };
+    }
+    if (["requesting", "pending", "processed", "request_unknown"].includes(intent.refund_status)) {
+      await client.query("ROLLBACK");
+      return { alreadyHandled: true, status: intent.refund_status };
+    }
+    await client.query(
+      `UPDATE checkout_intents
+          SET status = 'refund_pending', refund_status = 'requesting',
+              refund_requested_at = NOW(), failure_reason = $2
+        WHERE reference = $1`,
+      [reference, String(reason || "Checkout could not be completed").slice(0, 1000)]
+    );
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  let refundResponse;
+  let refundData;
+  try {
+    refundResponse = await fetch("https://api.paystack.co/refund", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        transaction: reference,
+        amount: Number(intent.amount_kobo),
+        currency: intent.currency || "NGN",
+        customer_note: "Your Stallyard payment was automatically refunded because the order could not be completed.",
+        merchant_note: `Automatic checkout refund: ${String(reason || "order could not be completed").slice(0, 180)}`,
+      }),
+    });
+    refundData = await refundResponse.json();
+  } catch (err) {
+    await pool.query(
+      "UPDATE checkout_intents SET refund_status='request_unknown', failure_reason=$2 WHERE reference=$1",
+      [reference, `Automatic refund confirmation failed: ${err.message}`.slice(0, 1000)]
+    );
+    throw err;
+  }
+  if (!refundResponse.ok || !refundData.status) {
+    const message = refundData.message || "Paystack rejected the automatic refund";
+    await pool.query(
+      "UPDATE checkout_intents SET status='integrity_failed', refund_status='failed', failure_reason=$2 WHERE reference=$1",
+      [reference, String(message).slice(0, 1000)]
+    );
+    throw new Error(message);
+  }
+  const refund = refundData.data || {};
+  await pool.query(
+    "UPDATE checkout_intents SET refund_status=$2, paystack_refund_id=$3 WHERE reference=$1",
+    [reference, refund.status || "pending", refund.id || null]
+  );
+  createNotification(intent.buyer_id, "refund_started", "Your payment was received, but the order could not be completed. A full automatic refund has been submitted to Paystack.");
+  return { alreadyHandled: false, status: refund.status || "pending", refundId: refund.id || null };
+}
+
 async function finalizeOrderFromPaystackCharge(reference, paystackData) {
   const existing = await pool.query("SELECT * FROM orders WHERE paystack_reference = $1", [reference]);
   if (existing.rows.length) {
@@ -731,8 +837,12 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
     let subtotal = 0;
     let shippingTotal = 0;
     const resolvedItems = [];
+    const seenListingIds = new Set();
     for (const cartItem of cartItems) {
       const qty = Number(cartItem.qty);
+      const listingId = Number(cartItem.listingId);
+      if (seenListingIds.has(listingId)) throw new Error("Payment integrity check failed: duplicate listing in checkout");
+      seenListingIds.add(listingId);
       const listingResult = await client.query(
         `SELECT listings.* FROM listings
           JOIN users ON users.id = listings.owner_id
@@ -748,6 +858,10 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
         throw new Error(`Paid listing ${cartItem.listingId} is no longer available — payment requires manual review`);
       }
       const listing = listingResult.rows[0];
+      const availableQuantity = Math.max(1, Number(listing.quantity || 1));
+      if (!Number.isInteger(qty) || qty <= 0 || qty > availableQuantity) {
+        throw new Error(`Paid listing ${cartItem.listingId} no longer has the requested quantity — payment requires an automatic refund`);
+      }
       const price = Number(cartItem.unitPrice);
       const shippingFee = Number(cartItem.shippingFee) || 0;
       if (!(price > 0)) throw new Error("Payment integrity check failed: invalid item price snapshot");
@@ -804,7 +918,11 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
         ]
       );
       insertedItems.push(itemResult.rows[0]);
-      await client.query("UPDATE listings SET status = 'sold' WHERE id = $1", [listing.id]);
+      const remainingQuantity = Math.max(0, Math.max(1, Number(listing.quantity || 1)) - qty);
+      await client.query(
+        "UPDATE listings SET quantity = $1, status = CASE WHEN $1 = 0 THEN 'sold' ELSE 'active' END WHERE id = $2",
+        [remainingQuantity, listing.id]
+      );
       createNotification(
         listing.owner_id,
         "sale",
@@ -2805,6 +2923,13 @@ const SCHEMA_MIGRATIONS = [
          AND casual_seller_status = 'approved'
          AND seller_tier IS DISTINCT FROM 'casual'`,
   ] },
+  { version: 76, name: "checkout-automatic-refunds", statements: [
+    `ALTER TABLE checkout_intents
+       ADD COLUMN IF NOT EXISTS refund_status TEXT,
+       ADD COLUMN IF NOT EXISTS paystack_refund_id BIGINT,
+       ADD COLUMN IF NOT EXISTS refund_requested_at TIMESTAMP,
+       ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMP`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -3633,7 +3758,10 @@ app.patch("/users/:id/suspend", authenticate, requirePermission("user_management
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "User not found" });
     }
-    if (isSuspended) await client.query("UPDATE listings SET status='paused' WHERE owner_id=$1 AND status='active'", [req.params.id]);
+    if (isSuspended) {
+      await client.query("UPDATE listings SET status='paused' WHERE owner_id=$1 AND status='active'", [req.params.id]);
+      await cancelOpenCheckoutsForSeller(client, req.params.id, "Seller account was suspended before payment completed");
+    }
     await client.query("COMMIT");
     logAdminAction(req.user.id, "user_suspended", `${isSuspended ? "Suspended" : "Unsuspended"} ${result.rows[0].username}`);
     res.json({ user: result.rows[0] });
@@ -6758,6 +6886,7 @@ app.patch("/admin/casual-seller-applications/:id/suspend", authenticate, require
     await client.query("UPDATE casual_seller_applications SET status='suspended', suspended_at=NOW(), decision_reason=$1, updated_at=NOW() WHERE id=$2", [String(req.body?.reason || "Suspended after verification review").slice(0, 500), req.params.id]);
     await client.query("UPDATE users SET casual_seller_status='suspended', casual_seller_suspended_at=NOW(), seller_suspended=true, seller_suspended_reason=$1 WHERE id=$2", [String(req.body?.reason || "Suspended after verification review").slice(0, 500), application.rows[0].user_id]);
     await client.query("UPDATE listings SET status='paused' WHERE owner_id=$1 AND status='active'", [application.rows[0].user_id]);
+    await cancelOpenCheckoutsForSeller(client, application.rows[0].user_id, "Seller verification was suspended before payment completed");
     await client.query("COMMIT");
     logAdminAction(req.user.id, "casual_seller_suspended", `Suspended casual seller application ${application.rows[0].reference}`);
     createNotification(application.rows[0].user_id, "verification_problem", "Your casual-seller verification was suspended. Your active listings have been paused.");
@@ -7376,11 +7505,15 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, requir
     let subtotal = 0;
     let shippingTotal = 0;
     const itemSnapshots = [];
+    const seenListingIds = new Set();
     for (const cartItem of items) {
       const qty = Number(cartItem.qty);
       if (!cartItem.listingId || !Number.isInteger(qty) || qty <= 0) {
         return res.status(400).json({ error: "Each cart item needs a valid listingId and a positive quantity" });
       }
+      const listingId = Number(cartItem.listingId);
+      if (seenListingIds.has(listingId)) return res.status(400).json({ error: "Each listing may appear only once in checkout" });
+      seenListingIds.add(listingId);
       const listingResult = await pool.query(
         `SELECT listings.* FROM listings
           JOIN users ON users.id = listings.owner_id
@@ -7395,6 +7528,10 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, requir
         return res.status(404).json({ error: `Listing ${cartItem.listingId} isn't available` });
       }
       const listing = listingResult.rows[0];
+      const availableQuantity = Math.max(1, Number(listing.quantity || 1));
+      if (qty > availableQuantity) {
+        return res.status(409).json({ error: `Only ${availableQuantity} unit${availableQuantity === 1 ? " is" : "s are"} available for ${listing.title}` });
+      }
       const price = Number(listing.price);
       if (!(price > 0)) return res.status(400).json({ error: "Listing has an invalid price" });
       const shippingFee = Number(listing.shipping_fee) || 0;
@@ -7501,8 +7638,18 @@ app.post("/checkout/verify/:reference", authenticate, async (req, res) => {
       return res.status(409).json({ error: "Payment received but checkout verification did not match. Your order was not created; contact support with the payment reference." });
     }
     await recordPaymentAttempt(req.user.id, { reference: req.params.reference, method: "checkout_verify", status: "success", amount: Number(verifyData.data?.amount || 0) / 100, currency: verifyData.data?.currency || "NGN" });
-    const { order } = await finalizeOrderFromPaystackCharge(req.params.reference, verifyData.data);
-    res.json({ order });
+    try {
+      const { order } = await finalizeOrderFromPaystackCharge(req.params.reference, verifyData.data);
+      res.json({ order });
+    } catch (finalizeErr) {
+      await markCheckoutIntent(req.params.reference, "integrity_failed", finalizeErr.message).catch(() => {});
+      try {
+        const refund = await requestAutomaticCheckoutRefund(req.params.reference, finalizeErr.message);
+        return res.status(409).json({ error: "Payment was received, but the order could not be completed. A full automatic refund has been submitted.", refund });
+      } catch (refundErr) {
+        return res.status(502).json({ error: "Payment was received, but the order could not be completed and the automatic refund needs support review.", reference: req.params.reference });
+      }
+    }
   } catch (err) {
     sendInternalError(res, err);
   }
@@ -7535,11 +7682,15 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
     let subtotal = 0;
     let shippingTotal = 0;
     const itemSnapshots = [];
+    const seenListingIds = new Set();
     for (const cartItem of items) {
       const qty = Number(cartItem.qty);
       if (!cartItem.listingId || !Number.isInteger(qty) || qty <= 0) {
         return res.status(400).json({ error: "Each cart item needs a valid listingId and a positive quantity" });
       }
+      const listingId = Number(cartItem.listingId);
+      if (seenListingIds.has(listingId)) return res.status(400).json({ error: "Each listing may appear only once in checkout" });
+      seenListingIds.add(listingId);
       const listingResult = await pool.query(
         `SELECT listings.* FROM listings
           JOIN users ON users.id = listings.owner_id
@@ -7554,6 +7705,10 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
         return res.status(404).json({ error: `Listing ${cartItem.listingId} isn't available` });
       }
       const listing = listingResult.rows[0];
+      const availableQuantity = Math.max(1, Number(listing.quantity || 1));
+      if (qty > availableQuantity) {
+        return res.status(409).json({ error: `Only ${availableQuantity} unit${availableQuantity === 1 ? " is" : "s are"} available for ${listing.title}` });
+      }
       const price = Number(listing.price);
       if (!(price > 0)) return res.status(400).json({ error: "Listing has an invalid price" });
       const shippingFee = Number(listing.shipping_fee) || 0;
@@ -7628,8 +7783,18 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
       return res.status(409).json({ error: "Payment received but checkout verification did not match. Your order was not created; contact support with the payment reference." });
     }
     await recordPaymentAttempt(req.user.id, { reference, method: "saved_card", status: "success", amount: total, currency: "NGN" });
-    const { order } = await finalizeOrderFromPaystackCharge(reference, chargeData.data);
-    res.json({ order });
+    try {
+      const { order } = await finalizeOrderFromPaystackCharge(reference, chargeData.data);
+      res.json({ order });
+    } catch (finalizeErr) {
+      await markCheckoutIntent(reference, "integrity_failed", finalizeErr.message).catch(() => {});
+      try {
+        const refund = await requestAutomaticCheckoutRefund(reference, finalizeErr.message);
+        return res.status(409).json({ error: "Payment was received, but the order could not be completed. A full automatic refund has been submitted.", refund });
+      } catch (refundErr) {
+        return res.status(502).json({ error: "Payment was received, but the order could not be completed and the automatic refund needs support review.", reference });
+      }
+    }
   } catch (err) {
     sendInternalError(res, err);
   }
@@ -9255,6 +9420,9 @@ app.post("/webhook/paystack", async (req, res) => {
       } catch (err) {
         if (event.data?.reference) {
           await markCheckoutIntent(event.data.reference, "integrity_failed", err.message).catch(() => {});
+          await requestAutomaticCheckoutRefund(event.data.reference, err.message).catch((refundErr) => {
+            console.error("Webhook automatic checkout refund needs review:", refundErr.message);
+          });
         }
         console.error("Webhook order finalization blocked:", err.message);
       }
@@ -9383,6 +9551,29 @@ app.post("/webhook/paystack", async (req, res) => {
                  WHERE id = $4`,
                 [refundStatus, data.id || null, event.event === "refund.needs-attention" ? (data.reason || "Customer bank details are required") : null, order.id]
               );
+            }
+          } else {
+            const checkout = await pool.query("SELECT buyer_id FROM checkout_intents WHERE reference=$1", [transactionReference]);
+            if (checkout.rows.length) {
+              const refundStatus = data.status || event.event.replace("refund.", "");
+              if (event.event === "refund.processed") {
+                await pool.query(
+                  "UPDATE checkout_intents SET status='refunded', refund_status='processed', paystack_refund_id=COALESCE($2,paystack_refund_id), refunded_at=NOW() WHERE reference=$1",
+                  [transactionReference, data.id || null]
+                );
+                createNotification(checkout.rows[0].buyer_id, "refund_processed", "Your full refund has been processed because the order could not be completed.");
+              } else if (event.event === "refund.failed") {
+                await pool.query(
+                  "UPDATE checkout_intents SET status='integrity_failed', refund_status='failed', paystack_refund_id=COALESCE($2,paystack_refund_id), failure_reason=$3 WHERE reference=$1",
+                  [transactionReference, data.id || null, data.reason || "Paystack reported that the refund failed"]
+                );
+                createNotification(checkout.rows[0].buyer_id, "refund_failed", "Your automatic refund could not be completed. Stallyard support will review it.");
+              } else {
+                await pool.query(
+                  "UPDATE checkout_intents SET status='refund_pending', refund_status=$2, paystack_refund_id=COALESCE($3,paystack_refund_id), failure_reason=CASE WHEN $4::boolean THEN $5 ELSE failure_reason END WHERE reference=$1",
+                  [transactionReference, refundStatus, data.id || null, event.event === "refund.needs-attention", data.reason || "Customer bank details are required"]
+                );
+              }
             }
           }
         } catch (err) {
