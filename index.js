@@ -2760,6 +2760,10 @@ const SCHEMA_MIGRATIONS = [
        created_at TIMESTAMP NOT NULL DEFAULT NOW()
      )`,
   ] },
+  { version: 74, name: "premium-seller-no-preset-ceiling", statements: [
+    `ALTER TABLE users ALTER COLUMN seller_listing_limit TYPE NUMERIC`,
+    `ALTER TABLE premium_seller_applications ALTER COLUMN requested_limit TYPE NUMERIC`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -3920,15 +3924,37 @@ app.patch("/users/:id/approve", authenticate, requirePermission("seller_verifica
   try {
     await client.query("BEGIN");
     const pendingApplication = await client.query(
-      "SELECT id FROM verified_seller_applications WHERE user_id=$1 AND status='pending' ORDER BY created_at DESC LIMIT 1 FOR UPDATE", [req.params.id]
+      `SELECT a.*, u.is_suspended, u.seller_suspended, u.casual_seller_status,
+              u.is_email_verified, u.is_phone_verified, u.paystack_recipient_code
+         FROM verified_seller_applications a JOIN users u ON u.id=a.user_id
+        WHERE a.user_id=$1 AND a.status='pending' ORDER BY a.created_at DESC LIMIT 1 FOR UPDATE`, [req.params.id]
     );
     if (!pendingApplication.rows.length) {
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "A complete pending verified-seller application is required before approval" });
     }
+    const application = pendingApplication.rows[0];
+    const address = await client.query(
+      `SELECT id FROM user_addresses WHERE id=$1 AND user_id=$2 AND is_default=true
+        AND street<>'' AND city<>'' AND state<>'' AND LOWER(country)='nigeria'`,
+      [application.address_id, application.user_id]
+    );
+    const failedChecks = [];
+    if (application.is_suspended || application.seller_suspended) failedChecks.push("seller account is suspended");
+    if (application.casual_seller_status !== "approved") failedChecks.push("Casual Seller approval is no longer active");
+    if (!application.is_email_verified || !application.is_phone_verified) failedChecks.push("email and phone must remain verified");
+    if (!application.paystack_recipient_code) failedChecks.push("verified payout bank is missing");
+    if (!address.rows.length) failedChecks.push("complete default Nigerian address is missing");
+    if (!CASUAL_SELLER_ID_TYPES.has(application.id_type) || !application.id_front_path) failedChecks.push("accepted identification is missing");
+    if (!application.bank_statement_path) failedChecks.push("bank statement is missing");
+    if (!application.consented_at) failedChecks.push("seller declaration is missing");
+    if (failedChecks.length) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: `Seller cannot be approved: ${failedChecks.join("; ")}`, failedChecks });
+    }
     const result = await client.query(
       `UPDATE users SET is_approved = true, verification_status = 'approved', rejection_reason = NULL,
-         seller_tier = 'verified', seller_listing_limit = $1, seller_suspended=false, seller_suspended_reason=NULL
+         seller_tier = 'verified', seller_listing_limit = $1
        WHERE id = $2 RETURNING ${USER_RETURNING_FIELDS}`,
       [VERIFIED_SELLER_LIMIT_NGN, req.params.id]
     );
@@ -3939,7 +3965,7 @@ app.patch("/users/:id/approve", authenticate, requirePermission("seller_verifica
     await client.query(
       `UPDATE verified_seller_applications SET status='approved', reviewed_by=$1, reviewed_at=NOW(), updated_at=NOW()
         WHERE id=$2`,
-      [req.user.id, pendingApplication.rows[0].id]
+      [req.user.id, application.id]
     );
     await client.query("COMMIT");
     logAdminAction(req.user.id, "seller_approved", `Approved ${result.rows[0].username}'s seller application`);
@@ -5289,7 +5315,6 @@ const LISTING_SUBCATEGORIES = {
 const CASUAL_SELLER_LIMIT_NGN = 500000;
 const VERIFIED_SELLER_LIMIT_NGN = 20000000;
 const PREMIUM_SELLER_MIN_LIMIT_NGN = 20000000.01;
-const PREMIUM_SELLER_MAX_LIMIT_NGN = 1000000000;
 const CASUAL_SELLER_ID_TYPES = new Set(["nin", "passport", "drivers_license", "voters_card", "cerpac"]);
 const CASUAL_SELLER_CONSENT_VERSION = "2026-09-12";
 const CASUAL_LIVENESS_TTL_MS = 10 * 60 * 1000;
@@ -5464,6 +5489,10 @@ app.get("/casual-seller/status", authenticate, rejectAdminMarketplaceUse, async 
       `SELECT reference, status, decision_reason, automatic_checks, created_at, approved_at
          FROM casual_seller_applications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`, [req.user.id]
     );
+    const latestPremium = await pool.query(
+      `SELECT reference, requested_limit, status, decision_reason, created_at, reviewed_at
+         FROM premium_seller_applications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`, [req.user.id]
+    );
     const currentValue = await activeListingValue(pool, req.user.id);
     res.json({
       status: user.rows[0]?.casual_seller_status || "none",
@@ -5474,6 +5503,7 @@ app.get("/casual-seller/status", authenticate, rejectAdminMarketplaceUse, async 
       emailVerified: !!user.rows[0]?.is_email_verified,
       phoneVerified: !!user.rows[0]?.is_phone_verified,
       application: latest.rows[0] || null,
+      premiumApplication: latestPremium.rows[0] || null,
     });
   } catch (err) { sendInternalError(res, err); }
 });
@@ -5830,7 +5860,7 @@ app.patch("/admin/verified-seller-applications/:id/auto-verify", authenticate, r
 
     const userResult = await client.query(
       `UPDATE users SET is_approved = true, verification_status = 'approved', rejection_reason = NULL,
-         seller_tier = 'verified', seller_listing_limit = $1, seller_suspended=false, seller_suspended_reason=NULL
+         seller_tier = 'verified', seller_listing_limit = $1
        WHERE id = $2 RETURNING ${USER_RETURNING_FIELDS}`,
       [VERIFIED_SELLER_LIMIT_NGN, application.user_id]
     );
@@ -5916,8 +5946,8 @@ app.post("/premium-seller/apply", authenticate, rejectAdminMarketplaceUse, requi
   try {
     if (req.body?.consent !== true) return res.status(400).json({ error: "Accept the Premium Seller declaration before applying" });
     const requestedLimit = Number(req.body?.requestedLimit);
-    if (!Number.isFinite(requestedLimit) || requestedLimit < PREMIUM_SELLER_MIN_LIMIT_NGN || requestedLimit > PREMIUM_SELLER_MAX_LIMIT_NGN) {
-      return res.status(400).json({ error: "Choose a requested limit above ₦20,000,000 and no higher than ₦1,000,000,000" });
+    if (!Number.isFinite(requestedLimit) || requestedLimit < PREMIUM_SELLER_MIN_LIMIT_NGN) {
+      return res.status(400).json({ error: "Choose a requested limit above ₦20,000,000" });
     }
     const document = parsePrivateApplicationDocument(req.body?.supportingDocument, "Premium supporting document");
     await client.query("BEGIN");
@@ -5994,18 +6024,37 @@ app.patch("/admin/premium-seller-applications/:id/approve", authenticate, requir
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const applicationResult = await client.query("SELECT * FROM premium_seller_applications WHERE id=$1 FOR UPDATE", [req.params.id]);
+    const applicationResult = await client.query(
+      `SELECT a.*,u.is_approved,u.is_suspended,u.seller_suspended,u.seller_tier,
+              u.is_email_verified,u.is_phone_verified,u.paystack_recipient_code
+         FROM premium_seller_applications a JOIN users u ON u.id=a.user_id
+        WHERE a.id=$1 FOR UPDATE`, [req.params.id]
+    );
     const application = applicationResult.rows[0];
     if (!application) { await client.query("ROLLBACK"); return res.status(404).json({ error:"Application not found" }); }
     if (application.status !== "pending") { await client.query("ROLLBACK"); return res.status(409).json({ error:"Only a pending Premium Seller application can be approved" }); }
     const approvedLimit = Number(req.body?.approvedLimit || application.requested_limit);
-    if (!Number.isFinite(approvedLimit) || approvedLimit < PREMIUM_SELLER_MIN_LIMIT_NGN || approvedLimit > PREMIUM_SELLER_MAX_LIMIT_NGN) {
+    if (!Number.isFinite(approvedLimit) || approvedLimit < PREMIUM_SELLER_MIN_LIMIT_NGN) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ error:"Approved limit must be above ₦20,000,000 and no higher than ₦1,000,000,000" });
+      return res.status(400).json({ error:"Approved limit must be above ₦20,000,000" });
+    }
+    const verifiedRecord = await client.query(
+      "SELECT id FROM verified_seller_applications WHERE id=$1 AND user_id=$2 AND status='approved'",
+      [application.verified_application_id, application.user_id]
+    );
+    const failedChecks = [];
+    if (application.is_suspended || application.seller_suspended) failedChecks.push("seller account is suspended");
+    if (!application.is_approved || application.seller_tier !== "verified") failedChecks.push("Verified Seller approval is no longer active");
+    if (!application.is_email_verified || !application.is_phone_verified) failedChecks.push("email and phone must remain verified");
+    if (!application.paystack_recipient_code) failedChecks.push("verified payout bank is missing");
+    if (!verifiedRecord.rows.length) failedChecks.push("approved Verified Seller record is missing");
+    if (failedChecks.length) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error:`Premium Seller cannot be approved: ${failedChecks.join("; ")}`, failedChecks });
     }
     const userResult = await client.query(
-      `UPDATE users SET seller_tier='premium',seller_listing_limit=$1,is_approved=true,verification_status='approved',seller_suspended=false,seller_suspended_reason=NULL
-        WHERE id=$2 AND is_suspended=false RETURNING ${USER_RETURNING_FIELDS}`, [approvedLimit, application.user_id]
+      `UPDATE users SET seller_tier='premium',seller_listing_limit=$1,is_approved=true,verification_status='approved'
+        WHERE id=$2 AND is_suspended=false AND seller_suspended=false RETURNING ${USER_RETURNING_FIELDS}`, [approvedLimit, application.user_id]
     );
     if (!userResult.rows.length) { await client.query("ROLLBACK"); return res.status(409).json({ error:"The seller account is unavailable or suspended" }); }
     await client.query("UPDATE premium_seller_applications SET status='approved',decision_reason=$1,reviewed_by=$2,reviewed_at=NOW(),updated_at=NOW() WHERE id=$3",
