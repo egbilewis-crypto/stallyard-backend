@@ -5592,7 +5592,7 @@ app.post("/casual-seller/rekognition/session", authenticate, rejectAdminMarketpl
   }
 );
 
-app.post("/casual-seller/rekognition/complete", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, requireCasualVerificationAvailable, async (req, res) => {
+app.post("/casual-seller/rekognition/complete", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireVerifiedEmailAndPhone, requireNigeriaMarketplaceUser, requireCasualVerificationAvailable, async (req, res) => {
   try {
     const issued = await getSecurityState("rekognition-liveness-session", req.user.id);
     const sessionId = String(req.body?.sessionId || "");
@@ -5616,7 +5616,7 @@ app.post("/casual-seller/rekognition/complete", authenticate, rejectAdminMarketp
   } catch (err) { sendInternalError(res, err, "complete Rekognition liveness session"); }
 });
 
-app.post("/casual-seller/challenge", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, requireCasualVerificationAvailable, async (req, res) => {
+app.post("/casual-seller/challenge", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireVerifiedEmailAndPhone, requireNigeriaMarketplaceUser, requireCasualVerificationAvailable, async (req, res) => {
   try {
     const poolValues = ["blink", "turn_left", "turn_right", "smile", "move_closer"];
     for (let index = poolValues.length - 1; index > 0; index--) {
@@ -5804,11 +5804,11 @@ app.post("/verified-seller/apply", authenticate, rejectAdminMarketplaceUse, requ
     const idBack = req.body?.idBack ? parseVerificationJpeg(req.body.idBack, "ID back") : null;
     await client.query("BEGIN");
     const userResult = await client.query(
-      `SELECT id, username, is_approved, is_suspended, casual_seller_status, is_email_verified,
+      `SELECT id, username, is_approved, is_suspended, seller_suspended, casual_seller_status, is_email_verified,
               is_phone_verified, paystack_recipient_code FROM users WHERE id=$1 FOR UPDATE`, [req.user.id]
     );
     const user = userResult.rows[0];
-    if (!user || user.is_suspended) throw Object.assign(new Error("This account cannot apply"), { statusCode: 403 });
+    if (!user || user.is_suspended || user.seller_suspended) throw Object.assign(new Error("This account cannot apply while selling access is suspended"), { statusCode: 403 });
     if (user.is_approved) throw Object.assign(new Error("Your account is already a verified seller"), { statusCode: 409 });
     if (user.casual_seller_status !== "approved") throw Object.assign(new Error("Complete automatic casual-seller identity verification first"), { statusCode: 400 });
     if (!user.is_email_verified || !user.is_phone_verified) throw Object.assign(new Error("Verify your email and phone number first"), { statusCode: 400 });
