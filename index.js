@@ -8131,7 +8131,12 @@ app.post("/orders/:id/buyer-cancel-refund", authenticate, rejectAdminMarketplace
     const orderResult = await client.query(
       `SELECT orders.*,
               created_at + INTERVAL '3 hours' AS cancellation_deadline,
-              NOW() < created_at + INTERVAL '3 hours' AS cancellation_window_open
+              (NOW() < created_at + INTERVAL '3 hours'
+               OR (refund_type = 'buyer_cancellation'
+                   AND refund_status = 'failed'
+                   AND refund_requested_at IS NOT NULL
+                   AND refund_requested_at < created_at + INTERVAL '3 hours'
+                   AND refund_requested_by = buyer_id)) AS cancellation_window_open
          FROM orders
         WHERE id = $1
         FOR UPDATE`,
@@ -8167,6 +8172,10 @@ app.post("/orders/:id/buyer-cancel-refund", authenticate, rejectAdminMarketplace
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "Cancellation and refund are permanently closed because a delivery token was sent to a seller" });
     }
+    if (items.some((item) => item.fulfillment_status === "delivered" || item.buyer_confirmed_at || item.proof_of_delivery_url)) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "This order has already been recorded as delivered and can no longer be cancelled" });
+    }
     const payoutLock = await client.query(
       `SELECT 1 FROM seller_payouts WHERE order_id = $1 AND status IN ('queued', 'processing', 'request_unknown', 'paid') LIMIT 1`,
       [order.id]
@@ -8186,16 +8195,21 @@ app.post("/orders/:id/buyer-cancel-refund", authenticate, rejectAdminMarketplace
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "This order has no refundable balance" });
     }
-    const received = items.some((item) => item.fulfillment_status === "delivered" || item.buyer_confirmed_at || item.proof_of_delivery_url);
     const locked = await client.query(
       `UPDATE orders SET payment_status = 'refund_pending', refund_status = 'requesting',
        refund_previous_payment_status = 'held', refund_reason = $1, refund_requested_by = $2,
        refund_type = 'buyer_cancellation', refund_amount = $3, cancellation_fee = $4,
-       buyer_exit_type = $5, refund_requested_at = NOW(), refunded_at = NULL, refund_failure_reason = NULL
+       buyer_exit_type = $5, refund_requested_at = COALESCE(refund_requested_at, NOW()),
+       refunded_at = NULL, refund_failure_reason = NULL
        WHERE id = $6
-         AND NOW() < created_at + INTERVAL '3 hours'
+         AND (NOW() < created_at + INTERVAL '3 hours'
+              OR (refund_type = 'buyer_cancellation'
+                  AND refund_status = 'failed'
+                  AND refund_requested_at IS NOT NULL
+                  AND refund_requested_at < created_at + INTERVAL '3 hours'
+                  AND refund_requested_by = buyer_id))
        RETURNING *`,
-      [reason, req.user.id, refundAmount, cancellationFee, received ? "return_refund" : "cancellation", order.id]
+      [reason, req.user.id, refundAmount, cancellationFee, "cancellation", order.id]
     );
     if (!locked.rows.length) {
       await client.query("ROLLBACK");
@@ -8214,7 +8228,7 @@ app.post("/orders/:id/buyer-cancel-refund", authenticate, rejectAdminMarketplace
           transaction: order.paystack_reference,
           amount: Math.round(refundAmount * 100),
           currency: order.currency || "NGN",
-          customer_note: `Stallyard ${received ? "return" : "cancellation"} refund for order #${order.id}; 2% cancellation fee retained.`,
+          customer_note: `Stallyard cancellation refund for order #${order.id}; 2% cancellation fee retained.`,
           merchant_note: `Automatic buyer refund for order #${order.id}; fee ${cancellationFee}.`,
         }),
       });
@@ -8232,12 +8246,42 @@ app.post("/orders/:id/buyer-cancel-refund", authenticate, rejectAdminMarketplace
       return res.status(400).json({ error: message, order: restored.rows[0] });
     }
     const refund = paystackData.data || {};
-    const updated = await pool.query(
-      `UPDATE orders SET refund_status = $1, paystack_refund_id = $2, refund_failure_reason = NULL WHERE id = $3 RETURNING *`,
-      [refund.status || "pending", refund.id || null, order.id]
-    );
-    createNotification(order.buyer_id, "refund_started", `Your ${formatMoneyServer(refundAmount, order.currency)} refund for order #${order.id} was submitted. Stallyard retained the disclosed ${formatMoneyServer(cancellationFee, order.currency)} cancellation fee.`);
-    res.json({ order: updated.rows[0], refundAmount, cancellationFee, buyerExitType: received ? "return_refund" : "cancellation" });
+    const refundStatus = String(refund.status || "pending").toLowerCase();
+    let updated;
+    if (refundStatus === "processed") {
+      const completionClient = await pool.connect();
+      try {
+        await completionClient.query("BEGIN");
+        updated = await completionClient.query(
+          `UPDATE orders SET payment_status = 'refunded', refund_status = 'processed',
+             paystack_refund_id = $1, refunded_at = NOW(), refund_failure_reason = NULL
+           WHERE id = $2 RETURNING *`,
+          [refund.id || null, order.id]
+        );
+        await completionClient.query(
+          `UPDATE order_items SET fulfillment_status = 'cancelled',
+             cancellation_status = 'approved', cancellation_responded_at = NOW(),
+             delivery_token = NULL, delivery_token_generated_at = NULL,
+             live_location_enabled = FALSE, live_location_expires_at = NULL
+           WHERE order_id = $1 AND delivery_token_sent_at IS NULL AND delivery_token_redeemed_at IS NULL`,
+          [order.id]
+        );
+        await completionClient.query("COMMIT");
+      } catch (completionErr) {
+        await completionClient.query("ROLLBACK").catch(() => {});
+        throw completionErr;
+      } finally {
+        completionClient.release();
+      }
+      createNotification(order.buyer_id, "refund_processed", `Your refund of ${formatMoneyServer(refundAmount, order.currency)} for order #${order.id} was processed after the ${formatMoneyServer(cancellationFee, order.currency)} cancellation fee.`);
+    } else {
+      updated = await pool.query(
+        `UPDATE orders SET refund_status = $1, paystack_refund_id = $2, refund_failure_reason = NULL WHERE id = $3 RETURNING *`,
+        [refundStatus, refund.id || null, order.id]
+      );
+      createNotification(order.buyer_id, "refund_started", `Your ${formatMoneyServer(refundAmount, order.currency)} refund for order #${order.id} was submitted. Stallyard retained the disclosed ${formatMoneyServer(cancellationFee, order.currency)} cancellation fee.`);
+    }
+    res.json({ order: updated.rows[0], refundAmount, cancellationFee, buyerExitType: "cancellation" });
   } catch (err) {
     try { await client.query("ROLLBACK"); } catch {}
     sendInternalError(res, err);
