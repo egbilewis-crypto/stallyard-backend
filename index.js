@@ -8128,7 +8128,15 @@ app.post("/orders/:id/buyer-cancel-refund", authenticate, rejectAdminMarketplace
     if (!process.env.PAYSTACK_SECRET_KEY) return res.status(500).json({ error: "Paystack refunds aren't configured — contact support" });
 
     await client.query("BEGIN");
-    const orderResult = await client.query("SELECT * FROM orders WHERE id = $1 FOR UPDATE", [req.params.id]);
+    const orderResult = await client.query(
+      `SELECT orders.*,
+              created_at + INTERVAL '3 hours' AS cancellation_deadline,
+              NOW() < created_at + INTERVAL '3 hours' AS cancellation_window_open
+         FROM orders
+        WHERE id = $1
+        FOR UPDATE`,
+      [req.params.id]
+    );
     if (!orderResult.rows.length) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "Order not found" });
@@ -8137,6 +8145,13 @@ app.post("/orders/:id/buyer-cancel-refund", authenticate, rejectAdminMarketplace
     if (Number(order.buyer_id) !== Number(req.user.id)) {
       await client.query("ROLLBACK");
       return res.status(403).json({ error: "Only the buyer can cancel or refund this order" });
+    }
+    if (!order.cancellation_window_open) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error: "The 3-hour cancellation window for this order has closed",
+        cancellationDeadline: order.cancellation_deadline,
+      });
     }
     if (order.payment_status !== "held") {
       await client.query("ROLLBACK");
@@ -8177,9 +8192,15 @@ app.post("/orders/:id/buyer-cancel-refund", authenticate, rejectAdminMarketplace
        refund_previous_payment_status = 'held', refund_reason = $1, refund_requested_by = $2,
        refund_type = 'buyer_cancellation', refund_amount = $3, cancellation_fee = $4,
        buyer_exit_type = $5, refund_requested_at = NOW(), refunded_at = NULL, refund_failure_reason = NULL
-       WHERE id = $6 RETURNING *`,
+       WHERE id = $6
+         AND NOW() < created_at + INTERVAL '3 hours'
+       RETURNING *`,
       [reason, req.user.id, refundAmount, cancellationFee, received ? "return_refund" : "cancellation", order.id]
     );
+    if (!locked.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "The 3-hour cancellation window for this order has closed" });
+    }
     order = locked.rows[0];
     await client.query("COMMIT");
 
