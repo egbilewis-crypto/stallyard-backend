@@ -5520,7 +5520,8 @@ app.get("/casual-seller/status", authenticate, rejectAdminMarketplaceUse, async 
   try {
     const user = await pool.query(
       `SELECT casual_seller_status, casual_seller_limit, casual_seller_approved_at,
-              is_approved, is_email_verified, is_phone_verified
+              is_approved, is_email_verified, is_phone_verified,
+              seller_tier, seller_listing_limit
          FROM users WHERE id = $1`, [req.user.id]
     );
     const latest = await pool.query(
@@ -5532,14 +5533,22 @@ app.get("/casual-seller/status", authenticate, rejectAdminMarketplaceUse, async 
          FROM premium_seller_applications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`, [req.user.id]
     );
     const currentValue = await activeListingValue(pool, req.user.id);
+    const account = user.rows[0] || {};
+    const sellerTier = account.is_approved
+      ? (account.seller_tier === "premium" ? "premium" : "verified")
+      : (account.casual_seller_status === "approved" ? "casual" : "buyer");
+    const effectiveLimit = account.is_approved
+      ? Number(account.seller_listing_limit || VERIFIED_SELLER_LIMIT_NGN)
+      : Number(account.casual_seller_limit || CASUAL_SELLER_LIMIT_NGN);
     res.json({
-      status: user.rows[0]?.casual_seller_status || "none",
-      limit: Number(user.rows[0]?.casual_seller_limit || CASUAL_SELLER_LIMIT_NGN),
+      status: account.casual_seller_status || "none",
+      sellerTier,
+      limit: effectiveLimit,
       currentActiveValue: currentValue,
-      remainingValue: Math.max(0, Number(user.rows[0]?.casual_seller_limit || CASUAL_SELLER_LIMIT_NGN) - currentValue),
-      fullyApprovedSeller: !!user.rows[0]?.is_approved,
-      emailVerified: !!user.rows[0]?.is_email_verified,
-      phoneVerified: !!user.rows[0]?.is_phone_verified,
+      remainingValue: Math.max(0, effectiveLimit - currentValue),
+      fullyApprovedSeller: !!account.is_approved,
+      emailVerified: !!account.is_email_verified,
+      phoneVerified: !!account.is_phone_verified,
       application: latest.rows[0] || null,
       premiumApplication: latestPremium.rows[0] || null,
     });
