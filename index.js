@@ -595,7 +595,14 @@ async function reserveCheckoutListings(client, { buyerId, reference, items }) {
   for (const listingId of listingIds) {
     // Lock the listing row so two checkout transactions cannot reserve it simultaneously.
     const listingResult = await client.query(
-      "SELECT id, status FROM listings WHERE id = $1 FOR UPDATE",
+      `SELECT listings.id, listings.status FROM listings
+        JOIN users ON users.id = listings.owner_id
+       WHERE listings.id = $1
+         AND users.is_suspended = false
+         AND users.seller_suspended = false
+         AND ((users.is_approved = true AND users.seller_tier IN ('verified', 'premium'))
+              OR users.casual_seller_status = 'approved')
+       FOR UPDATE OF listings, users`,
       [listingId]
     );
     if (!listingResult.rows.length || listingResult.rows[0].status !== "active") {
@@ -727,7 +734,14 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
     for (const cartItem of cartItems) {
       const qty = Number(cartItem.qty);
       const listingResult = await client.query(
-        "SELECT * FROM listings WHERE id = $1 AND status = 'active' FOR UPDATE",
+        `SELECT listings.* FROM listings
+          JOIN users ON users.id = listings.owner_id
+         WHERE listings.id = $1 AND listings.status = 'active'
+           AND users.is_suspended = false
+           AND users.seller_suspended = false
+           AND ((users.is_approved = true AND users.seller_tier IN ('verified', 'premium'))
+                OR users.casual_seller_status = 'approved')
+         FOR UPDATE OF listings, users`,
         [cartItem.listingId]
       );
       if (listingResult.rows.length === 0) {
@@ -2783,6 +2797,13 @@ const SCHEMA_MIGRATIONS = [
   { version: 74, name: "premium-seller-no-preset-ceiling", statements: [
     `ALTER TABLE users ALTER COLUMN seller_listing_limit TYPE NUMERIC`,
     `ALTER TABLE premium_seller_applications ALTER COLUMN requested_limit TYPE NUMERIC`,
+  ] },
+  { version: 75, name: "repair-casual-seller-tier", statements: [
+    `UPDATE users SET seller_tier = 'casual'
+       WHERE is_admin = false
+         AND is_approved = false
+         AND casual_seller_status = 'approved'
+         AND seller_tier IS DISTINCT FROM 'casual'`,
   ] },
 ];
 
@@ -5764,6 +5785,7 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requir
     await client.query("UPDATE casual_seller_applications SET evidence_paths = $1, face_descriptor = $2 WHERE id = $3", [JSON.stringify(evidencePaths), JSON.stringify(faceDescriptor), applicationId]);
     await client.query(
       `UPDATE users SET casual_seller_status = $1, casual_seller_approved_at = CASE WHEN $1 = 'approved' THEN NOW() ELSE NULL END,
+         seller_tier = CASE WHEN $1 = 'approved' THEN 'casual' ELSE seller_tier END,
          has_applied_to_sell = true, verification_status = CASE WHEN $1 = 'approved' THEN 'casual_approved' ELSE 'review_required' END
        WHERE id = $2`, [status, req.user.id]
     );
@@ -6992,13 +7014,15 @@ app.get("/listings", async (req, res) => {
     const result = await pool.query(
       `SELECT listings.*, users.display_name AS seller_name, users.username AS owner_username,
               users.is_approved AS seller_is_approved, users.casual_seller_status,
-              users.is_suspended AS seller_is_suspended
+              users.is_suspended AS seller_is_suspended, users.seller_suspended
        FROM listings
        JOIN users ON listings.owner_id = users.id
        WHERE (
          listings.status = 'active'
-         AND (users.is_approved = true OR users.casual_seller_status = 'approved')
+         AND ((users.is_approved = true AND users.seller_tier IN ('verified', 'premium'))
+              OR users.casual_seller_status = 'approved')
          AND users.is_suspended = false
+         AND users.seller_suspended = false
        )
        OR ($1::integer IS NOT NULL AND listings.owner_id = $1)
        ORDER BY listings.created_at DESC`,
@@ -7007,7 +7031,7 @@ app.get("/listings", async (req, res) => {
 
     const rows = result.rows.map((row) => {
       if (validUserId && row.owner_id === validUserId) {
-        const { seller_is_approved, casual_seller_status, seller_is_suspended, ...ownRow } = row;
+        const { seller_is_approved, casual_seller_status, seller_is_suspended, seller_suspended, ...ownRow } = row;
         return ownRow;
       }
       return publicListingRow(row);
@@ -7358,7 +7382,13 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, requir
         return res.status(400).json({ error: "Each cart item needs a valid listingId and a positive quantity" });
       }
       const listingResult = await pool.query(
-        "SELECT * FROM listings WHERE id = $1 AND status = 'active'",
+        `SELECT listings.* FROM listings
+          JOIN users ON users.id = listings.owner_id
+         WHERE listings.id = $1 AND listings.status = 'active'
+           AND users.is_suspended = false
+           AND users.seller_suspended = false
+           AND ((users.is_approved = true AND users.seller_tier IN ('verified', 'premium'))
+                OR users.casual_seller_status = 'approved')`,
         [cartItem.listingId]
       );
       if (listingResult.rows.length === 0) {
@@ -7511,7 +7541,13 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
         return res.status(400).json({ error: "Each cart item needs a valid listingId and a positive quantity" });
       }
       const listingResult = await pool.query(
-        "SELECT * FROM listings WHERE id = $1 AND status = 'active'",
+        `SELECT listings.* FROM listings
+          JOIN users ON users.id = listings.owner_id
+         WHERE listings.id = $1 AND listings.status = 'active'
+           AND users.is_suspended = false
+           AND users.seller_suspended = false
+           AND ((users.is_approved = true AND users.seller_tier IN ('verified', 'premium'))
+                OR users.casual_seller_status = 'approved')`,
         [cartItem.listingId]
       );
       if (listingResult.rows.length === 0) {
