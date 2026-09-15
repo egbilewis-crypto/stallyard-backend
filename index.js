@@ -3989,26 +3989,33 @@ app.patch("/users/:id/approve", authenticate, requireSuperAdmin, async (req, res
   } finally { client.release(); }
 });
 
-app.patch("/users/:id/reject", authenticate, requirePermission("seller_verification"), async (req, res) => {
+app.patch("/users/:id/reject", authenticate, requireSuperAdmin, async (req, res) => {
+  const client = await pool.connect();
   try {
     const { reason } = req.body;
-    const pendingApplication = await pool.query(
-      "SELECT id FROM verified_seller_applications WHERE user_id=$1 AND status='pending' ORDER BY created_at DESC LIMIT 1", [req.params.id]
+    await client.query("BEGIN");
+    const pendingApplication = await client.query(
+      "SELECT id FROM verified_seller_applications WHERE user_id=$1 AND status='pending' ORDER BY created_at DESC LIMIT 1 FOR UPDATE", [req.params.id]
     );
     if (!pendingApplication.rows.length) {
+      await client.query("ROLLBACK");
       return res.status(409).json({ error: "A pending Verified Seller application is required before rejection" });
     }
-    const result = await pool.query(
+    const result = await client.query(
       `UPDATE users SET is_approved = false, verification_status = 'rejected', rejection_reason = $1
        WHERE id = $2 RETURNING ${USER_RETURNING_FIELDS}`,
       [reason || null, req.params.id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
-    await pool.query(
+    if (result.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "User not found" });
+    }
+    await client.query(
       `UPDATE verified_seller_applications SET status='rejected', decision_reason=$1, reviewed_by=$2, reviewed_at=NOW(), updated_at=NOW()
-        WHERE id=(SELECT id FROM verified_seller_applications WHERE user_id=$3 AND status='pending' ORDER BY created_at DESC LIMIT 1)`,
-      [reason || "Application rejected", req.user.id, req.params.id]
+        WHERE id=$3`,
+      [reason || "Application rejected", req.user.id, pendingApplication.rows[0].id]
     );
+    await client.query("COMMIT");
     logAdminAction(req.user.id, "seller_rejected", `Rejected ${result.rows[0].username}'s seller application${reason ? ": " + reason : ""}`);
     createNotification(
       req.params.id,
@@ -4017,8 +4024,9 @@ app.patch("/users/:id/reject", authenticate, requirePermission("seller_verificat
     );
     res.json({ user: result.rows[0] });
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
     sendInternalError(res, err);
-  }
+  } finally { client.release(); }
 });
 
 app.delete("/users/:id", authenticate, requirePermission("user_management"), async (req, res) => {
@@ -5608,6 +5616,16 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requir
       return res.status(400).json({ error: "Complete your legal name and birth date" });
     }
     if (ageOnDate(dateOfBirth) < 18) return res.status(400).json({ error: "Casual sellers must be at least 18 years old" });
+    const existingSeller = await pool.query(
+      "SELECT is_approved, is_suspended, seller_suspended, casual_seller_status FROM users WHERE id=$1 LIMIT 1",
+      [req.user.id]
+    );
+    if (!existingSeller.rows.length || existingSeller.rows[0].is_suspended || existingSeller.rows[0].seller_suspended) {
+      return res.status(403).json({ error: "This account cannot apply" });
+    }
+    if (existingSeller.rows[0].is_approved || existingSeller.rows[0].casual_seller_status === "approved") {
+      return res.status(409).json({ error: "Your Casual Seller verification is already approved" });
+    }
     if (!Array.isArray(challengeFrames) || challengeFrames.length !== 3 || !Array.isArray(challenges) || challenges.length !== 3) {
       return res.status(400).json({ error: "Complete all three live camera challenges" });
     }
@@ -5646,12 +5664,13 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requir
     await client.query("BEGIN");
     const accountResult = await client.query(
       `SELECT id, username, email, phone, first_name, last_name, other_name, display_name, country,
-              is_email_verified, is_phone_verified, is_suspended, is_approved, casual_seller_status
+              is_email_verified, is_phone_verified, is_suspended, seller_suspended, is_approved, casual_seller_status
          FROM users WHERE id = $1 FOR UPDATE`, [req.user.id]
     );
     const account = accountResult.rows[0];
-    if (!account || account.is_suspended) throw Object.assign(new Error("This account cannot apply"), { statusCode: 403 });
+    if (!account || account.is_suspended || account.seller_suspended) throw Object.assign(new Error("This account cannot apply"), { statusCode: 403 });
     if (account.is_approved) throw Object.assign(new Error("Your account already has full seller approval"), { statusCode: 409 });
+    if (account.casual_seller_status === "approved") throw Object.assign(new Error("Your Casual Seller verification is already approved"), { statusCode: 409 });
     if (!account.is_email_verified || !account.is_phone_verified) {
       throw Object.assign(new Error("Verify both your email and phone number before applying"), { statusCode: 400, code: "CONTACT_VERIFICATION_REQUIRED" });
     }
