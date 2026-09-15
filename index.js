@@ -746,7 +746,7 @@ async function cancelOpenCheckoutsForSeller(client, sellerId, reason) {
   return references;
 }
 
-async function requestAutomaticCheckoutRefund(reference, reason) {
+async function requestAutomaticCheckoutRefund(reference, reason, payment = {}) {
   if (!process.env.PAYSTACK_SECRET_KEY) throw new Error("Paystack refunds are not configured");
   const client = await pool.connect();
   let intent;
@@ -755,10 +755,17 @@ async function requestAutomaticCheckoutRefund(reference, reason) {
     const result = await client.query("SELECT * FROM checkout_intents WHERE reference = $1 FOR UPDATE", [reference]);
     intent = result.rows[0];
     if (!intent) throw new Error("Checkout intent not found for automatic refund");
-    if (intent.status === "finalized") {
-      await client.query("ROLLBACK");
-      return { alreadyHandled: true, status: "finalized" };
+    const existingOrder = await client.query("SELECT id FROM orders WHERE paystack_reference = $1 LIMIT 1", [reference]);
+    if (existingOrder.rows.length) {
+      await client.query(
+        "UPDATE checkout_intents SET status='finalized', failure_reason=NULL, finalized_at=COALESCE(finalized_at,NOW()) WHERE reference=$1",
+        [reference]
+      );
+      await client.query("COMMIT");
+      return { alreadyHandled: true, status: "finalized", orderId: existingOrder.rows[0].id };
     }
+    // Do not trust a finalized flag by itself. Only an existing order may
+    // suppress a refund; this also repairs legacy partial-finalization states.
     if (["requesting", "pending", "processed", "request_unknown"].includes(intent.refund_status)) {
       await client.query("ROLLBACK");
       return { alreadyHandled: true, status: intent.refund_status };
@@ -785,9 +792,9 @@ async function requestAutomaticCheckoutRefund(reference, reason) {
       method: "POST",
       headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({
-        transaction: reference,
-        amount: Number(intent.amount_kobo),
-        currency: intent.currency || "NGN",
+        transaction: String(payment.transactionReference || reference),
+        amount: Number(payment.amountKobo || intent.amount_kobo),
+        currency: String(payment.currency || intent.currency || "NGN").toUpperCase(),
         customer_note: "Your Stallyard payment was automatically refunded because the order could not be completed.",
         merchant_note: `Automatic checkout refund: ${String(reason || "order could not be completed").slice(0, 180)}`,
       }),
@@ -809,29 +816,53 @@ async function requestAutomaticCheckoutRefund(reference, reason) {
     throw new Error(message);
   }
   const refund = refundData.data || {};
+  const refundStatus = refund.status || "pending";
+  const immediatelyProcessed = refundStatus === "processed";
   await pool.query(
-    "UPDATE checkout_intents SET refund_status=$2, paystack_refund_id=$3 WHERE reference=$1",
-    [reference, refund.status || "pending", refund.id || null]
+    `UPDATE checkout_intents SET status=$2, refund_status=$3, paystack_refund_id=$4,
+       refunded_at=CASE WHEN $5::boolean THEN NOW() ELSE refunded_at END WHERE reference=$1`,
+    [reference, immediatelyProcessed ? "refunded" : "refund_pending", refundStatus, refund.id || null, immediatelyProcessed]
   );
-  createNotification(intent.buyer_id, "refund_started", "Your payment was received, but the order could not be completed. A full automatic refund has been submitted to Paystack.");
-  return { alreadyHandled: false, status: refund.status || "pending", refundId: refund.id || null };
+  createNotification(intent.buyer_id, immediatelyProcessed ? "refund_processed" : "refund_started",
+    immediatelyProcessed
+      ? "Your full refund was processed because the order could not be completed."
+      : "Your payment was received, but the order could not be completed. A full automatic refund has been submitted to Paystack.");
+  return { alreadyHandled: false, status: refundStatus, refundId: refund.id || null };
 }
 
 async function finalizeOrderFromPaystackCharge(reference, paystackData) {
-  const existing = await pool.query("SELECT * FROM orders WHERE paystack_reference = $1", [reference]);
-  if (existing.rows.length) {
-    const itemsResult = await pool.query("SELECT * FROM order_items WHERE order_id = $1 ORDER BY id ASC", [existing.rows[0].id]);
-    return { order: existing.rows[0], items: itemsResult.rows, alreadyFinalized: true };
-  }
-
-  const intent = await loadCheckoutIntent(reference);
-  assertPaystackMatchesCheckoutIntent(intent, paystackData);
-  const cartItems = Array.isArray(intent.items) ? intent.items : [];
-  if (!cartItems.length) throw new Error("Payment integrity check failed: checkout intent has no items");
-
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    // Serialize webhook and browser verification for the same payment. The
+    // checkout row remains locked until both the order and finalized status
+    // are committed, so a second caller cannot mistake a completed order for
+    // a failed checkout and refund it.
+    const intentResult = await client.query(
+      "SELECT * FROM checkout_intents WHERE reference = $1 FOR UPDATE",
+      [reference]
+    );
+    if (!intentResult.rows.length) throw new Error("Checkout intent not found");
+    const intent = intentResult.rows[0];
+
+    const existing = await client.query("SELECT * FROM orders WHERE paystack_reference = $1", [reference]);
+    if (existing.rows.length) {
+      const itemsResult = await client.query("SELECT * FROM order_items WHERE order_id = $1 ORDER BY id ASC", [existing.rows[0].id]);
+      await client.query(
+        "UPDATE checkout_intents SET status='finalized', failure_reason=NULL, finalized_at=COALESCE(finalized_at,NOW()) WHERE reference=$1",
+        [reference]
+      );
+      await client.query("COMMIT");
+      return { order: existing.rows[0], items: itemsResult.rows, alreadyFinalized: true };
+    }
+    if (["requesting", "pending", "processed", "request_unknown"].includes(intent.refund_status)
+        || ["refund_pending", "refunded"].includes(intent.status)) {
+      throw new Error("This payment is already in the refund process and cannot be converted into an order");
+    }
+
+    assertPaystackMatchesCheckoutIntent(intent, paystackData);
+    const cartItems = Array.isArray(intent.items) ? intent.items : [];
+    if (!cartItems.length) throw new Error("Payment integrity check failed: checkout intent has no items");
     await assertCheckoutReservationsOwned(client, intent);
 
     let subtotal = 0;
@@ -931,9 +962,11 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
     }
 
     await releaseCheckoutReservations(reference, client);
+    await client.query(
+      "UPDATE checkout_intents SET status='finalized', failure_reason=NULL, finalized_at=COALESCE(finalized_at,NOW()) WHERE reference=$1",
+      [reference]
+    );
     await client.query("COMMIT");
-
-    await markCheckoutIntent(reference, "finalized", null);
 
     if (intent.save_card && authorization.reusable && authorization.authorization_code) {
       try {
@@ -7633,18 +7666,37 @@ app.post("/checkout/verify/:reference", authenticate, async (req, res) => {
     try {
       assertPaystackMatchesCheckoutIntent(intent, verifyData.data);
     } catch (integrityErr) {
-      await markCheckoutIntent(req.params.reference, "integrity_failed", integrityErr.message);
       await recordPaymentAttempt(req.user.id, { reference: req.params.reference, method: "checkout_verify", status: "integrity_failed", amount: Number(verifyData.data?.amount || 0) / 100, currency: verifyData.data?.currency || "NGN", message: integrityErr.message });
-      return res.status(409).json({ error: "Payment received but checkout verification did not match. Your order was not created; contact support with the payment reference." });
+      try {
+        const refund = await requestAutomaticCheckoutRefund(req.params.reference, integrityErr.message, {
+          transactionReference: verifyData.data?.reference,
+          amountKobo: Number(verifyData.data?.amount),
+          currency: verifyData.data?.currency,
+        });
+        if (refund.status === "finalized" && refund.orderId) {
+          const recovered = await pool.query("SELECT * FROM orders WHERE id = $1", [refund.orderId]);
+          return res.json({ order: recovered.rows[0], alreadyFinalized: true });
+        }
+        return res.status(409).json({ error: "Payment was received but did not pass checkout verification. A full automatic refund has been submitted.", refund });
+      } catch (refundErr) {
+        return res.status(502).json({ error: "Payment was received but did not pass checkout verification, and the automatic refund needs support review.", reference: req.params.reference });
+      }
     }
     await recordPaymentAttempt(req.user.id, { reference: req.params.reference, method: "checkout_verify", status: "success", amount: Number(verifyData.data?.amount || 0) / 100, currency: verifyData.data?.currency || "NGN" });
     try {
       const { order } = await finalizeOrderFromPaystackCharge(req.params.reference, verifyData.data);
       res.json({ order });
     } catch (finalizeErr) {
-      await markCheckoutIntent(req.params.reference, "integrity_failed", finalizeErr.message).catch(() => {});
       try {
-        const refund = await requestAutomaticCheckoutRefund(req.params.reference, finalizeErr.message);
+        const refund = await requestAutomaticCheckoutRefund(req.params.reference, finalizeErr.message, {
+          transactionReference: verifyData.data?.reference,
+          amountKobo: Number(verifyData.data?.amount),
+          currency: verifyData.data?.currency,
+        });
+        if (refund.status === "finalized" && refund.orderId) {
+          const recovered = await pool.query("SELECT * FROM orders WHERE id = $1", [refund.orderId]);
+          return res.json({ order: recovered.rows[0], alreadyFinalized: true });
+        }
         return res.status(409).json({ error: "Payment was received, but the order could not be completed. A full automatic refund has been submitted.", refund });
       } catch (refundErr) {
         return res.status(502).json({ error: "Payment was received, but the order could not be completed and the automatic refund needs support review.", reference: req.params.reference });
@@ -7778,18 +7830,37 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
     try {
       assertPaystackMatchesCheckoutIntent(await loadCheckoutIntent(reference), chargeData.data);
     } catch (integrityErr) {
-      await markCheckoutIntent(reference, "integrity_failed", integrityErr.message);
       await recordPaymentAttempt(req.user.id, { reference, method: "saved_card", status: "integrity_failed", amount: Number(chargeData.data?.amount || 0) / 100, currency: chargeData.data?.currency || "NGN", message: integrityErr.message });
-      return res.status(409).json({ error: "Payment received but checkout verification did not match. Your order was not created; contact support with the payment reference." });
+      try {
+        const refund = await requestAutomaticCheckoutRefund(reference, integrityErr.message, {
+          transactionReference: chargeData.data?.reference,
+          amountKobo: Number(chargeData.data?.amount),
+          currency: chargeData.data?.currency,
+        });
+        if (refund.status === "finalized" && refund.orderId) {
+          const recovered = await pool.query("SELECT * FROM orders WHERE id = $1", [refund.orderId]);
+          return res.json({ order: recovered.rows[0], alreadyFinalized: true });
+        }
+        return res.status(409).json({ error: "Payment was received but did not pass checkout verification. A full automatic refund has been submitted.", refund });
+      } catch (refundErr) {
+        return res.status(502).json({ error: "Payment was received but did not pass checkout verification, and the automatic refund needs support review.", reference });
+      }
     }
     await recordPaymentAttempt(req.user.id, { reference, method: "saved_card", status: "success", amount: total, currency: "NGN" });
     try {
       const { order } = await finalizeOrderFromPaystackCharge(reference, chargeData.data);
       res.json({ order });
     } catch (finalizeErr) {
-      await markCheckoutIntent(reference, "integrity_failed", finalizeErr.message).catch(() => {});
       try {
-        const refund = await requestAutomaticCheckoutRefund(reference, finalizeErr.message);
+        const refund = await requestAutomaticCheckoutRefund(reference, finalizeErr.message, {
+          transactionReference: chargeData.data?.reference,
+          amountKobo: Number(chargeData.data?.amount),
+          currency: chargeData.data?.currency,
+        });
+        if (refund.status === "finalized" && refund.orderId) {
+          const recovered = await pool.query("SELECT * FROM orders WHERE id = $1", [refund.orderId]);
+          return res.json({ order: recovered.rows[0], alreadyFinalized: true });
+        }
         return res.status(409).json({ error: "Payment was received, but the order could not be completed. A full automatic refund has been submitted.", refund });
       } catch (refundErr) {
         return res.status(502).json({ error: "Payment was received, but the order could not be completed and the automatic refund needs support review.", reference });
@@ -9419,8 +9490,11 @@ app.post("/webhook/paystack", async (req, res) => {
         await finalizeOrderFromPaystackCharge(event.data.reference, event.data);
       } catch (err) {
         if (event.data?.reference) {
-          await markCheckoutIntent(event.data.reference, "integrity_failed", err.message).catch(() => {});
-          await requestAutomaticCheckoutRefund(event.data.reference, err.message).catch((refundErr) => {
+          await requestAutomaticCheckoutRefund(event.data.reference, err.message, {
+            transactionReference: event.data?.reference,
+            amountKobo: Number(event.data?.amount),
+            currency: event.data?.currency,
+          }).catch((refundErr) => {
             console.error("Webhook automatic checkout refund needs review:", refundErr.message);
           });
         }
