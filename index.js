@@ -368,6 +368,26 @@ async function requireVerifiedEmailAndPhone(req, res, next) {
   }
 }
 
+async function requireCasualVerificationAvailable(req, res, next) {
+  try {
+    const result = await pool.query(
+      `SELECT is_approved, is_suspended, seller_suspended, casual_seller_status
+         FROM users WHERE id=$1 LIMIT 1`,
+      [req.user.id]
+    );
+    const account = result.rows[0];
+    if (!account || account.is_suspended || account.seller_suspended || account.casual_seller_status === "suspended") {
+      return res.status(403).json({ error: "Seller verification is unavailable while this account is suspended", code: "SELLER_SUSPENDED" });
+    }
+    if (account.is_approved || account.casual_seller_status === "approved") {
+      return res.status(409).json({ error: "Your seller verification is already approved", code: "SELLER_ALREADY_APPROVED" });
+    }
+    next();
+  } catch (err) {
+    sendInternalError(res, err);
+  }
+}
+
 const ADMIN_ROLES = new Set([
   "super_admin", "seller_verification", "listing_moderator",
   "order_dispute", "finance", "customer_support",
@@ -5526,7 +5546,7 @@ app.get("/casual-seller/status", authenticate, rejectAdminMarketplaceUse, async 
   } catch (err) { sendInternalError(res, err); }
 });
 
-app.post("/casual-seller/rekognition/session", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireVerifiedEmailAndPhone, requireNigeriaMarketplaceUser,
+app.post("/casual-seller/rekognition/session", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireVerifiedEmailAndPhone, requireNigeriaMarketplaceUser, requireCasualVerificationAvailable,
   rekognitionSessionUserLimit, rekognitionSessionIpLimit, async (req, res) => {
     try {
       const roleArn = String(process.env.AWS_LIVENESS_ROLE_ARN || "").trim();
@@ -5563,7 +5583,7 @@ app.post("/casual-seller/rekognition/session", authenticate, rejectAdminMarketpl
   }
 );
 
-app.post("/casual-seller/rekognition/complete", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
+app.post("/casual-seller/rekognition/complete", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, requireCasualVerificationAvailable, async (req, res) => {
   try {
     const issued = await getSecurityState("rekognition-liveness-session", req.user.id);
     const sessionId = String(req.body?.sessionId || "");
@@ -5587,7 +5607,7 @@ app.post("/casual-seller/rekognition/complete", authenticate, rejectAdminMarketp
   } catch (err) { sendInternalError(res, err, "complete Rekognition liveness session"); }
 });
 
-app.post("/casual-seller/challenge", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
+app.post("/casual-seller/challenge", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, requireCasualVerificationAvailable, async (req, res) => {
   try {
     const poolValues = ["blink", "turn_left", "turn_right", "smile", "move_closer"];
     for (let index = poolValues.length - 1; index > 0; index--) {
