@@ -12174,6 +12174,185 @@ async function sendShipReminders() {
     console.error("Ship reminder check failed:", err.message);
   }
 }
+
+// Optional, private preview accounts for the owner to inspect buyer and seller
+// dashboards. They are created only when explicitly enabled in Railway and
+// both passwords are supplied there. The sample listing stays in draft and
+// the sample order has no Paystack reference, so no real payment or refund can
+// be initiated from these records. Re-running this setup is idempotent.
+async function ensurePreviewAccounts() {
+  if (String(process.env.PREVIEW_ACCOUNTS_ENABLED || "").toLowerCase() !== "true") return;
+
+  const buyerPassword = String(process.env.PREVIEW_BUYER_PASSWORD || "");
+  const sellerPassword = String(process.env.PREVIEW_SELLER_PASSWORD || "");
+  if (buyerPassword.length < 12 || sellerPassword.length < 12) {
+    throw new Error("Preview accounts require PREVIEW_BUYER_PASSWORD and PREVIEW_SELLER_PASSWORD with at least 12 characters");
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const buyerHash = await bcrypt.hash(buyerPassword, 10);
+    const sellerHash = await bcrypt.hash(sellerPassword, 10);
+
+    const upsertPreviewUser = async ({ username, email, passwordHash, displayName, intent, seller }) => {
+      const conflict = await client.query("SELECT id, email FROM users WHERE username = $1 FOR UPDATE", [username]);
+      if (conflict.rows.length && String(conflict.rows[0].email || "").toLowerCase() !== email) {
+        throw new Error(`The reserved preview username ${username} is already used by another account`);
+      }
+      const result = await client.query(
+        `INSERT INTO users (
+           username, email, password_hash, display_name, first_name, last_name,
+           date_of_birth, gender, nationality, state_of_residence, country,
+           is_admin, is_approved, is_verified, verification_status,
+           is_email_verified, is_phone_verified, profile_complete,
+           onboarding_intent, onboarding_completed_at, casual_seller_status,
+           seller_tier, seller_listing_limit, is_suspended, seller_suspended
+         ) VALUES (
+           $1,$2,$3,$4,'Preview','Account','1990-01-01','prefer_not_to_say',
+           'Nigerian','Lagos','Nigeria',false,$6,$6,$7,true,true,true,$5,NOW(),
+           $8,$9,$10,false,false
+         )
+         ON CONFLICT (username) DO UPDATE SET
+           password_hash = EXCLUDED.password_hash,
+           display_name = EXCLUDED.display_name,
+           is_email_verified = true, is_phone_verified = true,
+           profile_complete = true, onboarding_completed_at = NOW(),
+           is_approved = EXCLUDED.is_approved, is_verified = EXCLUDED.is_verified,
+           verification_status = EXCLUDED.verification_status,
+           casual_seller_status = EXCLUDED.casual_seller_status,
+           seller_tier = EXCLUDED.seller_tier,
+           seller_listing_limit = EXCLUDED.seller_listing_limit,
+           is_suspended = false, seller_suspended = false,
+           token_version = COALESCE(users.token_version, 0) + 1
+         RETURNING id, username`,
+        [
+          username, email, passwordHash, displayName, intent, seller,
+          seller ? "approved" : "none",
+          seller ? "approved" : "none",
+          seller ? "verified" : "buyer",
+          seller ? VERIFIED_SELLER_LIMIT_NGN : 0,
+        ]
+      );
+      return result.rows[0];
+    };
+
+    const buyer = await upsertPreviewUser({
+      username: "stallyard_preview_buyer",
+      email: "preview-buyer@stallyard.test",
+      passwordHash: buyerHash,
+      displayName: "Stallyard Preview Buyer",
+      intent: "buy",
+      seller: false,
+    });
+    const seller = await upsertPreviewUser({
+      username: "stallyard_preview_seller",
+      email: "preview-seller@stallyard.test",
+      passwordHash: sellerHash,
+      displayName: "Stallyard Preview Seller",
+      intent: "sell",
+      seller: true,
+    });
+
+    let listingResult = await client.query(
+      "SELECT id FROM listings WHERE owner_id = $1 AND sku = 'STALLYARD-PREVIEW-ONLY' LIMIT 1 FOR UPDATE",
+      [seller.id]
+    );
+    if (!listingResult.rows.length) {
+      listingResult = await client.query(
+        `INSERT INTO listings (
+           owner_id,title,description,price,category,subcategory,condition,shipping_fee,
+           emoji,images,listing_type,currency,status,quantity,sku,brand,state,shipping_methods,return_policy
+         ) VALUES ($1,'TEST DATA — Preview wireless headphones',
+           'Private preview listing. This draft is not visible in the marketplace.',45000,
+           'Electronics','Audio & Headphones','New',2500,'🎧','[]'::jsonb,'fixed','NGN',
+           'draft',3,'STALLYARD-PREVIEW-ONLY','Stallyard Preview','Lagos','[]'::jsonb,
+           'Preview data only') RETURNING id`,
+        [seller.id]
+      );
+    }
+    const listingId = listingResult.rows[0].id;
+
+    let orderResult = await client.query(
+      "SELECT id FROM orders WHERE buyer_id = $1 AND shipping_address->>'previewData' = 'true' LIMIT 1 FOR UPDATE",
+      [buyer.id]
+    );
+    if (!orderResult.rows.length) {
+      orderResult = await client.query(
+        `INSERT INTO orders (
+           buyer_id,buyer_username,total,currency,shipping_address,subtotal,shipping_total,
+           commission_rate,commission_amount,tax_amount,payment_status,is_disputed,created_at
+         ) VALUES ($1,$2,47500,'NGN',$3::jsonb,45000,2500,0.05,2250,0,'held',false,NOW())
+         RETURNING id`,
+        [buyer.id, buyer.username, JSON.stringify({
+          previewData: true,
+          fullName: "Stallyard Preview Buyer",
+          phone: "+2348000000000",
+          street: "Preview address — not a real delivery location",
+          city: "Lagos",
+          state: "Lagos",
+          country: "Nigeria",
+        })]
+      );
+    }
+    const orderId = orderResult.rows[0].id;
+
+    const itemResult = await client.query(
+      "SELECT id FROM order_items WHERE order_id = $1 AND listing_id = $2 LIMIT 1",
+      [orderId, listingId]
+    );
+    if (!itemResult.rows.length) {
+      await client.query(
+        `INSERT INTO order_items (
+           order_id,listing_id,title,emoji,price,qty,shipping_fee,seller_id,
+           seller_username,seller_name,fulfillment_status,delivery_token,delivery_token_generated_at
+         ) VALUES ($1,$2,'TEST DATA — Preview wireless headphones','🎧',45000,1,2500,$3,$4,$5,
+           'new','PREVIEW1234',NOW())`,
+        [orderId, listingId, seller.id, seller.username, "Stallyard Preview Seller"]
+      );
+    }
+
+    let threadResult = await client.query(
+      "SELECT id FROM threads WHERE listing_id = $1 AND buyer_id = $2 AND seller_id = $3 LIMIT 1",
+      [listingId, buyer.id, seller.id]
+    );
+    if (!threadResult.rows.length) {
+      threadResult = await client.query(
+        "INSERT INTO threads (listing_id,buyer_id,seller_id) VALUES ($1,$2,$3) RETURNING id",
+        [listingId, buyer.id, seller.id]
+      );
+    }
+    const threadId = threadResult.rows[0].id;
+    const messageExists = await client.query(
+      "SELECT 1 FROM messages WHERE thread_id = $1 AND body LIKE 'TEST DATA — Welcome to the preview%' LIMIT 1",
+      [threadId]
+    );
+    if (!messageExists.rows.length) {
+      await client.query(
+        `INSERT INTO messages (thread_id,sender_id,message_type,body,order_id)
+         VALUES ($1,$2,'text','TEST DATA — Welcome to the preview conversation. Use these accounts to inspect buyer and seller messaging.', $3)`,
+        [threadId, buyer.id, orderId]
+      );
+    }
+
+    const addPreviewNotification = async (userId, type, message) => {
+      const existing = await client.query("SELECT 1 FROM notifications WHERE user_id=$1 AND message=$2 LIMIT 1", [userId, message]);
+      if (!existing.rows.length) {
+        await client.query("INSERT INTO notifications (user_id,type,message,read) VALUES ($1,$2,$3,false)", [userId, type, message]);
+      }
+    };
+    await addPreviewNotification(buyer.id, "preview", "TEST DATA — Your preview order has been created.");
+    await addPreviewNotification(seller.id, "preview", "TEST DATA — You have a preview order waiting to be prepared.");
+
+    await client.query("COMMIT");
+    console.log("Preview buyer and seller accounts are ready.");
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
 // Final Express safety net for unexpected middleware/route failures. Never send
 // stack traces, SQL text, or provider internals to the browser.
 app.use((err, req, res, next) => {
@@ -12189,6 +12368,7 @@ async function startServer() {
     await ensurePrivateVerificationBucket();
     await protectLegacySellerReports();
     await encryptLegacyTotpSecrets();
+    await ensurePreviewAccounts();
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
       setInterval(sendShipReminders, 60 * 60 * 1000).unref();
