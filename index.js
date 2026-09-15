@@ -2709,6 +2709,57 @@ const SCHEMA_MIGRATIONS = [
     `UPDATE users SET onboarding_intent = CASE WHEN COALESCE(has_applied_to_sell, false) OR COALESCE(casual_seller_status, 'none') <> 'none' OR COALESCE(is_approved, false) THEN 'sell' ELSE 'buy' END
        WHERE onboarding_intent IS NULL OR onboarding_intent NOT IN ('buy','sell')`,
   ] },
+  { version: 73, name: "seller-tier-corrections-and-premium-applications", statements: [
+    `ALTER TABLE users
+       ADD COLUMN IF NOT EXISTS seller_suspended BOOLEAN NOT NULL DEFAULT false,
+       ADD COLUMN IF NOT EXISTS seller_suspended_reason TEXT`,
+    `ALTER TABLE users ALTER COLUMN seller_listing_limit SET DEFAULT 20000000`,
+    `UPDATE users SET seller_listing_limit = 20000000
+       WHERE is_admin = false AND seller_tier = 'verified' AND seller_listing_limit < 20000000`,
+    `UPDATE verified_seller_applications SET requested_limit = 20000000
+       WHERE status = 'pending' AND requested_limit < 20000000`,
+    `CREATE TABLE IF NOT EXISTS premium_seller_applications (
+       id BIGSERIAL PRIMARY KEY,
+       reference TEXT NOT NULL UNIQUE,
+       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+       verified_application_id BIGINT REFERENCES verified_seller_applications(id) ON DELETE RESTRICT,
+       requested_limit NUMERIC(14,2) NOT NULL,
+       supporting_document_path TEXT NOT NULL,
+       requirements_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+       consented_at TIMESTAMP NOT NULL,
+       status TEXT NOT NULL DEFAULT 'pending',
+       decision_reason TEXT,
+       reviewed_by INTEGER REFERENCES users(id) ON DELETE RESTRICT,
+       reviewed_at TIMESTAMP,
+       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_one_pending_premium_seller_application
+       ON premium_seller_applications(user_id) WHERE status = 'pending'`,
+    `CREATE INDEX IF NOT EXISTS idx_premium_seller_admin_queue
+       ON premium_seller_applications(status, created_at DESC)`,
+    `CREATE TABLE IF NOT EXISTS premium_seller_daily_reports (
+       id BIGSERIAL PRIMARY KEY,
+       report_date DATE NOT NULL UNIQUE,
+       application_count INTEGER NOT NULL DEFAULT 0,
+       pdf_storage_path TEXT,
+       pdf_sha256 TEXT,
+       password_encrypted TEXT,
+       email_recipients JSONB NOT NULL DEFAULT '[]'::jsonb,
+       email_status TEXT NOT NULL DEFAULT 'pending',
+       email_error TEXT,
+       emailed_at TIMESTAMP,
+       created_at TIMESTAMP NOT NULL DEFAULT NOW()
+     )`,
+    `ALTER TABLE premium_seller_applications ADD COLUMN IF NOT EXISTS included_in_report_id BIGINT REFERENCES premium_seller_daily_reports(id) ON DELETE SET NULL`,
+    `CREATE TABLE IF NOT EXISTS premium_seller_report_access_log (
+       id BIGSERIAL PRIMARY KEY,
+       report_id BIGINT NOT NULL REFERENCES premium_seller_daily_reports(id) ON DELETE RESTRICT,
+       admin_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+       action TEXT NOT NULL,
+       created_at TIMESTAMP NOT NULL DEFAULT NOW()
+     )`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -3433,7 +3484,7 @@ const USER_PUBLIC_FIELDS = `id, username, display_name, country, account_type, c
   avatar_url, store_bio, store_policies`;
 
 const USER_FULL_FIELDS = `id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, office_location,
-  country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
+  country, is_admin, is_approved, is_verified, is_suspended, seller_suspended, seller_suspended_reason, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
   bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
   is_email_verified, is_phone_verified, admin_role, profile_complete, onboarding_intent, onboarding_completed_at`;
@@ -3502,7 +3553,7 @@ app.get("/users", async (req, res) => {
 });
 
 const USER_RETURNING_FIELDS = `id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, office_location,
-  country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type, id_country,
+  country, is_admin, is_approved, is_verified, is_suspended, seller_suspended, seller_suspended_reason, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
   bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
   is_email_verified, is_phone_verified, token_version, admin_role, casual_seller_status,
@@ -3525,18 +3576,26 @@ app.patch("/users/:id/verify", authenticate, requirePermission("user_management"
 });
 
 app.patch("/users/:id/suspend", authenticate, requirePermission("user_management"), async (req, res) => {
+  const client = await pool.connect();
   try {
     const { isSuspended } = req.body;
-    const result = await pool.query(
+    await client.query("BEGIN");
+    const result = await client.query(
       `UPDATE users SET is_suspended = $1 WHERE id = $2 RETURNING ${USER_RETURNING_FIELDS}`,
       [!!isSuspended, req.params.id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
+    if (result.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "User not found" });
+    }
+    if (isSuspended) await client.query("UPDATE listings SET status='paused' WHERE owner_id=$1 AND status='active'", [req.params.id]);
+    await client.query("COMMIT");
     logAdminAction(req.user.id, "user_suspended", `${isSuspended ? "Suspended" : "Unsuspended"} ${result.rows[0].username}`);
     res.json({ user: result.rows[0] });
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
     sendInternalError(res, err);
-  }
+  } finally { client.release(); }
 });
 
 app.patch("/users/:id/admin-role", authenticate, requirePermission("role_assignment"), async (req, res) => {
@@ -3857,35 +3916,43 @@ app.get("/admin-audit-log", authenticate, requirePermission("role_assignment"), 
 });
 
 app.patch("/users/:id/approve", authenticate, requirePermission("seller_verification"), async (req, res) => {
+  const client = await pool.connect();
   try {
-    const pendingApplication = await pool.query(
-      "SELECT id FROM verified_seller_applications WHERE user_id=$1 AND status='pending' ORDER BY created_at DESC LIMIT 1", [req.params.id]
+    await client.query("BEGIN");
+    const pendingApplication = await client.query(
+      "SELECT id FROM verified_seller_applications WHERE user_id=$1 AND status='pending' ORDER BY created_at DESC LIMIT 1 FOR UPDATE", [req.params.id]
     );
     if (!pendingApplication.rows.length) {
+      await client.query("ROLLBACK");
       return res.status(409).json({ error: "A complete pending verified-seller application is required before approval" });
     }
-    const result = await pool.query(
+    const result = await client.query(
       `UPDATE users SET is_approved = true, verification_status = 'approved', rejection_reason = NULL,
-         seller_tier = 'verified', seller_listing_limit = 10000000
-       WHERE id = $1 RETURNING ${USER_RETURNING_FIELDS}`,
-      [req.params.id]
+         seller_tier = 'verified', seller_listing_limit = $1, seller_suspended=false, seller_suspended_reason=NULL
+       WHERE id = $2 RETURNING ${USER_RETURNING_FIELDS}`,
+      [VERIFIED_SELLER_LIMIT_NGN, req.params.id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
-    await pool.query(
+    if (result.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "User not found" });
+    }
+    await client.query(
       `UPDATE verified_seller_applications SET status='approved', reviewed_by=$1, reviewed_at=NOW(), updated_at=NOW()
-        WHERE id=(SELECT id FROM verified_seller_applications WHERE user_id=$2 AND status='pending' ORDER BY created_at DESC LIMIT 1)`,
-      [req.user.id, req.params.id]
+        WHERE id=$2`,
+      [req.user.id, pendingApplication.rows[0].id]
     );
+    await client.query("COMMIT");
     logAdminAction(req.user.id, "seller_approved", `Approved ${result.rows[0].username}'s seller application`);
     createNotification(
       req.params.id,
       "seller_application",
-      "Your Verified Seller application was approved. You may now maintain up to ₦10,000,000 in combined active listings."
+      "Your Verified Seller application was approved. You may now maintain up to ₦20,000,000 in combined active listings."
     );
     res.json({ user: result.rows[0] });
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
     sendInternalError(res, err);
-  }
+  } finally { client.release(); }
 });
 
 app.patch("/users/:id/reject", authenticate, requirePermission("seller_verification"), async (req, res) => {
@@ -4190,7 +4257,7 @@ app.post("/admin/login", authRateLimit, async (req, res) => {
 // load, so it must never return seller verification documents, bank data,
 // government-ID details, or other private profile records.
 const SESSION_USER_FIELDS = `id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence,
-  country, is_admin, is_approved, is_verified, is_suspended, account_type,
+  country, is_admin, is_approved, is_verified, is_suspended, seller_suspended, seller_suspended_reason, account_type,
   has_applied_to_sell, verification_status, avatar_url, store_bio, store_policies,
   two_factor_enabled, is_email_verified, is_phone_verified, token_version, admin_role,
   casual_seller_status, casual_seller_limit, casual_seller_approved_at, seller_tier, seller_listing_limit,
@@ -5220,7 +5287,9 @@ const LISTING_SUBCATEGORIES = {
 };
 
 const CASUAL_SELLER_LIMIT_NGN = 500000;
-const VERIFIED_SELLER_LIMIT_NGN = 10000000;
+const VERIFIED_SELLER_LIMIT_NGN = 20000000;
+const PREMIUM_SELLER_MIN_LIMIT_NGN = 20000000.01;
+const PREMIUM_SELLER_MAX_LIMIT_NGN = 1000000000;
 const CASUAL_SELLER_ID_TYPES = new Set(["nin", "passport", "drivers_license", "voters_card", "cerpac"]);
 const CASUAL_SELLER_CONSENT_VERSION = "2026-09-12";
 const CASUAL_LIVENESS_TTL_MS = 10 * 60 * 1000;
@@ -5351,12 +5420,15 @@ async function activeListingValue(client, ownerId, excludeListingId = null) {
 
 async function assertSellerMayPublish(client, ownerId, proposedPrice, proposedQuantity, excludeListingId = null) {
   const userResult = await client.query(
-    `SELECT is_approved, casual_seller_status, casual_seller_limit, seller_tier, seller_listing_limit, username, display_name
+    `SELECT is_approved, is_suspended, seller_suspended, casual_seller_status, casual_seller_limit, seller_tier, seller_listing_limit, username, display_name
        FROM users WHERE id = $1 FOR UPDATE`,
     [ownerId]
   );
   if (!userResult.rows.length) throw Object.assign(new Error("Seller account not found"), { statusCode: 404 });
   const seller = userResult.rows[0];
+  if (seller.is_suspended || seller.seller_suspended) {
+    throw Object.assign(new Error("Selling is suspended on this account. Contact Stallyard support."), { statusCode: 403, code: "SELLER_SUSPENDED" });
+  }
   const price = Number(proposedPrice || 0);
   const quantity = Math.max(1, Number(proposedQuantity || 1));
   const current = await activeListingValue(client, ownerId, excludeListingId);
@@ -5758,7 +5830,7 @@ app.patch("/admin/verified-seller-applications/:id/auto-verify", authenticate, r
 
     const userResult = await client.query(
       `UPDATE users SET is_approved = true, verification_status = 'approved', rejection_reason = NULL,
-         seller_tier = 'verified', seller_listing_limit = $1
+         seller_tier = 'verified', seller_listing_limit = $1, seller_suspended=false, seller_suspended_reason=NULL
        WHERE id = $2 RETURNING ${USER_RETURNING_FIELDS}`,
       [VERIFIED_SELLER_LIMIT_NGN, application.user_id]
     );
@@ -5774,7 +5846,7 @@ app.patch("/admin/verified-seller-applications/:id/auto-verify", authenticate, r
     createNotification(
       application.user_id,
       "seller_application",
-      "Your Verified Seller application was approved. You may now maintain up to ₦10,000,000 in combined active listings."
+      "Your Verified Seller application was approved. You may now maintain up to ₦20,000,000 in combined active listings."
     );
     res.json({
       user: userResult.rows[0],
@@ -5837,6 +5909,145 @@ function jpegDimensions(buffer) {
 function pdfText(value) {
   return String(value ?? "").replace(/[^\x20-\x7E]/g, "?").replace(/([\\()])/g, "\\$1");
 }
+
+app.post("/premium-seller/apply", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
+  const client = await pool.connect();
+  const uploadedPaths = [];
+  try {
+    if (req.body?.consent !== true) return res.status(400).json({ error: "Accept the Premium Seller declaration before applying" });
+    const requestedLimit = Number(req.body?.requestedLimit);
+    if (!Number.isFinite(requestedLimit) || requestedLimit < PREMIUM_SELLER_MIN_LIMIT_NGN || requestedLimit > PREMIUM_SELLER_MAX_LIMIT_NGN) {
+      return res.status(400).json({ error: "Choose a requested limit above ₦20,000,000 and no higher than ₦1,000,000,000" });
+    }
+    const document = parsePrivateApplicationDocument(req.body?.supportingDocument, "Premium supporting document");
+    await client.query("BEGIN");
+    const userResult = await client.query(
+      `SELECT id,username,is_approved,is_suspended,seller_suspended,seller_tier,seller_listing_limit,
+              is_email_verified,is_phone_verified,paystack_recipient_code
+         FROM users WHERE id=$1 FOR UPDATE`, [req.user.id]
+    );
+    const user = userResult.rows[0];
+    if (!user || user.is_suspended || user.seller_suspended) throw Object.assign(new Error("This account cannot apply"), { statusCode: 403 });
+    if (!user.is_approved || !["verified", "premium"].includes(user.seller_tier)) throw Object.assign(new Error("Verified Seller approval is required first"), { statusCode: 400 });
+    if (user.seller_tier === "premium") throw Object.assign(new Error("Your account is already a Premium Seller"), { statusCode: 409 });
+    if (!user.is_email_verified || !user.is_phone_verified) throw Object.assign(new Error("Verify your email and phone number first"), { statusCode: 400 });
+    if (!user.paystack_recipient_code) throw Object.assign(new Error("Keep a verified payout bank account before applying"), { statusCode: 400 });
+    const address = await client.query(
+      `SELECT id FROM user_addresses WHERE user_id=$1 AND is_default=true AND street<>'' AND city<>'' AND state<>'' AND LOWER(country)='nigeria' LIMIT 1`,
+      [req.user.id]
+    );
+    if (!address.rows.length) throw Object.assign(new Error("Add a complete default Nigerian address before applying"), { statusCode: 400 });
+    const verifiedApplication = await client.query(
+      "SELECT id FROM verified_seller_applications WHERE user_id=$1 AND status='approved' ORDER BY reviewed_at DESC LIMIT 1", [req.user.id]
+    );
+    if (!verifiedApplication.rows.length) throw Object.assign(new Error("Your approved Verified Seller record was not found"), { statusCode: 400 });
+    const pending = await client.query("SELECT reference FROM premium_seller_applications WHERE user_id=$1 AND status='pending'", [req.user.id]);
+    if (pending.rows.length) throw Object.assign(new Error(`Premium Seller application ${pending.rows[0].reference} is already awaiting review`), { statusCode: 409 });
+    const reference = `PSA-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
+    const path = `user-${req.user.id}/premium-seller/${reference}/support-${document.sha256.slice(0, 12)}.${document.extension}`;
+    await uploadPrivateVerificationObject(path, document.buffer, document.contentType);
+    uploadedPaths.push(path);
+    await client.query(
+      `INSERT INTO premium_seller_applications(reference,user_id,verified_application_id,requested_limit,supporting_document_path,requirements_snapshot,consented_at)
+       VALUES($1,$2,$3,$4,$5,$6,NOW())`,
+      [reference, req.user.id, verifiedApplication.rows[0].id, requestedLimit, path,
+       JSON.stringify({ emailVerified:true, phoneVerified:true, payoutBankVerified:true, addressId:address.rows[0].id, currentTier:user.seller_tier })]
+    );
+    await client.query("COMMIT");
+    createNotification(req.user.id, "seller_application", `Your Premium Seller application ${reference} was submitted for review.`);
+    res.status(201).json({ reference, status:"pending", requestedLimit });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    await Promise.all(uploadedPaths.map((path) => deletePrivateVerificationObject(path))).catch(() => {});
+    if (err.statusCode) return res.status(err.statusCode).json({ error:err.message });
+    if (err.code === "23505") return res.status(409).json({ error:"A Premium Seller application is already pending" });
+    sendInternalError(res, err, "premium seller application");
+  } finally { client.release(); }
+});
+
+app.get("/admin/premium-seller-applications", authenticate, requireSuperAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT a.id,a.reference,a.user_id,a.requested_limit,a.status,a.decision_reason,a.created_at,a.reviewed_at,
+              u.username,u.display_name,u.email,u.phone
+         FROM premium_seller_applications a JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT 500`
+    );
+    res.json({ applications:result.rows });
+  } catch (err) { sendInternalError(res, err); }
+});
+
+app.get("/admin/premium-seller-applications/:id/document", authenticate, requireSuperAdmin, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT reference,supporting_document_path FROM premium_seller_applications WHERE id=$1", [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error:"Application not found" });
+    const bytes = await fetchPrivateVerificationObject(result.rows[0].supporting_document_path);
+    const isPdf = result.rows[0].supporting_document_path.endsWith(".pdf");
+    logAdminAction(req.user.id, "premium_seller_document_viewed", `Viewed supporting document for ${result.rows[0].reference}`);
+    res.setHeader("Content-Type", isPdf ? "application/pdf" : "image/jpeg");
+    res.setHeader("Content-Disposition", `inline; filename="${result.rows[0].reference}-support.${isPdf ? "pdf" : "jpg"}` + '"');
+    res.setHeader("Cache-Control", "private, no-store");
+    res.send(bytes);
+  } catch (err) { sendInternalError(res, err); }
+});
+
+app.patch("/admin/premium-seller-applications/:id/approve", authenticate, requireSuperAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const applicationResult = await client.query("SELECT * FROM premium_seller_applications WHERE id=$1 FOR UPDATE", [req.params.id]);
+    const application = applicationResult.rows[0];
+    if (!application) { await client.query("ROLLBACK"); return res.status(404).json({ error:"Application not found" }); }
+    if (application.status !== "pending") { await client.query("ROLLBACK"); return res.status(409).json({ error:"Only a pending Premium Seller application can be approved" }); }
+    const approvedLimit = Number(req.body?.approvedLimit || application.requested_limit);
+    if (!Number.isFinite(approvedLimit) || approvedLimit < PREMIUM_SELLER_MIN_LIMIT_NGN || approvedLimit > PREMIUM_SELLER_MAX_LIMIT_NGN) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error:"Approved limit must be above ₦20,000,000 and no higher than ₦1,000,000,000" });
+    }
+    const userResult = await client.query(
+      `UPDATE users SET seller_tier='premium',seller_listing_limit=$1,is_approved=true,verification_status='approved',seller_suspended=false,seller_suspended_reason=NULL
+        WHERE id=$2 AND is_suspended=false RETURNING ${USER_RETURNING_FIELDS}`, [approvedLimit, application.user_id]
+    );
+    if (!userResult.rows.length) { await client.query("ROLLBACK"); return res.status(409).json({ error:"The seller account is unavailable or suspended" }); }
+    await client.query("UPDATE premium_seller_applications SET status='approved',decision_reason=$1,reviewed_by=$2,reviewed_at=NOW(),updated_at=NOW() WHERE id=$3",
+      [`Approved with ₦${approvedLimit.toLocaleString("en-NG")} active-listing limit`, req.user.id, application.id]);
+    await client.query("COMMIT");
+    logAdminAction(req.user.id, "premium_seller_approved", `Approved Premium Seller application ${application.reference} with limit NGN ${approvedLimit}`);
+    createNotification(application.user_id, "seller_application", `Your Premium Seller application was approved with a ₦${approvedLimit.toLocaleString("en-NG")} combined active-listing limit.`);
+    res.json({ user:userResult.rows[0], applicationId:application.id, approvedLimit });
+  } catch (err) { await client.query("ROLLBACK").catch(() => {}); sendInternalError(res, err); }
+  finally { client.release(); }
+});
+
+app.patch("/admin/premium-seller-applications/:id/reject", authenticate, requireSuperAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const application = await client.query("SELECT * FROM premium_seller_applications WHERE id=$1 FOR UPDATE", [req.params.id]);
+    if (!application.rows.length) { await client.query("ROLLBACK"); return res.status(404).json({ error:"Application not found" }); }
+    if (application.rows[0].status !== "pending") { await client.query("ROLLBACK"); return res.status(409).json({ error:"Only a pending application can be rejected" }); }
+    const reason = String(req.body?.reason || "Premium Seller application rejected").slice(0,500);
+    await client.query("UPDATE premium_seller_applications SET status='rejected',decision_reason=$1,reviewed_by=$2,reviewed_at=NOW(),updated_at=NOW() WHERE id=$3", [reason,req.user.id,req.params.id]);
+    await client.query("COMMIT");
+    logAdminAction(req.user.id, "premium_seller_rejected", `Rejected Premium Seller application ${application.rows[0].reference}`);
+    createNotification(application.rows[0].user_id, "verification_problem", `Your Premium Seller application needs attention: ${reason}`);
+    res.json({ success:true });
+  } catch (err) { await client.query("ROLLBACK").catch(() => {}); sendInternalError(res, err); }
+  finally { client.release(); }
+});
+
+app.patch("/admin/sellers/:id/reinstate", authenticate, requireSuperAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE users SET seller_suspended=false,seller_suspended_reason=NULL,
+         casual_seller_status=CASE WHEN casual_seller_approved_at IS NOT NULL THEN 'approved' ELSE casual_seller_status END
+       WHERE id=$1 RETURNING ${USER_RETURNING_FIELDS}`, [req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error:"Seller not found" });
+    logAdminAction(req.user.id, "seller_reinstated", `Reinstated selling access for ${result.rows[0].username}`);
+    createNotification(req.params.id, "seller_verified", "Your selling access has been reinstated. Review paused listings before publishing them again.");
+    res.json({ user:result.rows[0] });
+  } catch (err) { sendInternalError(res, err); }
+});
 
 const PDF_PASSWORD_PADDING = Buffer.from([
   0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41, 0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08,
@@ -6004,7 +6215,7 @@ async function buildVerifiedSellerReportPdf(applications, reportDate, reportPass
       `Identification: ${application.id_type || "not provided"}`,
       `Payout account: ${decryptFieldSafe(application.bank_account_name) || "verified account on file"}`,
       `Address: ${[application.address_street, application.address_city, application.address_state].filter(Boolean).join(", ")}`,
-      `Seller level: Verified Seller   Combined active-listing limit: NGN 10,000,000`,
+      `Seller level: Verified Seller   Combined active-listing limit: NGN 20,000,000`,
       `Approved: ${application.reviewed_at ? new Date(application.reviewed_at).toISOString() : "not recorded"}`,
       `Approval method: ${approvalMethod}`,
       `Reviewed by: ${application.reviewer_name || application.reviewer_username || "authorized administrator"}`,
@@ -6027,6 +6238,45 @@ async function buildVerifiedSellerReportPdf(applications, reportDate, reportPass
     const xObjects = imageObjects.map((image, index) => `/Im${index + 1} ${image.imageId} 0 R`).join(" ");
     const pageId = addObject(`<< /Type /Page /Parent ${pagesId} 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 ${fontId} 0 R >> /XObject << ${xObjects} >> >> /Contents ${contentId} 0 R >>`);
     pageIds.push(pageId);
+  }
+  objects[pagesId] = Buffer.from(`<< /Type /Pages /Count ${pageIds.length} /Kids [${pageIds.map((id) => `${id} 0 R`).join(" ")}] >>`);
+  return assemblePdf(objects, catalogId, reportPassword);
+}
+
+async function buildPremiumSellerReportPdf(applications, reportDate, reportPassword) {
+  const objects = [null];
+  const addObject = (value) => { objects.push(Buffer.isBuffer(value) ? value : Buffer.from(value)); return objects.length - 1; };
+  const fontId = addObject("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+  const pagesId = addObject("");
+  const catalogId = addObject(`<< /Type /Catalog /Pages ${pagesId} 0 R >>`);
+  const pageIds = [];
+  for (const application of applications) {
+    const isImage = String(application.supporting_document_path || "").toLowerCase().endsWith(".jpg");
+    let imageId = null, dimensions = null;
+    if (isImage) {
+      const bytes = await fetchPrivateVerificationObject(application.supporting_document_path);
+      dimensions = jpegDimensions(bytes);
+      imageId = addObject(Buffer.concat([Buffer.from(`<< /Type /XObject /Subtype /Image /Width ${dimensions.width} /Height ${dimensions.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${bytes.length} >>\nstream\n`), bytes, Buffer.from("\nendstream")]));
+    }
+    const fullName = [application.last_name, application.first_name, application.other_name].filter(Boolean).join(" ") || application.display_name || application.username;
+    const lines = [
+      `Daily report: ${reportDate}`, `Application: ${application.reference}`, `Seller: ${fullName} (@${application.username})`,
+      `Email: ${application.email || "not provided"}   Phone: ${application.phone || "not provided"}`,
+      `Requested limit: NGN ${Number(application.requested_limit).toLocaleString("en-NG")}`,
+      `Approved: ${application.reviewed_at ? new Date(application.reviewed_at).toISOString() : "not recorded"}`,
+      `Decision: ${application.decision_reason || "Approved by authorized administrator"}`,
+      isImage ? "Supporting document: image reproduced below and original retained securely" : "Supporting document: original PDF retained securely",
+    ];
+    let content = "BT /F1 15 Tf 40 812 Td (Stallyard Premium Seller Approval) Tj ET\n";
+    lines.forEach((line, index) => { content += `BT /F1 9 Tf 40 ${786 - index * 16} Td (${pdfText(line).slice(0, 150)}) Tj ET\n`; });
+    if (imageId && dimensions) {
+      const scale = Math.min(515 / dimensions.width, 520 / dimensions.height);
+      content += `q ${(dimensions.width * scale).toFixed(2)} 0 0 ${(dimensions.height * scale).toFixed(2)} 40 100 cm /Im1 Do Q\n`;
+    }
+    const contentBuffer = Buffer.from(content);
+    const contentId = addObject(Buffer.concat([Buffer.from(`<< /Length ${contentBuffer.length} >>\nstream\n`), contentBuffer, Buffer.from("endstream")]));
+    const resources = imageId ? `/XObject << /Im1 ${imageId} 0 R >>` : "";
+    pageIds.push(addObject(`<< /Type /Page /Parent ${pagesId} 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 ${fontId} 0 R >> ${resources} >> /Contents ${contentId} 0 R >>`));
   }
   objects[pagesId] = Buffer.from(`<< /Type /Pages /Count ${pageIds.length} /Kids [${pageIds.map((id) => `${id} 0 R`).join(" ")}] >>`);
   return assemblePdf(objects, catalogId, reportPassword);
@@ -6179,6 +6429,50 @@ async function sendDailyVerifiedSellerReport(force = false) {
   }
 }
 
+async function sendDailyPremiumSellerReport(force = false) {
+  const { date, hour } = lagosDateParts();
+  if (!force && hour < 8) return { skipped:true, reason:"before_schedule" };
+  const client = await pool.connect();
+  try {
+    await client.query("SELECT pg_advisory_lock($1)", [830500003]);
+    const existing = await client.query("SELECT id,email_status FROM premium_seller_daily_reports WHERE report_date=$1", [date]);
+    if (existing.rows[0]?.email_status === "sent") return { skipped:true, reason:"already_sent" };
+    const applications = await client.query(
+      `SELECT a.*,u.username,u.display_name,u.email,u.phone,u.first_name,u.last_name,u.other_name
+         FROM premium_seller_applications a JOIN users u ON u.id=a.user_id
+        WHERE a.status='approved' AND a.included_in_report_id IS NULL ORDER BY a.reviewed_at,a.id`
+    );
+    if (!applications.rows.length) return { sent:false, applicationCount:0 };
+    const recipientsResult = await client.query("SELECT email FROM users WHERE is_admin=true AND COALESCE(admin_role,'super_admin')='super_admin' AND is_suspended=false AND email IS NOT NULL AND email<>''");
+    const recipients = [...new Set(recipientsResult.rows.map((row) => row.email.toLowerCase()))];
+    if (!recipients.length) throw new Error("No active super-admin email address is configured");
+    const report = await client.query(
+      `INSERT INTO premium_seller_daily_reports(report_date,application_count,email_recipients) VALUES($1,$2,$3)
+       ON CONFLICT(report_date) DO UPDATE SET application_count=EXCLUDED.application_count,email_recipients=EXCLUDED.email_recipients,email_status='pending',email_error=NULL RETURNING id`,
+      [date,applications.rows.length,JSON.stringify(recipients)]
+    );
+    const reportId = report.rows[0].id;
+    const password = `STY-${crypto.randomBytes(9).toString("base64url")}`;
+    const pdf = await buildPremiumSellerReportPdf(applications.rows,date,password);
+    const hash = crypto.createHash("sha256").update(pdf).digest("hex");
+    const path = `daily-reports/${date}/premium-seller-approved-${reportId}-${hash.slice(0,12)}-${crypto.randomBytes(4).toString("hex")}.pdf`;
+    await uploadPrivateVerificationObject(path,pdf,"application/pdf");
+    await client.query("UPDATE premium_seller_daily_reports SET pdf_storage_path=$1,pdf_sha256=$2,password_encrypted=$3 WHERE id=$4",[path,hash,encryptField(password),reportId]);
+    if (!process.env.RESEND_API_KEY) throw new Error("RESEND_API_KEY is not configured");
+    const emailResponse = await fetch("https://api.resend.com/emails",{method:"POST",headers:{"Content-Type":"application/json",Authorization:`Bearer ${process.env.RESEND_API_KEY}`},body:JSON.stringify({from:process.env.RESEND_FROM_EMAIL||"Stallyard <onboarding@resend.dev>",to:recipients,subject:`Stallyard approved Premium Sellers — ${date}`,html:"<p>Attached is the password-protected daily Premium Seller approval report. Retrieve the password from the authorized administration dashboard.</p>",attachments:[{filename:`stallyard-premium-sellers-${date}.pdf`,content:pdf.toString("base64")} ]})});
+    if (!emailResponse.ok) throw new Error(`Premium Seller report email failed (${emailResponse.status})`);
+    await client.query("BEGIN");
+    await client.query("UPDATE premium_seller_daily_reports SET email_status='sent',emailed_at=NOW(),email_error=NULL WHERE id=$1",[reportId]);
+    await client.query("UPDATE premium_seller_applications SET included_in_report_id=$1 WHERE id=ANY($2::bigint[])",[reportId,applications.rows.map((row)=>row.id)]);
+    await client.query("COMMIT");
+    return { sent:true,reportId,applicationCount:applications.rows.length };
+  } catch(err) {
+    await client.query("ROLLBACK").catch(()=>{});
+    await client.query("UPDATE premium_seller_daily_reports SET email_status='failed',email_error=$1 WHERE report_date=$2",[String(err.message).slice(0,500),date]).catch(()=>{});
+    return { sent:false,error:err.message };
+  } finally { await client.query("SELECT pg_advisory_unlock($1)",[830500003]).catch(()=>{}); client.release(); }
+}
+
 async function ensureCasualSellerReportProtected(reportId) {
   const client = await pool.connect();
   let replacementPath = null;
@@ -6307,7 +6601,7 @@ app.patch("/admin/casual-seller-applications/:id/suspend", authenticate, require
     const application = await client.query("SELECT user_id, reference FROM casual_seller_applications WHERE id=$1 FOR UPDATE", [req.params.id]);
     if (!application.rows.length) throw Object.assign(new Error("Application not found"), { statusCode: 404 });
     await client.query("UPDATE casual_seller_applications SET status='suspended', suspended_at=NOW(), decision_reason=$1, updated_at=NOW() WHERE id=$2", [String(req.body?.reason || "Suspended after verification review").slice(0, 500), req.params.id]);
-    await client.query("UPDATE users SET casual_seller_status='suspended', casual_seller_suspended_at=NOW() WHERE id=$1", [application.rows[0].user_id]);
+    await client.query("UPDATE users SET casual_seller_status='suspended', casual_seller_suspended_at=NOW(), seller_suspended=true, seller_suspended_reason=$1 WHERE id=$2", [String(req.body?.reason || "Suspended after verification review").slice(0, 500), application.rows[0].user_id]);
     await client.query("UPDATE listings SET status='paused' WHERE owner_id=$1 AND status='active'", [application.rows[0].user_id]);
     await client.query("COMMIT");
     logAdminAction(req.user.id, "casual_seller_suspended", `Suspended casual seller application ${application.rows[0].reference}`);
@@ -6397,6 +6691,42 @@ app.get("/admin/verified-seller-reports/:id/password", authenticate, requireSupe
 app.post("/admin/verified-seller-reports/run", authenticate, requireSuperAdmin, async (req, res) => {
   const result = await sendDailyVerifiedSellerReport(true);
   if (result.error) return res.status(502).json({ error: "The Verified Seller report could not be completed", details: result.error });
+  res.json(result);
+});
+
+app.get("/admin/premium-seller-reports", authenticate, requireSuperAdmin, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT id,report_date,application_count,email_status,emailed_at,created_at FROM premium_seller_daily_reports ORDER BY report_date DESC LIMIT 365");
+    res.json({ reports:result.rows });
+  } catch (err) { sendInternalError(res,err); }
+});
+
+app.get("/admin/premium-seller-reports/:id/download", authenticate, requireSuperAdmin, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT report_date,pdf_storage_path FROM premium_seller_daily_reports WHERE id=$1",[req.params.id]);
+    if (!result.rows[0]?.pdf_storage_path) return res.status(404).json({ error:"Report file not found" });
+    const pdf = await fetchPrivateVerificationObject(result.rows[0].pdf_storage_path);
+    await pool.query("INSERT INTO premium_seller_report_access_log(report_id,admin_id,action) VALUES($1,$2,'downloaded_pdf')",[req.params.id,req.user.id]);
+    res.setHeader("Content-Type","application/pdf");
+    res.setHeader("Content-Disposition",`attachment; filename="stallyard-premium-sellers-${result.rows[0].report_date}.pdf"`);
+    res.setHeader("Cache-Control","private, no-store");
+    res.send(pdf);
+  } catch (err) { sendInternalError(res,err); }
+});
+
+app.get("/admin/premium-seller-reports/:id/password", authenticate, requireSuperAdmin, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT password_encrypted FROM premium_seller_daily_reports WHERE id=$1",[req.params.id]);
+    if (!result.rows[0]?.password_encrypted) return res.status(404).json({ error:"Report password not found" });
+    await pool.query("INSERT INTO premium_seller_report_access_log(report_id,admin_id,action) VALUES($1,$2,'revealed_password')",[req.params.id,req.user.id]);
+    res.setHeader("Cache-Control","private, no-store");
+    res.json({ password:decryptFieldSafe(result.rows[0].password_encrypted) });
+  } catch (err) { sendInternalError(res,err); }
+});
+
+app.post("/admin/premium-seller-reports/run", authenticate, requireSuperAdmin, async (req, res) => {
+  const result = await sendDailyPremiumSellerReport(true);
+  if (result.error) return res.status(502).json({ error:"The Premium Seller report could not be completed",details:result.error });
   res.json(result);
 });
 
@@ -11367,9 +11697,11 @@ async function startServer() {
       // single daily send at/after 08:00 Africa/Lagos, even across restarts.
       setInterval(() => sendDailyCasualSellerReport(false), 60 * 60 * 1000).unref();
       setInterval(() => sendDailyVerifiedSellerReport(false), 60 * 60 * 1000).unref();
+      setInterval(() => sendDailyPremiumSellerReport(false), 60 * 60 * 1000).unref();
       sendShipReminders();
       sendDailyCasualSellerReport(false);
       sendDailyVerifiedSellerReport(false);
+      sendDailyPremiumSellerReport(false);
     });
   } catch (err) {
     // Fail the deployment instead of starting against a half-migrated schema.
