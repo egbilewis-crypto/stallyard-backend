@@ -3919,7 +3919,7 @@ app.get("/admin-audit-log", authenticate, requirePermission("role_assignment"), 
   }
 });
 
-app.patch("/users/:id/approve", authenticate, requirePermission("seller_verification"), async (req, res) => {
+app.patch("/users/:id/approve", authenticate, requireSuperAdmin, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -3939,6 +3939,11 @@ app.patch("/users/:id/approve", authenticate, requirePermission("seller_verifica
         AND street<>'' AND city<>'' AND state<>'' AND LOWER(country)='nigeria'`,
       [application.address_id, application.user_id]
     );
+    const [idFrontAvailable, idBackAvailable, bankStatementAvailable] = await Promise.all([
+      application.id_front_path ? fetchPrivateVerificationObject(application.id_front_path).then((bytes) => bytes.length > 0).catch(() => false) : false,
+      application.id_back_path ? fetchPrivateVerificationObject(application.id_back_path).then((bytes) => bytes.length > 0).catch(() => false) : true,
+      application.bank_statement_path ? fetchPrivateVerificationObject(application.bank_statement_path).then((bytes) => bytes.length > 0).catch(() => false) : false,
+    ]);
     const failedChecks = [];
     if (application.is_suspended || application.seller_suspended) failedChecks.push("seller account is suspended");
     if (application.casual_seller_status !== "approved") failedChecks.push("Casual Seller approval is no longer active");
@@ -3947,6 +3952,9 @@ app.patch("/users/:id/approve", authenticate, requirePermission("seller_verifica
     if (!address.rows.length) failedChecks.push("complete default Nigerian address is missing");
     if (!CASUAL_SELLER_ID_TYPES.has(application.id_type) || !application.id_front_path) failedChecks.push("accepted identification is missing");
     if (!application.bank_statement_path) failedChecks.push("bank statement is missing");
+    if (application.id_front_path && !idFrontAvailable) failedChecks.push("front identification file is unavailable");
+    if (application.id_back_path && !idBackAvailable) failedChecks.push("back identification file is unavailable");
+    if (application.bank_statement_path && !bankStatementAvailable) failedChecks.push("bank statement file is unavailable");
     if (!application.consented_at) failedChecks.push("seller declaration is missing");
     if (failedChecks.length) {
       await client.query("ROLLBACK");
@@ -5817,7 +5825,7 @@ app.patch("/admin/verified-seller-applications/:id/auto-verify", authenticate, r
   try {
     await client.query("BEGIN");
     const applicationResult = await client.query(
-      `SELECT a.*, u.username, u.is_suspended, u.casual_seller_status,
+      `SELECT a.*, u.username, u.is_suspended, u.seller_suspended, u.casual_seller_status,
               u.is_email_verified, u.is_phone_verified, u.paystack_recipient_code
          FROM verified_seller_applications a
          JOIN users u ON u.id = a.user_id
@@ -5840,8 +5848,13 @@ app.patch("/admin/verified-seller-applications/:id/auto-verify", authenticate, r
           AND street <> '' AND city <> '' AND state <> '' AND LOWER(country) = 'nigeria'`,
       [application.address_id, application.user_id]
     );
+    const [idFrontAvailable, idBackAvailable, bankStatementAvailable] = await Promise.all([
+      application.id_front_path ? fetchPrivateVerificationObject(application.id_front_path).then((bytes) => bytes.length > 0).catch(() => false) : false,
+      application.id_back_path ? fetchPrivateVerificationObject(application.id_back_path).then((bytes) => bytes.length > 0).catch(() => false) : true,
+      application.bank_statement_path ? fetchPrivateVerificationObject(application.bank_statement_path).then((bytes) => bytes.length > 0).catch(() => false) : false,
+    ]);
     const failedChecks = [];
-    if (application.is_suspended) failedChecks.push("account is suspended");
+    if (application.is_suspended || application.seller_suspended) failedChecks.push("seller account is suspended");
     if (application.casual_seller_status !== "approved") failedChecks.push("Casual Seller verification is not approved");
     if (!application.is_email_verified) failedChecks.push("email is not verified");
     if (!application.is_phone_verified) failedChecks.push("phone is not verified");
@@ -5850,6 +5863,9 @@ app.patch("/admin/verified-seller-applications/:id/auto-verify", authenticate, r
     if (!CASUAL_SELLER_ID_TYPES.has(application.id_type)) failedChecks.push("accepted identification type is missing");
     if (!application.id_front_path) failedChecks.push("front identification image is missing");
     if (!application.bank_statement_path) failedChecks.push("bank statement is missing");
+    if (application.id_front_path && !idFrontAvailable) failedChecks.push("front identification file is unavailable");
+    if (application.id_back_path && !idBackAvailable) failedChecks.push("back identification file is unavailable");
+    if (application.bank_statement_path && !bankStatementAvailable) failedChecks.push("bank statement file is unavailable");
     if (!application.consented_at) failedChecks.push("seller declaration was not accepted");
     if (Number(application.requested_limit) !== VERIFIED_SELLER_LIMIT_NGN) failedChecks.push("requested limit is invalid");
     if (failedChecks.length) {
@@ -5863,9 +5879,13 @@ app.patch("/admin/verified-seller-applications/:id/auto-verify", authenticate, r
     const userResult = await client.query(
       `UPDATE users SET is_approved = true, verification_status = 'approved', rejection_reason = NULL,
          seller_tier = 'verified', seller_listing_limit = $1
-       WHERE id = $2 RETURNING ${USER_RETURNING_FIELDS}`,
+       WHERE id = $2 AND is_suspended=false AND seller_suspended=false RETURNING ${USER_RETURNING_FIELDS}`,
       [VERIFIED_SELLER_LIMIT_NGN, application.user_id]
     );
+    if (!userResult.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "The seller account is unavailable or suspended" });
+    }
     await client.query(
       `UPDATE verified_seller_applications
           SET status = 'approved', decision_reason = 'Approved by Super Admin automatic record checks',
