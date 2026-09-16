@@ -11818,10 +11818,10 @@ app.put("/admin/homepage-ads/:slot", authenticate, requireAdmin, async (req, res
       return res.status(400).json({ error: "Invalid homepage ad slot" });
     }
 
-    const imageUrl = String(req.body?.imageUrl || "").trim(); // primary media URL (image or Ad 1 video)
+    const imageUrl = String(req.body?.imageUrl || "").trim(); // desktop image (or legacy Ad 1 video)
     const requestedMediaType = String(req.body?.mediaType || "image").trim().toLowerCase();
     const mediaType = requestedMediaType === "video" ? "video" : requestedMediaType === "image" ? "image" : "";
-    const posterUrl = String(req.body?.posterUrl || "").trim();
+    const posterUrl = String(req.body?.posterUrl || "").trim(); // mobile image (or legacy video poster)
     const linkUrl = String(req.body?.linkUrl || "").trim();
 
     if (!mediaType) {
@@ -11831,7 +11831,7 @@ app.put("/admin/homepage-ads/:slot", authenticate, requireAdmin, async (req, res
       return res.status(400).json({ error: "Only homepage Ad 1 can use video" });
     }
 
-    for (const [url, label] of [[imageUrl, "Ad media"], [posterUrl, "Video poster"]]) {
+    for (const [url, label] of [[imageUrl, "Desktop image"], [posterUrl, "Mobile image"]]) {
       if (!url) continue;
       try {
         const parsed = new URL(url);
@@ -11861,7 +11861,7 @@ app.put("/admin/homepage-ads/:slot", authenticate, requireAdmin, async (req, res
          updated_at = NOW(),
          updated_by = EXCLUDED.updated_by
        RETURNING slot, image_url, media_type, poster_url, link_url, updated_at`,
-      [slot, imageUrl, mediaType, mediaType === "video" ? posterUrl : "", linkUrl, req.user.id]
+      [slot, imageUrl, mediaType, posterUrl, linkUrl, req.user.id]
     );
     logAdminAction(req.user.id, "homepage_ad_updated", `Updated homepage ad slot #${slot}`);
     res.json({ ad: result.rows[0] });
