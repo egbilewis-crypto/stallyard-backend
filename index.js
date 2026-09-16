@@ -249,7 +249,7 @@ async function authenticate(req, res, next) {
   }
   try {
     const result = await pool.query(
-      "SELECT is_admin, is_suspended, token_version, admin_role, two_factor_enabled, country, profile_complete FROM users WHERE id = $1",
+      "SELECT is_admin, is_suspended, is_preview, token_version, admin_role, two_factor_enabled, country, profile_complete FROM users WHERE id = $1",
       [requester.id]
     );
     if (result.rows.length === 0) {
@@ -269,6 +269,7 @@ async function authenticate(req, res, next) {
       twoFactorEnabled: !!result.rows[0].two_factor_enabled,
       country: result.rows[0].country || "",
       profileComplete: !!result.rows[0].profile_complete,
+      isPreview: !!result.rows[0].is_preview,
     };
 
     if (req.user.isAdmin) {
@@ -318,6 +319,16 @@ function rejectAdminMarketplaceUse(req, res, next) {
     return res.status(403).json({
       error: "Admin accounts are staff-only and cannot use buyer or seller marketplace features.",
       code: "ADMIN_STAFF_ONLY",
+    });
+  }
+  next();
+}
+
+function rejectPreviewRealWorldAction(req, res, next) {
+  if (req.user?.isPreview) {
+    return res.status(403).json({
+      error: "Preview accounts cannot publish listings, make real payments, request refunds, change payout details, or withdraw money.",
+      code: "PREVIEW_ACCOUNT_RESTRICTED",
     });
   }
   next();
@@ -2961,7 +2972,14 @@ const SCHEMA_MIGRATIONS = [
        ADD COLUMN IF NOT EXISTS refund_status TEXT,
        ADD COLUMN IF NOT EXISTS paystack_refund_id BIGINT,
        ADD COLUMN IF NOT EXISTS refund_requested_at TIMESTAMP,
-       ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMP`,
+      ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMP`,
+  ] },
+  { version: 77, name: "isolate-preview-accounts", statements: [
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
+    `ALTER TABLE listings ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
+    `ALTER TABLE orders ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
+    `CREATE INDEX IF NOT EXISTS idx_users_is_preview ON users(is_preview)`,
+    `CREATE INDEX IF NOT EXISTS idx_orders_is_preview ON orders(is_preview)`,
   ] },
 ];
 
@@ -4501,7 +4519,7 @@ app.post("/admin/login", authRateLimit, async (req, res) => {
 // load, so it must never return seller verification documents, bank data,
 // government-ID details, or other private profile records.
 const SESSION_USER_FIELDS = `id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence,
-  country, is_admin, is_approved, is_verified, is_suspended, seller_suspended, seller_suspended_reason, account_type,
+  country, is_admin, is_approved, is_verified, is_suspended, is_preview, seller_suspended, seller_suspended_reason, account_type,
   has_applied_to_sell, verification_status, avatar_url, store_bio, store_policies,
   two_factor_enabled, is_email_verified, is_phone_verified, token_version, admin_role,
   casual_seller_status, casual_seller_limit, casual_seller_approved_at, seller_tier, seller_listing_limit,
@@ -5737,7 +5755,7 @@ app.get("/casual-seller/status", authenticate, rejectAdminMarketplaceUse, async 
   } catch (err) { sendInternalError(res, err); }
 });
 
-app.post("/casual-seller/rekognition/session", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireVerifiedEmailAndPhone, requireNigeriaMarketplaceUser, requireCasualVerificationAvailable,
+app.post("/casual-seller/rekognition/session", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, requireCompleteProfile, requireVerifiedEmailAndPhone, requireNigeriaMarketplaceUser, requireCasualVerificationAvailable,
   rekognitionSessionUserLimit, rekognitionSessionIpLimit, async (req, res) => {
     try {
       const roleArn = String(process.env.AWS_LIVENESS_ROLE_ARN || "").trim();
@@ -5774,7 +5792,7 @@ app.post("/casual-seller/rekognition/session", authenticate, rejectAdminMarketpl
   }
 );
 
-app.post("/casual-seller/rekognition/complete", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireVerifiedEmailAndPhone, requireNigeriaMarketplaceUser, requireCasualVerificationAvailable, async (req, res) => {
+app.post("/casual-seller/rekognition/complete", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, requireCompleteProfile, requireVerifiedEmailAndPhone, requireNigeriaMarketplaceUser, requireCasualVerificationAvailable, async (req, res) => {
   try {
     const issued = await getSecurityState("rekognition-liveness-session", req.user.id);
     const sessionId = String(req.body?.sessionId || "");
@@ -5798,7 +5816,7 @@ app.post("/casual-seller/rekognition/complete", authenticate, rejectAdminMarketp
   } catch (err) { sendInternalError(res, err, "complete Rekognition liveness session"); }
 });
 
-app.post("/casual-seller/challenge", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireVerifiedEmailAndPhone, requireNigeriaMarketplaceUser, requireCasualVerificationAvailable, async (req, res) => {
+app.post("/casual-seller/challenge", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, requireCompleteProfile, requireVerifiedEmailAndPhone, requireNigeriaMarketplaceUser, requireCasualVerificationAvailable, async (req, res) => {
   try {
     const poolValues = ["blink", "turn_left", "turn_right", "smile", "move_closer"];
     for (let index = poolValues.length - 1; index > 0; index--) {
@@ -5813,7 +5831,7 @@ app.post("/casual-seller/challenge", authenticate, rejectAdminMarketplaceUse, re
   } catch (err) { sendInternalError(res, err, "casual seller liveness challenge"); }
 });
 
-app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
+app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   const client = await pool.connect();
   const uploadedPaths = [];
   try {
@@ -5975,7 +5993,7 @@ function parsePrivateApplicationDocument(dataUrl, label) {
   return { buffer, contentType: match[1], extension: match[1] === "application/pdf" ? "pdf" : "jpg", sha256: crypto.createHash("sha256").update(buffer).digest("hex") };
 }
 
-app.post("/verified-seller/apply", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
+app.post("/verified-seller/apply", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   const client = await pool.connect();
   const uploadedPaths = [];
   try {
@@ -6045,7 +6063,9 @@ app.get("/admin/verified-seller-applications", authenticate, requireSuperAdmin, 
       `SELECT a.id,a.reference,a.user_id,a.requested_limit,a.requirements_snapshot,a.status,a.decision_reason,
               a.id_type,(a.id_back_path IS NOT NULL) AS has_id_back,
               a.created_at,a.reviewed_at,u.username,u.display_name,u.email,u.phone
-         FROM verified_seller_applications a JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT 500`
+         FROM verified_seller_applications a JOIN users u ON u.id=a.user_id
+        WHERE u.is_preview=false
+        ORDER BY a.created_at DESC LIMIT 500`
     );
     res.json({ applications: result.rows });
   } catch (err) { sendInternalError(res, err); }
@@ -6193,7 +6213,7 @@ function pdfText(value) {
   return String(value ?? "").replace(/[^\x20-\x7E]/g, "?").replace(/([\\()])/g, "\\$1");
 }
 
-app.post("/premium-seller/apply", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
+app.post("/premium-seller/apply", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   const client = await pool.connect();
   const uploadedPaths = [];
   try {
@@ -6253,7 +6273,9 @@ app.get("/admin/premium-seller-applications", authenticate, requireSuperAdmin, a
     const result = await pool.query(
       `SELECT a.id,a.reference,a.user_id,a.requested_limit,a.status,a.decision_reason,a.created_at,a.reviewed_at,
               u.username,u.display_name,u.email,u.phone
-         FROM premium_seller_applications a JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT 500`
+         FROM premium_seller_applications a JOIN users u ON u.id=a.user_id
+        WHERE u.is_preview=false
+        ORDER BY a.created_at DESC LIMIT 500`
     );
     res.json({ applications:result.rows });
   } catch (err) { sendInternalError(res, err); }
@@ -6616,7 +6638,7 @@ async function sendDailyCasualSellerReport(force = false) {
     const applicationsResult = await lockClient.query(
       `SELECT a.*, u.username, u.email, u.phone
          FROM casual_seller_applications a JOIN users u ON u.id = a.user_id
-        WHERE a.status = 'approved' AND a.included_in_report_id IS NULL
+        WHERE a.status = 'approved' AND a.included_in_report_id IS NULL AND u.is_preview = false
         ORDER BY a.approved_at, a.id`
     );
     if (!applicationsResult.rows.length) return { skipped: true, reason: "no_applications" };
@@ -6689,7 +6711,7 @@ async function sendDailyVerifiedSellerReport(force = false) {
          JOIN users u ON u.id = a.user_id
          LEFT JOIN user_addresses addr ON addr.id = a.address_id
          LEFT JOIN users reviewer ON reviewer.id = a.reviewed_by
-        WHERE a.status = 'approved' AND a.included_in_report_id IS NULL
+        WHERE a.status = 'approved' AND a.included_in_report_id IS NULL AND u.is_preview = false
         ORDER BY a.reviewed_at, a.id`
     );
     if (!applicationsResult.rows.length) return { skipped: true, reason: "no_applications" };
@@ -6756,7 +6778,7 @@ async function sendDailyPremiumSellerReport(force = false) {
     const applications = await client.query(
       `SELECT a.*,u.username,u.display_name,u.email,u.phone,u.first_name,u.last_name,u.other_name
          FROM premium_seller_applications a JOIN users u ON u.id=a.user_id
-        WHERE a.status='approved' AND a.included_in_report_id IS NULL ORDER BY a.reviewed_at,a.id`
+        WHERE a.status='approved' AND a.included_in_report_id IS NULL AND u.is_preview=false ORDER BY a.reviewed_at,a.id`
     );
     if (!applications.rows.length) return { sent:false, applicationCount:0 };
     const recipientsResult = await client.query("SELECT email FROM users WHERE is_admin=true AND COALESCE(admin_role,'super_admin')='super_admin' AND is_suspended=false AND email IS NOT NULL AND email<>''");
@@ -6890,7 +6912,9 @@ app.get("/admin/casual-seller-applications", authenticate, requireSuperAdmin, as
               a.id_expiration, a.status, a.decision_reason, a.automatic_checks, a.liveness_challenges,
               a.approved_at, a.suspended_at, a.created_at, u.username, u.email, u.phone,
               ARRAY(SELECT jsonb_object_keys(a.evidence_paths)) AS evidence_keys
-         FROM casual_seller_applications a JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT 500`
+         FROM casual_seller_applications a JOIN users u ON u.id=a.user_id
+        WHERE u.is_preview=false
+        ORDER BY a.created_at DESC LIMIT 500`
     );
     res.json({ applications: result.rows });
   } catch (err) { sendInternalError(res, err); }
@@ -7047,7 +7071,7 @@ app.post("/admin/premium-seller-reports/run", authenticate, requireSuperAdmin, a
   res.json(result);
 });
 
-app.post("/listings", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
+app.post("/listings", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   const client = await pool.connect();
   try {
     const {
@@ -7185,6 +7209,8 @@ app.get("/listings", async (req, res) => {
               OR users.casual_seller_status = 'approved')
          AND users.is_suspended = false
          AND users.seller_suspended = false
+         AND users.is_preview = false
+         AND listings.is_preview = false
        )
        OR ($1::integer IS NOT NULL AND listings.owner_id = $1)
        ORDER BY listings.created_at DESC`,
@@ -7518,7 +7544,7 @@ app.post("/checkout", authenticate, rejectAdminMarketplaceUse, requireCompletePr
   });
 });
 
-app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
+app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   try {
     const { items, shippingAddress, currency, saveCard } = req.body;
     if (!isNigeriaCountry(shippingAddress?.country)) {
@@ -7646,7 +7672,7 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, requir
   }
 });
 
-app.post("/checkout/verify/:reference", authenticate, async (req, res) => {
+app.post("/checkout/verify/:reference", authenticate, rejectPreviewRealWorldAction, async (req, res) => {
   try {
     if (!process.env.PAYSTACK_SECRET_KEY) {
       return res.status(500).json({ error: "Payments aren't configured — contact support" });
@@ -7707,7 +7733,7 @@ app.post("/checkout/verify/:reference", authenticate, async (req, res) => {
   }
 });
 
-app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
+app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   try {
     const { items, shippingAddress, currency, cardId } = req.body;
     if (!isNigeriaCountry(shippingAddress?.country)) {
@@ -8118,7 +8144,7 @@ app.patch("/orders/:id/release", authenticate, requirePermission("finance"), asy
   }
 });
 
-app.post("/orders/:id/buyer-cancel-refund", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+app.post("/orders/:id/buyer-cancel-refund", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, async (req, res) => {
   const client = await pool.connect();
   let order;
   try {
@@ -9481,7 +9507,7 @@ app.post("/order-items/:id/redeem-delivery-token", authenticate, codeRateLimit, 
     const { token } = req.body;
     if (!token) return res.status(400).json({ error: "Enter the code the buyer gave you" });
     const existing = await pool.query(
-      `SELECT oi.*, o.payment_status, o.is_disputed
+      `SELECT oi.*, o.payment_status, o.is_disputed, o.is_preview
        FROM order_items oi
        JOIN orders o ON oi.order_id = o.id
        WHERE oi.id = $1`,
@@ -9489,6 +9515,9 @@ app.post("/order-items/:id/redeem-delivery-token", authenticate, codeRateLimit, 
     );
     if (existing.rows.length === 0) return res.status(404).json({ error: "Order item not found" });
     const item = existing.rows[0];
+    if (item.is_preview) {
+      return res.status(403).json({ error: "Preview delivery tokens cannot release real money", code: "PREVIEW_ACCOUNT_RESTRICTED" });
+    }
     if (item.seller_id !== req.user.id) {
       return res.status(403).json({ error: "Only the seller for this item can redeem the buyer's delivery code" });
     }
@@ -9785,7 +9814,7 @@ async function resolvePaystackBankAccount(userId, bankCode, accountNumber) {
   };
 }
 
-app.post("/paystack/resolve-account", authenticate, rejectAdminMarketplaceUse, bankAccountResolveRateLimit, async (req, res) => {
+app.post("/paystack/resolve-account", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, bankAccountResolveRateLimit, async (req, res) => {
   try {
     const result = await resolvePaystackBankAccount(req.user.id, req.body?.bankCode, req.body?.accountNumber);
     if (result.error) return res.status(result.status).json({ error: result.error });
@@ -9832,6 +9861,7 @@ async function verifyAndSaveBankDetails(userId, bankCode, accountNumber, expecte
 app.post(
   "/sellers/bank-details",
   authenticate,
+  rejectPreviewRealWorldAction,
   bankChangeSendIpRateLimit,
   bankChangeSendUserRateLimit,
   async (req, res) => {
@@ -9863,10 +9893,11 @@ app.post(
     }
 
     const existing = await pool.query(
-      "SELECT account_number, email, username, display_name, is_admin, is_approved FROM users WHERE id = $1",
+      "SELECT account_number, email, username, display_name, is_admin, is_approved, is_preview FROM users WHERE id = $1",
       [targetUserId]
     );
     if (existing.rows.length === 0) return res.status(404).json({ error: "User not found" });
+    if (existing.rows[0].is_preview) return res.status(403).json({ error: "Preview accounts cannot store payout bank details" });
 
     // Admin override is only for marketplace sellers, never another staff
     // account. Staff/admin identities are deliberately separated from seller
@@ -9963,6 +9994,7 @@ app.post(
 app.post(
   "/sellers/bank-details/confirm",
   authenticate,
+  rejectPreviewRealWorldAction,
   bankChangeConfirmRateLimit,
   async (req, res) => {
   try {
@@ -10029,7 +10061,8 @@ async function queueAutomaticSellerPayouts(orderId, onlySellerId = null) {
     `SELECT oi.seller_id,
        ROUND(SUM((oi.price * oi.qty) - (oi.price * oi.qty * o.commission_rate) + (oi.shipping_fee * oi.qty))::numeric, 2) AS amount
      FROM order_items oi JOIN orders o ON o.id = oi.order_id
-     WHERE o.id = $1 AND o.payment_status IN ('held', 'released') AND COALESCE(o.is_disputed, false) = false
+     WHERE o.id = $1 AND o.is_preview = false
+       AND o.payment_status IN ('held', 'released') AND COALESCE(o.is_disputed, false) = false
        AND ($2::int IS NULL OR oi.seller_id = $2)
        AND oi.fulfillment_status NOT IN ('cancelled', 'returned')
        AND NOT EXISTS (
@@ -10127,7 +10160,11 @@ app.post("/seller-payouts/:id/retry", authenticate, requirePermission("finance")
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "Only confirmed failed, reversed, or bank-details-required payouts can be retried" });
     }
-    const userResult = await client.query("SELECT paystack_recipient_code FROM users WHERE id = $1", [payout.seller_id]);
+    const userResult = await client.query("SELECT paystack_recipient_code, is_preview FROM users WHERE id = $1", [payout.seller_id]);
+    if (userResult.rows[0]?.is_preview) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Preview-account payouts cannot be retried" });
+    }
     const encryptedRecipient = userResult.rows[0]?.paystack_recipient_code;
     if (!encryptedRecipient) {
       await client.query("ROLLBACK");
@@ -10184,10 +10221,13 @@ app.post("/sellers/payout", authenticate, requirePermission("finance"), async (r
     }
 
     const userResult = await pool.query(
-      "SELECT paystack_recipient_code FROM users WHERE id = $1",
+      "SELECT paystack_recipient_code, is_preview FROM users WHERE id = $1",
       [userId]
     );
 
+    if (userResult.rows[0]?.is_preview) {
+      return res.status(403).json({ error: "Preview accounts cannot receive real payouts" });
+    }
     if (userResult.rows.length === 0 || !userResult.rows[0].paystack_recipient_code) {
       return res.status(400).json({ error: "This seller hasn't added bank details yet" });
     }
@@ -10216,7 +10256,7 @@ async function computeAvailableBalance(client, sellerId) {
            ELSE 0 END) AS seller_proceeds
        FROM order_items oi
        JOIN orders o ON oi.order_id = o.id
-       WHERE oi.seller_id = $1 AND o.payment_status = 'released'
+       WHERE oi.seller_id = $1 AND o.payment_status = 'released' AND o.is_preview = false
        GROUP BY o.id, o.refund_type, o.refund_amount
      )
      SELECT COALESCE(SUM(
@@ -10237,7 +10277,7 @@ async function computeAvailableBalance(client, sellerId) {
   return Math.max(0, Math.round((released - reserved) * 100) / 100);
 }
 
-app.post("/withdrawals", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+app.post("/withdrawals", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, async (req, res) => {
   const client = await pool.connect();
   try {
     const amount = Math.round(Number(req.body.amount) * 100) / 100;
@@ -10359,6 +10399,7 @@ app.get("/admin/buyer-risk", authenticate, requirePermission("user_management"),
         (SELECT COALESCE(SUM(o.total), 0) FROM orders o WHERE o.buyer_id = u.id) AS lifetime_spend
       FROM users u
       WHERE u.is_admin = false
+        AND u.is_preview = false
         AND EXISTS (SELECT 1 FROM orders o WHERE o.buyer_id = u.id)
       ORDER BY u.display_name ASC, u.username ASC
     `);
@@ -10515,6 +10556,7 @@ app.get("/admin/seller-performance", authenticate, requirePermission("seller_ver
         (SELECT COALESCE(SUM(amount), 0) FROM withdrawals w WHERE w.seller_id = u.id AND w.status = 'failed') AS failed_withdrawal_amount
       FROM users u
       WHERE u.is_admin = false
+        AND u.is_preview = false
         AND (
           u.is_approved = true
           OR u.has_applied_to_sell = true
@@ -10705,7 +10747,7 @@ app.get("/admin/reports/:type", authenticate, async (req, res) => {
                COALESCE(SUM(oi.qty), 0) AS item_quantity
         FROM orders o
         LEFT JOIN order_items oi ON oi.order_id = o.id
-        ${where}
+        ${where ? where + " AND o.is_preview = false" : "WHERE o.is_preview = false"}
         GROUP BY o.id
         ORDER BY o.created_at DESC
         LIMIT 10000
@@ -10775,7 +10817,8 @@ app.get("/admin/reports/:type", authenticate, async (req, res) => {
         SELECT w.id, w.seller_username, w.amount, w.status, w.failure_reason,
                w.paystack_transfer_code, w.requested_at, w.processed_at
         FROM withdrawals w
-        ${where}
+        JOIN users u ON u.id=w.seller_id
+        ${where}${where ? " AND" : " WHERE"} u.is_preview=false
         ORDER BY w.requested_at DESC
         LIMIT 10000
       `, params);
@@ -10811,7 +10854,7 @@ app.get("/admin/reports/:type", authenticate, async (req, res) => {
                COALESCE((SELECT AVG(rv.rating) FROM reviews rv WHERE rv.seller_id = u.id), 0) AS avg_rating,
                COALESCE((SELECT COUNT(*) FROM reviews rv WHERE rv.seller_id = u.id), 0) AS review_count
         FROM users u
-        ${where ? where + " AND (u.has_applied_to_sell = true OR u.is_approved = true)" : "WHERE (u.has_applied_to_sell = true OR u.is_approved = true)"}
+        ${where ? where + " AND u.is_preview = false AND (u.has_applied_to_sell = true OR u.is_approved = true)" : "WHERE u.is_preview = false AND (u.has_applied_to_sell = true OR u.is_approved = true)"}
         ORDER BY u.created_at DESC
         LIMIT 10000
       `, params);
@@ -10868,13 +10911,16 @@ app.get("/admin/reconciliation", authenticate, requirePermission("finance"), asy
         ) AS missing_pod_count
       FROM orders o
       LEFT JOIN order_items oi ON oi.order_id = o.id
+      WHERE o.is_preview = false
       GROUP BY o.id
       ORDER BY o.created_at DESC
       LIMIT 500
     `);
     const withdrawalsResult = await pool.query(`
       SELECT status, COALESCE(SUM(amount), 0) AS amount, COUNT(*) AS count
-      FROM withdrawals
+      FROM withdrawals w
+      JOIN users u ON u.id=w.seller_id
+      WHERE u.is_preview=false
       GROUP BY status
     `);
 
@@ -12161,10 +12207,11 @@ app.patch("/notifications/mark-all-read", authenticate, async (req, res) => {
 async function sendShipReminders() {
   try {
     const result = await pool.query(
-      `SELECT * FROM order_items
-       WHERE fulfillment_status = 'new'
-         AND ship_reminder_sent_at IS NULL
-         AND created_at < NOW() - INTERVAL '24 hours'`
+      `SELECT oi.* FROM order_items oi JOIN orders o ON o.id = oi.order_id
+       WHERE oi.fulfillment_status = 'new'
+         AND o.is_preview = false
+         AND oi.ship_reminder_sent_at IS NULL
+         AND oi.created_at < NOW() - INTERVAL '24 hours'`
     );
     for (const item of result.rows) {
       createNotification(item.seller_id, "ship_reminder", `Reminder: "${item.title}" hasn't shipped yet`);
@@ -12207,11 +12254,11 @@ async function ensurePreviewAccounts() {
            is_admin, is_approved, is_verified, verification_status,
            is_email_verified, is_phone_verified, profile_complete,
            onboarding_intent, onboarding_completed_at, casual_seller_status,
-           seller_tier, seller_listing_limit, is_suspended, seller_suspended
+           seller_tier, seller_listing_limit, is_suspended, seller_suspended, is_preview
          ) VALUES (
            $1,$2,$3,$4,'Preview','Account','1990-01-01','prefer_not_to_say',
-           'Nigerian','Lagos','Nigeria',false,$6,$6,$7,true,true,true,$5,NOW(),
-           $8,$9,$10,false,false
+           'Nigerian','Lagos','Nigeria',false,false,false,'none',true,true,true,$5,NOW(),
+           $6,$7,$8,false,false,true
          )
          ON CONFLICT (username) DO UPDATE SET
            password_hash = EXCLUDED.password_hash,
@@ -12223,15 +12270,14 @@ async function ensurePreviewAccounts() {
            casual_seller_status = EXCLUDED.casual_seller_status,
            seller_tier = EXCLUDED.seller_tier,
            seller_listing_limit = EXCLUDED.seller_listing_limit,
-           is_suspended = false, seller_suspended = false,
+           is_suspended = false, seller_suspended = false, is_preview = true,
            token_version = COALESCE(users.token_version, 0) + 1
          RETURNING id, username`,
         [
-          username, email, passwordHash, displayName, intent, seller,
+          username, email, passwordHash, displayName, intent,
           seller ? "approved" : "none",
-          seller ? "approved" : "none",
-          seller ? "verified" : "buyer",
-          seller ? VERIFIED_SELLER_LIMIT_NGN : 0,
+          seller ? "casual" : "buyer",
+          seller ? CASUAL_SELLER_LIMIT_NGN : 0,
         ]
       );
       return result.rows[0];
@@ -12262,16 +12308,17 @@ async function ensurePreviewAccounts() {
       listingResult = await client.query(
         `INSERT INTO listings (
            owner_id,title,description,price,category,subcategory,condition,shipping_fee,
-           emoji,images,listing_type,currency,status,quantity,sku,brand,state,shipping_methods,return_policy
+           emoji,images,listing_type,currency,status,quantity,sku,brand,state,shipping_methods,return_policy,is_preview
          ) VALUES ($1,'TEST DATA — Preview wireless headphones',
            'Private preview listing. This draft is not visible in the marketplace.',45000,
            'Electronics','Audio & Headphones','New',2500,'🎧','[]'::jsonb,'fixed','NGN',
            'draft',3,'STALLYARD-PREVIEW-ONLY','Stallyard Preview','Lagos','[]'::jsonb,
-           'Preview data only') RETURNING id`,
+           'Preview data only',true) RETURNING id`,
         [seller.id]
       );
     }
     const listingId = listingResult.rows[0].id;
+    await client.query("UPDATE listings SET status='draft', is_preview=true WHERE id=$1", [listingId]);
 
     let orderResult = await client.query(
       "SELECT id FROM orders WHERE buyer_id = $1 AND shipping_address->>'previewData' = 'true' LIMIT 1 FOR UPDATE",
@@ -12281,8 +12328,8 @@ async function ensurePreviewAccounts() {
       orderResult = await client.query(
         `INSERT INTO orders (
            buyer_id,buyer_username,total,currency,shipping_address,subtotal,shipping_total,
-           commission_rate,commission_amount,tax_amount,payment_status,is_disputed,created_at
-         ) VALUES ($1,$2,47500,'NGN',$3::jsonb,45000,2500,0.05,2250,0,'held',false,NOW())
+           commission_rate,commission_amount,tax_amount,payment_status,is_disputed,created_at,is_preview
+         ) VALUES ($1,$2,47500,'NGN',$3::jsonb,45000,2500,0.05,2250,0,'held',false,NOW(),true)
          RETURNING id`,
         [buyer.id, buyer.username, JSON.stringify({
           previewData: true,
@@ -12296,6 +12343,7 @@ async function ensurePreviewAccounts() {
       );
     }
     const orderId = orderResult.rows[0].id;
+    await client.query("UPDATE orders SET is_preview=true, paystack_reference=NULL WHERE id=$1", [orderId]);
 
     const itemResult = await client.query(
       "SELECT id FROM order_items WHERE order_id = $1 AND listing_id = $2 LIMIT 1",
