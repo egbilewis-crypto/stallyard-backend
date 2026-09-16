@@ -249,7 +249,7 @@ async function authenticate(req, res, next) {
   }
   try {
     const result = await pool.query(
-      "SELECT is_admin, is_suspended, is_preview, token_version, admin_role, two_factor_enabled, country, profile_complete FROM users WHERE id = $1",
+      "SELECT is_admin, is_suspended, token_version, admin_role, two_factor_enabled, country, profile_complete FROM users WHERE id = $1",
       [requester.id]
     );
     if (result.rows.length === 0) {
@@ -269,7 +269,6 @@ async function authenticate(req, res, next) {
       twoFactorEnabled: !!result.rows[0].two_factor_enabled,
       country: result.rows[0].country || "",
       profileComplete: !!result.rows[0].profile_complete,
-      isPreview: !!result.rows[0].is_preview,
     };
 
     if (req.user.isAdmin) {
@@ -324,16 +323,6 @@ function rejectAdminMarketplaceUse(req, res, next) {
   next();
 }
 
-function rejectPreviewRealWorldAction(req, res, next) {
-  if (req.user?.isPreview) {
-    return res.status(403).json({
-      error: "Preview accounts cannot publish listings, make real payments, request refunds, change payout details, or withdraw money.",
-      code: "PREVIEW_ACCOUNT_RESTRICTED",
-    });
-  }
-  next();
-}
-
 function isNigeriaCountry(value) {
   return ["nigeria", "ng"].includes(String(value || "").trim().toLowerCase());
 }
@@ -372,26 +361,6 @@ async function requireVerifiedEmailAndPhone(req, res, next) {
         emailVerified: !!account?.is_email_verified,
         phoneVerified: !!account?.is_phone_verified,
       });
-    }
-    next();
-  } catch (err) {
-    sendInternalError(res, err);
-  }
-}
-
-async function requireCasualVerificationAvailable(req, res, next) {
-  try {
-    const result = await pool.query(
-      `SELECT is_approved, is_suspended, seller_suspended, casual_seller_status
-         FROM users WHERE id=$1 LIMIT 1`,
-      [req.user.id]
-    );
-    const account = result.rows[0];
-    if (!account || account.is_suspended || account.seller_suspended || account.casual_seller_status === "suspended") {
-      return res.status(403).json({ error: "Seller verification is unavailable while this account is suspended", code: "SELLER_SUSPENDED" });
-    }
-    if (account.is_approved || account.casual_seller_status === "approved") {
-      return res.status(409).json({ error: "Your seller verification is already approved", code: "SELLER_ALREADY_APPROVED" });
     }
     next();
   } catch (err) {
@@ -513,11 +482,7 @@ const authRateLimit = rateLimit({ scope: "auth", windowMs: 15 * 60 * 1000, max: 
 async function createNotification(userId, type, message) {
   if (!userId) return;
   try {
-    await pool.query(
-      `INSERT INTO notifications (user_id, type, message, is_preview)
-       SELECT id, $2, $3, is_preview FROM users WHERE id=$1`,
-      [userId, type, message]
-    );
+    await pool.query("INSERT INTO notifications (user_id, type, message) VALUES ($1, $2, $3)", [userId, type, message]);
   } catch (err) {
     console.error("Failed to create notification:", err.message);
   }
@@ -604,40 +569,17 @@ async function createCheckoutIntent({ reference, buyerId, buyerUsername, buyerEm
 const CHECKOUT_RESERVATION_MINUTES = 15;
 
 async function reserveCheckoutListings(client, { buyerId, reference, items }) {
-  const requestedByListing = new Map();
-  for (const item of items || []) {
-    const listingId = Number(item.listingId);
-    const qty = Number(item.qty);
-    if (Number.isInteger(listingId) && Number.isInteger(qty) && qty > 0) {
-      requestedByListing.set(listingId, (requestedByListing.get(listingId) || 0) + qty);
-    }
-  }
-  const listingIds = [...requestedByListing.keys()].sort((a, b) => a - b);
+  const listingIds = [...new Set((items || []).map((item) => Number(item.listingId)))].filter(Number.isInteger).sort((a, b) => a - b);
   if (!listingIds.length) throw new Error("Checkout has no valid listings to reserve");
 
   for (const listingId of listingIds) {
     // Lock the listing row so two checkout transactions cannot reserve it simultaneously.
     const listingResult = await client.query(
-      `SELECT listings.id, listings.status, listings.quantity FROM listings
-        JOIN users ON users.id = listings.owner_id
-       WHERE listings.id = $1
-         AND listings.is_preview = false
-         AND users.is_preview = false
-         AND users.is_suspended = false
-         AND users.seller_suspended = false
-         AND ((users.is_approved = true AND users.seller_tier IN ('verified', 'premium'))
-              OR users.casual_seller_status = 'approved')
-       FOR UPDATE OF listings, users`,
+      "SELECT id, status FROM listings WHERE id = $1 FOR UPDATE",
       [listingId]
     );
     if (!listingResult.rows.length || listingResult.rows[0].status !== "active") {
       const err = new Error(`Listing ${listingId} isn't available`);
-      err.code = "LISTING_UNAVAILABLE";
-      throw err;
-    }
-    const availableQuantity = Math.max(1, Number(listingResult.rows[0].quantity || 1));
-    if (requestedByListing.get(listingId) > availableQuantity) {
-      const err = new Error(`Only ${availableQuantity} unit${availableQuantity === 1 ? " is" : "s are"} available for listing ${listingId}`);
       err.code = "LISTING_UNAVAILABLE";
       throw err;
     }
@@ -742,176 +684,36 @@ async function markCheckoutIntent(reference, status, failureReason = null, clien
   );
 }
 
-async function cancelOpenCheckoutsForSeller(client, sellerId, reason) {
-  const cancelled = await client.query(
-    `UPDATE checkout_intents AS intent
-        SET status = 'cancelled', failure_reason = $2
-      WHERE intent.status = 'initialized'
-        AND EXISTS (
-          SELECT 1
-            FROM jsonb_array_elements(intent.items) AS item
-            JOIN listings ON listings.id = (item ->> 'listingId')::integer
-           WHERE listings.owner_id = $1
-        )
-      RETURNING reference`,
-    [sellerId, String(reason || "Seller became unavailable").slice(0, 1000)]
-  );
-  const references = cancelled.rows.map((row) => row.reference);
-  if (references.length) {
-    await client.query("DELETE FROM listing_checkout_reservations WHERE reference = ANY($1::text[])", [references]);
-  }
-  return references;
-}
-
-async function requestAutomaticCheckoutRefund(reference, reason, payment = {}) {
-  if (!process.env.PAYSTACK_SECRET_KEY) throw new Error("Paystack refunds are not configured");
-  const client = await pool.connect();
-  let intent;
-  try {
-    await client.query("BEGIN");
-    const result = await client.query("SELECT * FROM checkout_intents WHERE reference = $1 FOR UPDATE", [reference]);
-    intent = result.rows[0];
-    if (!intent) throw new Error("Checkout intent not found for automatic refund");
-    const existingOrder = await client.query("SELECT id FROM orders WHERE paystack_reference = $1 LIMIT 1", [reference]);
-    if (existingOrder.rows.length) {
-      await client.query(
-        "UPDATE checkout_intents SET status='finalized', failure_reason=NULL, finalized_at=COALESCE(finalized_at,NOW()) WHERE reference=$1",
-        [reference]
-      );
-      await client.query("COMMIT");
-      return { alreadyHandled: true, status: "finalized", orderId: existingOrder.rows[0].id };
-    }
-    // Do not trust a finalized flag by itself. Only an existing order may
-    // suppress a refund; this also repairs legacy partial-finalization states.
-    if (["requesting", "pending", "processed", "request_unknown"].includes(intent.refund_status)) {
-      await client.query("ROLLBACK");
-      return { alreadyHandled: true, status: intent.refund_status };
-    }
-    await client.query(
-      `UPDATE checkout_intents
-          SET status = 'refund_pending', refund_status = 'requesting',
-              refund_requested_at = NOW(), failure_reason = $2
-        WHERE reference = $1`,
-      [reference, String(reason || "Checkout could not be completed").slice(0, 1000)]
-    );
-    await client.query("COMMIT");
-  } catch (err) {
-    await client.query("ROLLBACK").catch(() => {});
-    throw err;
-  } finally {
-    client.release();
-  }
-
-  let refundResponse;
-  let refundData;
-  try {
-    refundResponse = await fetch("https://api.paystack.co/refund", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        transaction: String(payment.transactionReference || reference),
-        amount: Number(payment.amountKobo || intent.amount_kobo),
-        currency: String(payment.currency || intent.currency || "NGN").toUpperCase(),
-        customer_note: "Your Stallyard payment was automatically refunded because the order could not be completed.",
-        merchant_note: `Automatic checkout refund: ${String(reason || "order could not be completed").slice(0, 180)}`,
-      }),
-    });
-    refundData = await refundResponse.json();
-  } catch (err) {
-    await pool.query(
-      "UPDATE checkout_intents SET refund_status='request_unknown', failure_reason=$2 WHERE reference=$1",
-      [reference, `Automatic refund confirmation failed: ${err.message}`.slice(0, 1000)]
-    );
-    throw err;
-  }
-  if (!refundResponse.ok || !refundData.status) {
-    const message = refundData.message || "Paystack rejected the automatic refund";
-    await pool.query(
-      "UPDATE checkout_intents SET status='integrity_failed', refund_status='failed', failure_reason=$2 WHERE reference=$1",
-      [reference, String(message).slice(0, 1000)]
-    );
-    throw new Error(message);
-  }
-  const refund = refundData.data || {};
-  const refundStatus = refund.status || "pending";
-  const immediatelyProcessed = refundStatus === "processed";
-  await pool.query(
-    `UPDATE checkout_intents SET status=$2, refund_status=$3, paystack_refund_id=$4,
-       refunded_at=CASE WHEN $5::boolean THEN NOW() ELSE refunded_at END WHERE reference=$1`,
-    [reference, immediatelyProcessed ? "refunded" : "refund_pending", refundStatus, refund.id || null, immediatelyProcessed]
-  );
-  createNotification(intent.buyer_id, immediatelyProcessed ? "refund_processed" : "refund_started",
-    immediatelyProcessed
-      ? "Your full refund was processed because the order could not be completed."
-      : "Your payment was received, but the order could not be completed. A full automatic refund has been submitted to Paystack.");
-  return { alreadyHandled: false, status: refundStatus, refundId: refund.id || null };
-}
-
 async function finalizeOrderFromPaystackCharge(reference, paystackData) {
+  const existing = await pool.query("SELECT * FROM orders WHERE paystack_reference = $1", [reference]);
+  if (existing.rows.length) {
+    const itemsResult = await pool.query("SELECT * FROM order_items WHERE order_id = $1 ORDER BY id ASC", [existing.rows[0].id]);
+    return { order: existing.rows[0], items: itemsResult.rows, alreadyFinalized: true };
+  }
+
+  const intent = await loadCheckoutIntent(reference);
+  assertPaystackMatchesCheckoutIntent(intent, paystackData);
+  const cartItems = Array.isArray(intent.items) ? intent.items : [];
+  if (!cartItems.length) throw new Error("Payment integrity check failed: checkout intent has no items");
+
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    // Serialize webhook and browser verification for the same payment. The
-    // checkout row remains locked until both the order and finalized status
-    // are committed, so a second caller cannot mistake a completed order for
-    // a failed checkout and refund it.
-    const intentResult = await client.query(
-      "SELECT * FROM checkout_intents WHERE reference = $1 FOR UPDATE",
-      [reference]
-    );
-    if (!intentResult.rows.length) throw new Error("Checkout intent not found");
-    const intent = intentResult.rows[0];
-
-    const existing = await client.query("SELECT * FROM orders WHERE paystack_reference = $1", [reference]);
-    if (existing.rows.length) {
-      const itemsResult = await client.query("SELECT * FROM order_items WHERE order_id = $1 ORDER BY id ASC", [existing.rows[0].id]);
-      await client.query(
-        "UPDATE checkout_intents SET status='finalized', failure_reason=NULL, finalized_at=COALESCE(finalized_at,NOW()) WHERE reference=$1",
-        [reference]
-      );
-      await client.query("COMMIT");
-      return { order: existing.rows[0], items: itemsResult.rows, alreadyFinalized: true };
-    }
-    if (["requesting", "pending", "processed", "request_unknown"].includes(intent.refund_status)
-        || ["refund_pending", "refunded"].includes(intent.status)) {
-      throw new Error("This payment is already in the refund process and cannot be converted into an order");
-    }
-
-    assertPaystackMatchesCheckoutIntent(intent, paystackData);
-    const cartItems = Array.isArray(intent.items) ? intent.items : [];
-    if (!cartItems.length) throw new Error("Payment integrity check failed: checkout intent has no items");
     await assertCheckoutReservationsOwned(client, intent);
 
     let subtotal = 0;
     let shippingTotal = 0;
     const resolvedItems = [];
-    const seenListingIds = new Set();
     for (const cartItem of cartItems) {
       const qty = Number(cartItem.qty);
-      const listingId = Number(cartItem.listingId);
-      if (seenListingIds.has(listingId)) throw new Error("Payment integrity check failed: duplicate listing in checkout");
-      seenListingIds.add(listingId);
       const listingResult = await client.query(
-        `SELECT listings.* FROM listings
-          JOIN users ON users.id = listings.owner_id
-         WHERE listings.id = $1 AND listings.status = 'active'
-           AND listings.is_preview = false
-           AND users.is_preview = false
-           AND users.is_suspended = false
-           AND users.seller_suspended = false
-           AND ((users.is_approved = true AND users.seller_tier IN ('verified', 'premium'))
-                OR users.casual_seller_status = 'approved')
-         FOR UPDATE OF listings, users`,
+        "SELECT * FROM listings WHERE id = $1 AND status = 'active' FOR UPDATE",
         [cartItem.listingId]
       );
       if (listingResult.rows.length === 0) {
         throw new Error(`Paid listing ${cartItem.listingId} is no longer available — payment requires manual review`);
       }
       const listing = listingResult.rows[0];
-      const availableQuantity = Math.max(1, Number(listing.quantity || 1));
-      if (!Number.isInteger(qty) || qty <= 0 || qty > availableQuantity) {
-        throw new Error(`Paid listing ${cartItem.listingId} no longer has the requested quantity — payment requires an automatic refund`);
-      }
       const price = Number(cartItem.unitPrice);
       const shippingFee = Number(cartItem.shippingFee) || 0;
       if (!(price > 0)) throw new Error("Payment integrity check failed: invalid item price snapshot");
@@ -968,11 +770,7 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
         ]
       );
       insertedItems.push(itemResult.rows[0]);
-      const remainingQuantity = Math.max(0, Math.max(1, Number(listing.quantity || 1)) - qty);
-      await client.query(
-        "UPDATE listings SET quantity = $1, status = CASE WHEN $1 = 0 THEN 'sold' ELSE 'active' END WHERE id = $2",
-        [remainingQuantity, listing.id]
-      );
+      await client.query("UPDATE listings SET status = 'sold' WHERE id = $1", [listing.id]);
       createNotification(
         listing.owner_id,
         "sale",
@@ -981,11 +779,9 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
     }
 
     await releaseCheckoutReservations(reference, client);
-    await client.query(
-      "UPDATE checkout_intents SET status='finalized', failure_reason=NULL, finalized_at=COALESCE(finalized_at,NOW()) WHERE reference=$1",
-      [reference]
-    );
     await client.query("COMMIT");
+
+    await markCheckoutIntent(reference, "finalized", null);
 
     if (intent.save_card && authorization.reusable && authorization.authorization_code) {
       try {
@@ -2964,73 +2760,29 @@ const SCHEMA_MIGRATIONS = [
        created_at TIMESTAMP NOT NULL DEFAULT NOW()
      )`,
   ] },
-  { version: 74, name: "premium-seller-no-preset-ceiling", statements: [
-    `ALTER TABLE users ALTER COLUMN seller_listing_limit TYPE NUMERIC`,
-    `ALTER TABLE premium_seller_applications ALTER COLUMN requested_limit TYPE NUMERIC`,
-  ] },
-  { version: 75, name: "repair-casual-seller-tier", statements: [
-    `UPDATE users SET seller_tier = 'casual'
-       WHERE is_admin = false
-         AND is_approved = false
-         AND casual_seller_status = 'approved'
-         AND seller_tier IS DISTINCT FROM 'casual'`,
-  ] },
-  { version: 76, name: "checkout-automatic-refunds", statements: [
-    `ALTER TABLE checkout_intents
-       ADD COLUMN IF NOT EXISTS refund_status TEXT,
-       ADD COLUMN IF NOT EXISTS paystack_refund_id BIGINT,
-       ADD COLUMN IF NOT EXISTS refund_requested_at TIMESTAMP,
-      ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMP`,
-  ] },
-  { version: 77, name: "isolate-preview-accounts", statements: [
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
-    `ALTER TABLE listings ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
-    `ALTER TABLE orders ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
-    `CREATE INDEX IF NOT EXISTS idx_users_is_preview ON users(is_preview)`,
-    `CREATE INDEX IF NOT EXISTS idx_orders_is_preview ON orders(is_preview)`,
-  ] },
-  { version: 78, name: "isolate-all-preview-child-records", statements: [
-    `ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
-    `ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
-    `ALTER TABLE order_items ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
-    `ALTER TABLE threads ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
-    `ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
-    `ALTER TABLE notifications ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
-    `ALTER TABLE dispute_cases ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
-    `ALTER TABLE reviews ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
-    `ALTER TABLE message_reports ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
-    `ALTER TABLE review_reports ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
-    `ALTER TABLE seller_reports ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
-    `ALTER TABLE account_reports ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
-    `UPDATE listings l SET is_preview=true FROM users u WHERE u.id=l.owner_id AND u.is_preview=true`,
-    `UPDATE orders o SET is_preview=true WHERE EXISTS (SELECT 1 FROM users u WHERE u.id=o.buyer_id AND u.is_preview=true)
-       OR EXISTS (SELECT 1 FROM order_items oi JOIN users u ON u.id=oi.seller_id WHERE oi.order_id=o.id AND u.is_preview=true)`,
-    `UPDATE checkout_intents ci SET is_preview=true FROM users u WHERE u.id=ci.buyer_id AND u.is_preview=true`,
-    `UPDATE payment_attempts pa SET is_preview=true FROM users u WHERE u.id=pa.user_id AND u.is_preview=true`,
-    `DELETE FROM listing_checkout_reservations r USING checkout_intents ci WHERE ci.reference=r.reference AND ci.is_preview=true`,
-    `UPDATE checkout_intents SET status='cancelled', failure_reason='Preview checkout isolated during security migration'
-       WHERE is_preview=true AND status='initialized'`,
-    `UPDATE order_items oi SET is_preview=true FROM orders o WHERE o.id=oi.order_id AND o.is_preview=true`,
-    `UPDATE threads t SET is_preview=true FROM users b, users s WHERE b.id=t.buyer_id AND s.id=t.seller_id AND (b.is_preview=true OR s.is_preview=true)`,
-    `UPDATE messages m SET is_preview=true FROM threads t WHERE t.id=m.thread_id AND t.is_preview=true`,
-    `UPDATE notifications n SET is_preview=true FROM users u WHERE u.id=n.user_id AND u.is_preview=true`,
-    `UPDATE dispute_cases d SET is_preview=true FROM orders o WHERE o.id=d.order_id AND o.is_preview=true`,
-    `UPDATE reviews r SET is_preview=true FROM orders o WHERE o.id=r.order_id AND o.is_preview=true`,
-    `UPDATE message_reports mr SET is_preview=true WHERE EXISTS (SELECT 1 FROM messages m WHERE m.id=mr.message_id AND m.is_preview=true)
-       OR EXISTS (SELECT 1 FROM users u WHERE u.id=mr.reporter_id AND u.is_preview=true)`,
-    `UPDATE review_reports rr SET is_preview=true WHERE EXISTS (SELECT 1 FROM reviews r WHERE r.id=rr.review_id AND r.is_preview=true)
-       OR EXISTS (SELECT 1 FROM users u WHERE u.id=rr.reporter_id AND u.is_preview=true)`,
-    `UPDATE seller_reports sr SET is_preview=true WHERE EXISTS (SELECT 1 FROM users u WHERE u.id=sr.reporter_id AND u.is_preview=true)
-       OR EXISTS (SELECT 1 FROM users u WHERE u.id=sr.reported_seller_id AND u.is_preview=true)
-       OR EXISTS (SELECT 1 FROM orders o WHERE o.id=sr.order_id AND o.is_preview=true)`,
-    `UPDATE account_reports ar SET is_preview=true FROM users u WHERE u.id=ar.user_id AND u.is_preview=true`,
-    `CREATE INDEX IF NOT EXISTS idx_order_items_is_preview ON order_items(is_preview)`,
-    `CREATE INDEX IF NOT EXISTS idx_threads_is_preview ON threads(is_preview)`,
-    `CREATE INDEX IF NOT EXISTS idx_messages_is_preview ON messages(is_preview)`,
-    `CREATE INDEX IF NOT EXISTS idx_disputes_is_preview ON dispute_cases(is_preview)`,
-    `CREATE INDEX IF NOT EXISTS idx_reviews_is_preview ON reviews(is_preview)`,
-    `CREATE INDEX IF NOT EXISTS idx_checkout_intents_is_preview ON checkout_intents(is_preview)`,
-  ] },
+  { version: 74, name: "self-delivery-journey", statements: [
+    `ALTER TABLE order_items
+       ADD COLUMN IF NOT EXISTS self_delivery_stage TEXT,
+       ADD COLUMN IF NOT EXISTS self_delivery_person_photo_url TEXT`,
+    `ALTER TABLE order_items DROP CONSTRAINT IF EXISTS order_items_self_delivery_stage_check`,
+    `ALTER TABLE order_items ADD CONSTRAINT order_items_self_delivery_stage_check
+       CHECK (self_delivery_stage IS NULL OR self_delivery_stage IN ('started','on_my_way','arrived','delivered'))`,
+    `CREATE OR REPLACE FUNCTION record_self_delivery_event() RETURNS TRIGGER AS $$
+     BEGIN
+       IF COALESCE(NEW.self_delivery_person_photo_url, '') IS DISTINCT FROM COALESCE(OLD.self_delivery_person_photo_url, '') AND COALESCE(NEW.self_delivery_person_photo_url, '') <> '' THEN
+         INSERT INTO order_item_status_events(order_item_id, event_type, label) VALUES (NEW.id, 'delivery_person_photo', 'Delivery person photo added');
+       END IF;
+       IF NEW.self_delivery_stage IS DISTINCT FROM OLD.self_delivery_stage AND NEW.self_delivery_stage IS NOT NULL THEN
+         INSERT INTO order_item_status_events(order_item_id, event_type, label)
+         VALUES (NEW.id, 'self_delivery_' || NEW.self_delivery_stage,
+           CASE NEW.self_delivery_stage WHEN 'started' THEN 'Self delivery started' WHEN 'on_my_way' THEN 'Seller is on the way' WHEN 'arrived' THEN 'Seller has arrived' WHEN 'delivered' THEN 'Self delivery marked delivered' ELSE 'Self delivery updated' END);
+       END IF;
+       RETURN NEW;
+     END; $$ LANGUAGE plpgsql`,
+    `DROP TRIGGER IF EXISTS trg_record_self_delivery_event ON order_items`,
+    `CREATE TRIGGER trg_record_self_delivery_event AFTER UPDATE ON order_items FOR EACH ROW EXECUTE FUNCTION record_self_delivery_event()`,
+  ] }
+
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -3859,10 +3611,7 @@ app.patch("/users/:id/suspend", authenticate, requirePermission("user_management
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "User not found" });
     }
-    if (isSuspended) {
-      await client.query("UPDATE listings SET status='paused' WHERE owner_id=$1 AND status='active'", [req.params.id]);
-      await cancelOpenCheckoutsForSeller(client, req.params.id, "Seller account was suspended before payment completed");
-    }
+    if (isSuspended) await client.query("UPDATE listings SET status='paused' WHERE owner_id=$1 AND status='active'", [req.params.id]);
     await client.query("COMMIT");
     logAdminAction(req.user.id, "user_suspended", `${isSuspended ? "Suspended" : "Unsuspended"} ${result.rows[0].username}`);
     res.json({ user: result.rows[0] });
@@ -4189,50 +3938,20 @@ app.get("/admin-audit-log", authenticate, requirePermission("role_assignment"), 
   }
 });
 
-app.patch("/users/:id/approve", authenticate, requireSuperAdmin, async (req, res) => {
+app.patch("/users/:id/approve", authenticate, requirePermission("seller_verification"), async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     const pendingApplication = await client.query(
-      `SELECT a.*, u.is_suspended, u.seller_suspended, u.casual_seller_status,
-              u.is_email_verified, u.is_phone_verified, u.paystack_recipient_code
-         FROM verified_seller_applications a JOIN users u ON u.id=a.user_id
-        WHERE a.user_id=$1 AND a.status='pending' ORDER BY a.created_at DESC LIMIT 1 FOR UPDATE`, [req.params.id]
+      "SELECT id FROM verified_seller_applications WHERE user_id=$1 AND status='pending' ORDER BY created_at DESC LIMIT 1 FOR UPDATE", [req.params.id]
     );
     if (!pendingApplication.rows.length) {
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "A complete pending verified-seller application is required before approval" });
     }
-    const application = pendingApplication.rows[0];
-    const address = await client.query(
-      `SELECT id FROM user_addresses WHERE id=$1 AND user_id=$2 AND is_default=true
-        AND street<>'' AND city<>'' AND state<>'' AND LOWER(country)='nigeria'`,
-      [application.address_id, application.user_id]
-    );
-    const [idFrontAvailable, idBackAvailable, bankStatementAvailable] = await Promise.all([
-      application.id_front_path ? fetchPrivateVerificationObject(application.id_front_path).then((bytes) => bytes.length > 0).catch(() => false) : false,
-      application.id_back_path ? fetchPrivateVerificationObject(application.id_back_path).then((bytes) => bytes.length > 0).catch(() => false) : true,
-      application.bank_statement_path ? fetchPrivateVerificationObject(application.bank_statement_path).then((bytes) => bytes.length > 0).catch(() => false) : false,
-    ]);
-    const failedChecks = [];
-    if (application.is_suspended || application.seller_suspended) failedChecks.push("seller account is suspended");
-    if (application.casual_seller_status !== "approved") failedChecks.push("Casual Seller approval is no longer active");
-    if (!application.is_email_verified || !application.is_phone_verified) failedChecks.push("email and phone must remain verified");
-    if (!application.paystack_recipient_code) failedChecks.push("verified payout bank is missing");
-    if (!address.rows.length) failedChecks.push("complete default Nigerian address is missing");
-    if (!CASUAL_SELLER_ID_TYPES.has(application.id_type) || !application.id_front_path) failedChecks.push("accepted identification is missing");
-    if (!application.bank_statement_path) failedChecks.push("bank statement is missing");
-    if (application.id_front_path && !idFrontAvailable) failedChecks.push("front identification file is unavailable");
-    if (application.id_back_path && !idBackAvailable) failedChecks.push("back identification file is unavailable");
-    if (application.bank_statement_path && !bankStatementAvailable) failedChecks.push("bank statement file is unavailable");
-    if (!application.consented_at) failedChecks.push("seller declaration is missing");
-    if (failedChecks.length) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ error: `Seller cannot be approved: ${failedChecks.join("; ")}`, failedChecks });
-    }
     const result = await client.query(
       `UPDATE users SET is_approved = true, verification_status = 'approved', rejection_reason = NULL,
-         seller_tier = 'verified', seller_listing_limit = $1
+         seller_tier = 'verified', seller_listing_limit = $1, seller_suspended=false, seller_suspended_reason=NULL
        WHERE id = $2 RETURNING ${USER_RETURNING_FIELDS}`,
       [VERIFIED_SELLER_LIMIT_NGN, req.params.id]
     );
@@ -4243,7 +3962,7 @@ app.patch("/users/:id/approve", authenticate, requireSuperAdmin, async (req, res
     await client.query(
       `UPDATE verified_seller_applications SET status='approved', reviewed_by=$1, reviewed_at=NOW(), updated_at=NOW()
         WHERE id=$2`,
-      [req.user.id, application.id]
+      [req.user.id, pendingApplication.rows[0].id]
     );
     await client.query("COMMIT");
     logAdminAction(req.user.id, "seller_approved", `Approved ${result.rows[0].username}'s seller application`);
@@ -4259,33 +3978,26 @@ app.patch("/users/:id/approve", authenticate, requireSuperAdmin, async (req, res
   } finally { client.release(); }
 });
 
-app.patch("/users/:id/reject", authenticate, requireSuperAdmin, async (req, res) => {
-  const client = await pool.connect();
+app.patch("/users/:id/reject", authenticate, requirePermission("seller_verification"), async (req, res) => {
   try {
     const { reason } = req.body;
-    await client.query("BEGIN");
-    const pendingApplication = await client.query(
-      "SELECT id FROM verified_seller_applications WHERE user_id=$1 AND status='pending' ORDER BY created_at DESC LIMIT 1 FOR UPDATE", [req.params.id]
+    const pendingApplication = await pool.query(
+      "SELECT id FROM verified_seller_applications WHERE user_id=$1 AND status='pending' ORDER BY created_at DESC LIMIT 1", [req.params.id]
     );
     if (!pendingApplication.rows.length) {
-      await client.query("ROLLBACK");
       return res.status(409).json({ error: "A pending Verified Seller application is required before rejection" });
     }
-    const result = await client.query(
+    const result = await pool.query(
       `UPDATE users SET is_approved = false, verification_status = 'rejected', rejection_reason = $1
        WHERE id = $2 RETURNING ${USER_RETURNING_FIELDS}`,
       [reason || null, req.params.id]
     );
-    if (result.rows.length === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "User not found" });
-    }
-    await client.query(
+    if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
+    await pool.query(
       `UPDATE verified_seller_applications SET status='rejected', decision_reason=$1, reviewed_by=$2, reviewed_at=NOW(), updated_at=NOW()
-        WHERE id=$3`,
-      [reason || "Application rejected", req.user.id, pendingApplication.rows[0].id]
+        WHERE id=(SELECT id FROM verified_seller_applications WHERE user_id=$3 AND status='pending' ORDER BY created_at DESC LIMIT 1)`,
+      [reason || "Application rejected", req.user.id, req.params.id]
     );
-    await client.query("COMMIT");
     logAdminAction(req.user.id, "seller_rejected", `Rejected ${result.rows[0].username}'s seller application${reason ? ": " + reason : ""}`);
     createNotification(
       req.params.id,
@@ -4294,9 +4006,8 @@ app.patch("/users/:id/reject", authenticate, requireSuperAdmin, async (req, res)
     );
     res.json({ user: result.rows[0] });
   } catch (err) {
-    await client.query("ROLLBACK").catch(() => {});
     sendInternalError(res, err);
-  } finally { client.release(); }
+  }
 });
 
 app.delete("/users/:id", authenticate, requirePermission("user_management"), async (req, res) => {
@@ -4569,7 +4280,7 @@ app.post("/admin/login", authRateLimit, async (req, res) => {
 // load, so it must never return seller verification documents, bank data,
 // government-ID details, or other private profile records.
 const SESSION_USER_FIELDS = `id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence,
-  country, is_admin, is_approved, is_verified, is_suspended, is_preview, seller_suspended, seller_suspended_reason, account_type,
+  country, is_admin, is_approved, is_verified, is_suspended, seller_suspended, seller_suspended_reason, account_type,
   has_applied_to_sell, verification_status, avatar_url, store_bio, store_policies,
   two_factor_enabled, is_email_verified, is_phone_verified, token_version, admin_role,
   casual_seller_status, casual_seller_limit, casual_seller_approved_at, seller_tier, seller_listing_limit,
@@ -5601,6 +5312,7 @@ const LISTING_SUBCATEGORIES = {
 const CASUAL_SELLER_LIMIT_NGN = 500000;
 const VERIFIED_SELLER_LIMIT_NGN = 20000000;
 const PREMIUM_SELLER_MIN_LIMIT_NGN = 20000000.01;
+const PREMIUM_SELLER_MAX_LIMIT_NGN = 1000000000;
 const CASUAL_SELLER_ID_TYPES = new Set(["nin", "passport", "drivers_license", "voters_card", "cerpac"]);
 const CASUAL_SELLER_CONSENT_VERSION = "2026-09-12";
 const CASUAL_LIVENESS_TTL_MS = 10 * 60 * 1000;
@@ -5731,15 +5443,12 @@ async function activeListingValue(client, ownerId, excludeListingId = null) {
 
 async function assertSellerMayPublish(client, ownerId, proposedPrice, proposedQuantity, excludeListingId = null) {
   const userResult = await client.query(
-      `SELECT is_approved, is_suspended, is_preview, seller_suspended, casual_seller_status, casual_seller_limit, seller_tier, seller_listing_limit, username, display_name
+    `SELECT is_approved, is_suspended, seller_suspended, casual_seller_status, casual_seller_limit, seller_tier, seller_listing_limit, username, display_name
        FROM users WHERE id = $1 FOR UPDATE`,
     [ownerId]
   );
   if (!userResult.rows.length) throw Object.assign(new Error("Seller account not found"), { statusCode: 404 });
   const seller = userResult.rows[0];
-  if (seller.is_preview) {
-    throw Object.assign(new Error("Preview listings cannot be published to the live marketplace."), { statusCode: 403, code: "PREVIEW_ACCOUNT_RESTRICTED" });
-  }
   if (seller.is_suspended || seller.seller_suspended) {
     throw Object.assign(new Error("Selling is suspended on this account. Contact Stallyard support."), { statusCode: 403, code: "SELLER_SUSPENDED" });
   }
@@ -5748,11 +5457,9 @@ async function assertSellerMayPublish(client, ownerId, proposedPrice, proposedQu
   const current = await activeListingValue(client, ownerId, excludeListingId);
   if (seller.is_approved) {
     const verifiedLimit = Number(seller.seller_listing_limit || VERIFIED_SELLER_LIMIT_NGN);
-    const approvedTier = seller.seller_tier === "premium" ? "Premium Seller" : "Verified Seller";
-    const limitCode = seller.seller_tier === "premium" ? "PREMIUM_LISTING_LIMIT" : "VERIFIED_LISTING_LIMIT";
     if (!Number.isFinite(price) || price <= 0 || current + price * quantity > verifiedLimit) {
-      throw Object.assign(new Error(`${approvedTier}s may have no more than ₦${verifiedLimit.toLocaleString("en-NG")} in combined active listings.`), {
-        statusCode: 409, code: limitCode, currentActiveValue: current, limit: verifiedLimit,
+      throw Object.assign(new Error(`Verified sellers may have no more than ₦${verifiedLimit.toLocaleString("en-NG")} in combined active listings.`), {
+        statusCode: 409, code: "VERIFIED_LISTING_LIMIT", currentActiveValue: current, limit: verifiedLimit,
       });
     }
     return seller;
@@ -5773,42 +5480,28 @@ app.get("/casual-seller/status", authenticate, rejectAdminMarketplaceUse, async 
   try {
     const user = await pool.query(
       `SELECT casual_seller_status, casual_seller_limit, casual_seller_approved_at,
-              is_approved, is_email_verified, is_phone_verified,
-              seller_tier, seller_listing_limit
+              is_approved, is_email_verified, is_phone_verified
          FROM users WHERE id = $1`, [req.user.id]
     );
     const latest = await pool.query(
       `SELECT reference, status, decision_reason, automatic_checks, created_at, approved_at
          FROM casual_seller_applications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`, [req.user.id]
     );
-    const latestPremium = await pool.query(
-      `SELECT reference, requested_limit, status, decision_reason, created_at, reviewed_at
-         FROM premium_seller_applications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`, [req.user.id]
-    );
     const currentValue = await activeListingValue(pool, req.user.id);
-    const account = user.rows[0] || {};
-    const sellerTier = account.is_approved
-      ? (account.seller_tier === "premium" ? "premium" : "verified")
-      : (account.casual_seller_status === "approved" ? "casual" : "buyer");
-    const effectiveLimit = account.is_approved
-      ? Number(account.seller_listing_limit || VERIFIED_SELLER_LIMIT_NGN)
-      : Number(account.casual_seller_limit || CASUAL_SELLER_LIMIT_NGN);
     res.json({
-      status: account.casual_seller_status || "none",
-      sellerTier,
-      limit: effectiveLimit,
+      status: user.rows[0]?.casual_seller_status || "none",
+      limit: Number(user.rows[0]?.casual_seller_limit || CASUAL_SELLER_LIMIT_NGN),
       currentActiveValue: currentValue,
-      remainingValue: Math.max(0, effectiveLimit - currentValue),
-      fullyApprovedSeller: !!account.is_approved,
-      emailVerified: !!account.is_email_verified,
-      phoneVerified: !!account.is_phone_verified,
+      remainingValue: Math.max(0, Number(user.rows[0]?.casual_seller_limit || CASUAL_SELLER_LIMIT_NGN) - currentValue),
+      fullyApprovedSeller: !!user.rows[0]?.is_approved,
+      emailVerified: !!user.rows[0]?.is_email_verified,
+      phoneVerified: !!user.rows[0]?.is_phone_verified,
       application: latest.rows[0] || null,
-      premiumApplication: latestPremium.rows[0] || null,
     });
   } catch (err) { sendInternalError(res, err); }
 });
 
-app.post("/casual-seller/rekognition/session", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, requireCompleteProfile, requireVerifiedEmailAndPhone, requireNigeriaMarketplaceUser, requireCasualVerificationAvailable,
+app.post("/casual-seller/rekognition/session", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireVerifiedEmailAndPhone, requireNigeriaMarketplaceUser,
   rekognitionSessionUserLimit, rekognitionSessionIpLimit, async (req, res) => {
     try {
       const roleArn = String(process.env.AWS_LIVENESS_ROLE_ARN || "").trim();
@@ -5845,7 +5538,7 @@ app.post("/casual-seller/rekognition/session", authenticate, rejectAdminMarketpl
   }
 );
 
-app.post("/casual-seller/rekognition/complete", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, requireCompleteProfile, requireVerifiedEmailAndPhone, requireNigeriaMarketplaceUser, requireCasualVerificationAvailable, async (req, res) => {
+app.post("/casual-seller/rekognition/complete", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   try {
     const issued = await getSecurityState("rekognition-liveness-session", req.user.id);
     const sessionId = String(req.body?.sessionId || "");
@@ -5869,7 +5562,7 @@ app.post("/casual-seller/rekognition/complete", authenticate, rejectAdminMarketp
   } catch (err) { sendInternalError(res, err, "complete Rekognition liveness session"); }
 });
 
-app.post("/casual-seller/challenge", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, requireCompleteProfile, requireVerifiedEmailAndPhone, requireNigeriaMarketplaceUser, requireCasualVerificationAvailable, async (req, res) => {
+app.post("/casual-seller/challenge", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   try {
     const poolValues = ["blink", "turn_left", "turn_right", "smile", "move_closer"];
     for (let index = poolValues.length - 1; index > 0; index--) {
@@ -5884,7 +5577,7 @@ app.post("/casual-seller/challenge", authenticate, rejectAdminMarketplaceUse, re
   } catch (err) { sendInternalError(res, err, "casual seller liveness challenge"); }
 });
 
-app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
+app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   const client = await pool.connect();
   const uploadedPaths = [];
   try {
@@ -5898,16 +5591,6 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, reject
       return res.status(400).json({ error: "Complete your legal name and birth date" });
     }
     if (ageOnDate(dateOfBirth) < 18) return res.status(400).json({ error: "Casual sellers must be at least 18 years old" });
-    const existingSeller = await pool.query(
-      "SELECT is_approved, is_suspended, seller_suspended, casual_seller_status FROM users WHERE id=$1 LIMIT 1",
-      [req.user.id]
-    );
-    if (!existingSeller.rows.length || existingSeller.rows[0].is_suspended || existingSeller.rows[0].seller_suspended) {
-      return res.status(403).json({ error: "This account cannot apply" });
-    }
-    if (existingSeller.rows[0].is_approved || existingSeller.rows[0].casual_seller_status === "approved") {
-      return res.status(409).json({ error: "Your Casual Seller verification is already approved" });
-    }
     if (!Array.isArray(challengeFrames) || challengeFrames.length !== 3 || !Array.isArray(challenges) || challenges.length !== 3) {
       return res.status(400).json({ error: "Complete all three live camera challenges" });
     }
@@ -5946,13 +5629,12 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, reject
     await client.query("BEGIN");
     const accountResult = await client.query(
       `SELECT id, username, email, phone, first_name, last_name, other_name, display_name, country,
-              is_email_verified, is_phone_verified, is_suspended, seller_suspended, is_approved, casual_seller_status
+              is_email_verified, is_phone_verified, is_suspended, is_approved, casual_seller_status
          FROM users WHERE id = $1 FOR UPDATE`, [req.user.id]
     );
     const account = accountResult.rows[0];
-    if (!account || account.is_suspended || account.seller_suspended) throw Object.assign(new Error("This account cannot apply"), { statusCode: 403 });
+    if (!account || account.is_suspended) throw Object.assign(new Error("This account cannot apply"), { statusCode: 403 });
     if (account.is_approved) throw Object.assign(new Error("Your account already has full seller approval"), { statusCode: 409 });
-    if (account.casual_seller_status === "approved") throw Object.assign(new Error("Your Casual Seller verification is already approved"), { statusCode: 409 });
     if (!account.is_email_verified || !account.is_phone_verified) {
       throw Object.assign(new Error("Verify both your email and phone number before applying"), { statusCode: 400, code: "CONTACT_VERIFICATION_REQUIRED" });
     }
@@ -6017,7 +5699,6 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, reject
     await client.query("UPDATE casual_seller_applications SET evidence_paths = $1, face_descriptor = $2 WHERE id = $3", [JSON.stringify(evidencePaths), JSON.stringify(faceDescriptor), applicationId]);
     await client.query(
       `UPDATE users SET casual_seller_status = $1, casual_seller_approved_at = CASE WHEN $1 = 'approved' THEN NOW() ELSE NULL END,
-         seller_tier = CASE WHEN $1 = 'approved' THEN 'casual' ELSE seller_tier END,
          has_applied_to_sell = true, verification_status = CASE WHEN $1 = 'approved' THEN 'casual_approved' ELSE 'review_required' END
        WHERE id = $2`, [status, req.user.id]
     );
@@ -6046,7 +5727,7 @@ function parsePrivateApplicationDocument(dataUrl, label) {
   return { buffer, contentType: match[1], extension: match[1] === "application/pdf" ? "pdf" : "jpg", sha256: crypto.createHash("sha256").update(buffer).digest("hex") };
 }
 
-app.post("/verified-seller/apply", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
+app.post("/verified-seller/apply", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   const client = await pool.connect();
   const uploadedPaths = [];
   try {
@@ -6058,11 +5739,11 @@ app.post("/verified-seller/apply", authenticate, rejectAdminMarketplaceUse, reje
     const idBack = req.body?.idBack ? parseVerificationJpeg(req.body.idBack, "ID back") : null;
     await client.query("BEGIN");
     const userResult = await client.query(
-      `SELECT id, username, is_approved, is_suspended, seller_suspended, casual_seller_status, is_email_verified,
+      `SELECT id, username, is_approved, is_suspended, casual_seller_status, is_email_verified,
               is_phone_verified, paystack_recipient_code FROM users WHERE id=$1 FOR UPDATE`, [req.user.id]
     );
     const user = userResult.rows[0];
-    if (!user || user.is_suspended || user.seller_suspended) throw Object.assign(new Error("This account cannot apply while selling access is suspended"), { statusCode: 403 });
+    if (!user || user.is_suspended) throw Object.assign(new Error("This account cannot apply"), { statusCode: 403 });
     if (user.is_approved) throw Object.assign(new Error("Your account is already a verified seller"), { statusCode: 409 });
     if (user.casual_seller_status !== "approved") throw Object.assign(new Error("Complete automatic casual-seller identity verification first"), { statusCode: 400 });
     if (!user.is_email_verified || !user.is_phone_verified) throw Object.assign(new Error("Verify your email and phone number first"), { statusCode: 400 });
@@ -6116,9 +5797,7 @@ app.get("/admin/verified-seller-applications", authenticate, requireSuperAdmin, 
       `SELECT a.id,a.reference,a.user_id,a.requested_limit,a.requirements_snapshot,a.status,a.decision_reason,
               a.id_type,(a.id_back_path IS NOT NULL) AS has_id_back,
               a.created_at,a.reviewed_at,u.username,u.display_name,u.email,u.phone
-         FROM verified_seller_applications a JOIN users u ON u.id=a.user_id
-        WHERE u.is_preview=false
-        ORDER BY a.created_at DESC LIMIT 500`
+         FROM verified_seller_applications a JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT 500`
     );
     res.json({ applications: result.rows });
   } catch (err) { sendInternalError(res, err); }
@@ -6129,7 +5808,7 @@ app.patch("/admin/verified-seller-applications/:id/auto-verify", authenticate, r
   try {
     await client.query("BEGIN");
     const applicationResult = await client.query(
-      `SELECT a.*, u.username, u.is_suspended, u.seller_suspended, u.casual_seller_status,
+      `SELECT a.*, u.username, u.is_suspended, u.casual_seller_status,
               u.is_email_verified, u.is_phone_verified, u.paystack_recipient_code
          FROM verified_seller_applications a
          JOIN users u ON u.id = a.user_id
@@ -6152,13 +5831,8 @@ app.patch("/admin/verified-seller-applications/:id/auto-verify", authenticate, r
           AND street <> '' AND city <> '' AND state <> '' AND LOWER(country) = 'nigeria'`,
       [application.address_id, application.user_id]
     );
-    const [idFrontAvailable, idBackAvailable, bankStatementAvailable] = await Promise.all([
-      application.id_front_path ? fetchPrivateVerificationObject(application.id_front_path).then((bytes) => bytes.length > 0).catch(() => false) : false,
-      application.id_back_path ? fetchPrivateVerificationObject(application.id_back_path).then((bytes) => bytes.length > 0).catch(() => false) : true,
-      application.bank_statement_path ? fetchPrivateVerificationObject(application.bank_statement_path).then((bytes) => bytes.length > 0).catch(() => false) : false,
-    ]);
     const failedChecks = [];
-    if (application.is_suspended || application.seller_suspended) failedChecks.push("seller account is suspended");
+    if (application.is_suspended) failedChecks.push("account is suspended");
     if (application.casual_seller_status !== "approved") failedChecks.push("Casual Seller verification is not approved");
     if (!application.is_email_verified) failedChecks.push("email is not verified");
     if (!application.is_phone_verified) failedChecks.push("phone is not verified");
@@ -6167,9 +5841,6 @@ app.patch("/admin/verified-seller-applications/:id/auto-verify", authenticate, r
     if (!CASUAL_SELLER_ID_TYPES.has(application.id_type)) failedChecks.push("accepted identification type is missing");
     if (!application.id_front_path) failedChecks.push("front identification image is missing");
     if (!application.bank_statement_path) failedChecks.push("bank statement is missing");
-    if (application.id_front_path && !idFrontAvailable) failedChecks.push("front identification file is unavailable");
-    if (application.id_back_path && !idBackAvailable) failedChecks.push("back identification file is unavailable");
-    if (application.bank_statement_path && !bankStatementAvailable) failedChecks.push("bank statement file is unavailable");
     if (!application.consented_at) failedChecks.push("seller declaration was not accepted");
     if (Number(application.requested_limit) !== VERIFIED_SELLER_LIMIT_NGN) failedChecks.push("requested limit is invalid");
     if (failedChecks.length) {
@@ -6182,14 +5853,10 @@ app.patch("/admin/verified-seller-applications/:id/auto-verify", authenticate, r
 
     const userResult = await client.query(
       `UPDATE users SET is_approved = true, verification_status = 'approved', rejection_reason = NULL,
-         seller_tier = 'verified', seller_listing_limit = $1
-       WHERE id = $2 AND is_suspended=false AND seller_suspended=false RETURNING ${USER_RETURNING_FIELDS}`,
+         seller_tier = 'verified', seller_listing_limit = $1, seller_suspended=false, seller_suspended_reason=NULL
+       WHERE id = $2 RETURNING ${USER_RETURNING_FIELDS}`,
       [VERIFIED_SELLER_LIMIT_NGN, application.user_id]
     );
-    if (!userResult.rows.length) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ error: "The seller account is unavailable or suspended" });
-    }
     await client.query(
       `UPDATE verified_seller_applications
           SET status = 'approved', decision_reason = 'Approved by Super Admin automatic record checks',
@@ -6266,14 +5933,14 @@ function pdfText(value) {
   return String(value ?? "").replace(/[^\x20-\x7E]/g, "?").replace(/([\\()])/g, "\\$1");
 }
 
-app.post("/premium-seller/apply", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
+app.post("/premium-seller/apply", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   const client = await pool.connect();
   const uploadedPaths = [];
   try {
     if (req.body?.consent !== true) return res.status(400).json({ error: "Accept the Premium Seller declaration before applying" });
     const requestedLimit = Number(req.body?.requestedLimit);
-    if (!Number.isFinite(requestedLimit) || requestedLimit < PREMIUM_SELLER_MIN_LIMIT_NGN) {
-      return res.status(400).json({ error: "Choose a requested limit above ₦20,000,000" });
+    if (!Number.isFinite(requestedLimit) || requestedLimit < PREMIUM_SELLER_MIN_LIMIT_NGN || requestedLimit > PREMIUM_SELLER_MAX_LIMIT_NGN) {
+      return res.status(400).json({ error: "Choose a requested limit above ₦20,000,000 and no higher than ₦1,000,000,000" });
     }
     const document = parsePrivateApplicationDocument(req.body?.supportingDocument, "Premium supporting document");
     await client.query("BEGIN");
@@ -6326,9 +5993,7 @@ app.get("/admin/premium-seller-applications", authenticate, requireSuperAdmin, a
     const result = await pool.query(
       `SELECT a.id,a.reference,a.user_id,a.requested_limit,a.status,a.decision_reason,a.created_at,a.reviewed_at,
               u.username,u.display_name,u.email,u.phone
-         FROM premium_seller_applications a JOIN users u ON u.id=a.user_id
-        WHERE u.is_preview=false
-        ORDER BY a.created_at DESC LIMIT 500`
+         FROM premium_seller_applications a JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT 500`
     );
     res.json({ applications:result.rows });
   } catch (err) { sendInternalError(res, err); }
@@ -6352,51 +6017,18 @@ app.patch("/admin/premium-seller-applications/:id/approve", authenticate, requir
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const applicationResult = await client.query(
-      `SELECT a.*,u.is_approved,u.is_suspended,u.seller_suspended,u.seller_tier,
-              u.is_email_verified,u.is_phone_verified,u.paystack_recipient_code
-         FROM premium_seller_applications a JOIN users u ON u.id=a.user_id
-        WHERE a.id=$1 FOR UPDATE`, [req.params.id]
-    );
+    const applicationResult = await client.query("SELECT * FROM premium_seller_applications WHERE id=$1 FOR UPDATE", [req.params.id]);
     const application = applicationResult.rows[0];
     if (!application) { await client.query("ROLLBACK"); return res.status(404).json({ error:"Application not found" }); }
     if (application.status !== "pending") { await client.query("ROLLBACK"); return res.status(409).json({ error:"Only a pending Premium Seller application can be approved" }); }
     const approvedLimit = Number(req.body?.approvedLimit || application.requested_limit);
-    if (!Number.isFinite(approvedLimit) || approvedLimit < PREMIUM_SELLER_MIN_LIMIT_NGN) {
+    if (!Number.isFinite(approvedLimit) || approvedLimit < PREMIUM_SELLER_MIN_LIMIT_NGN || approvedLimit > PREMIUM_SELLER_MAX_LIMIT_NGN) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ error:"Approved limit must be above ₦20,000,000" });
-    }
-    const verifiedRecord = await client.query(
-      "SELECT id FROM verified_seller_applications WHERE id=$1 AND user_id=$2 AND status='approved'",
-      [application.verified_application_id, application.user_id]
-    );
-    const currentAddress = await client.query(
-      `SELECT id FROM user_addresses WHERE user_id=$1 AND is_default=true
-        AND street<>'' AND city<>'' AND state<>'' AND LOWER(country)='nigeria' LIMIT 1`,
-      [application.user_id]
-    );
-    let supportingDocumentAvailable = false;
-    if (application.supporting_document_path) {
-      supportingDocumentAvailable = await fetchPrivateVerificationObject(application.supporting_document_path)
-        .then((bytes) => bytes.length > 0)
-        .catch(() => false);
-    }
-    const failedChecks = [];
-    if (application.is_suspended || application.seller_suspended) failedChecks.push("seller account is suspended");
-    if (!application.is_approved || application.seller_tier !== "verified") failedChecks.push("Verified Seller approval is no longer active");
-    if (!application.is_email_verified || !application.is_phone_verified) failedChecks.push("email and phone must remain verified");
-    if (!application.paystack_recipient_code) failedChecks.push("verified payout bank is missing");
-    if (!verifiedRecord.rows.length) failedChecks.push("approved Verified Seller record is missing");
-    if (!currentAddress.rows.length) failedChecks.push("complete default Nigerian address is missing");
-    if (!supportingDocumentAvailable) failedChecks.push("Premium supporting document is missing");
-    if (!application.consented_at) failedChecks.push("Premium Seller declaration is missing");
-    if (failedChecks.length) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ error:`Premium Seller cannot be approved: ${failedChecks.join("; ")}`, failedChecks });
+      return res.status(400).json({ error:"Approved limit must be above ₦20,000,000 and no higher than ₦1,000,000,000" });
     }
     const userResult = await client.query(
-      `UPDATE users SET seller_tier='premium',seller_listing_limit=$1,is_approved=true,verification_status='approved'
-        WHERE id=$2 AND is_suspended=false AND seller_suspended=false RETURNING ${USER_RETURNING_FIELDS}`, [approvedLimit, application.user_id]
+      `UPDATE users SET seller_tier='premium',seller_listing_limit=$1,is_approved=true,verification_status='approved',seller_suspended=false,seller_suspended_reason=NULL
+        WHERE id=$2 AND is_suspended=false RETURNING ${USER_RETURNING_FIELDS}`, [approvedLimit, application.user_id]
     );
     if (!userResult.rows.length) { await client.query("ROLLBACK"); return res.status(409).json({ error:"The seller account is unavailable or suspended" }); }
     await client.query("UPDATE premium_seller_applications SET status='approved',decision_reason=$1,reviewed_by=$2,reviewed_at=NOW(),updated_at=NOW() WHERE id=$3",
@@ -6691,7 +6323,7 @@ async function sendDailyCasualSellerReport(force = false) {
     const applicationsResult = await lockClient.query(
       `SELECT a.*, u.username, u.email, u.phone
          FROM casual_seller_applications a JOIN users u ON u.id = a.user_id
-        WHERE a.status = 'approved' AND a.included_in_report_id IS NULL AND u.is_preview = false
+        WHERE a.status = 'approved' AND a.included_in_report_id IS NULL
         ORDER BY a.approved_at, a.id`
     );
     if (!applicationsResult.rows.length) return { skipped: true, reason: "no_applications" };
@@ -6764,7 +6396,7 @@ async function sendDailyVerifiedSellerReport(force = false) {
          JOIN users u ON u.id = a.user_id
          LEFT JOIN user_addresses addr ON addr.id = a.address_id
          LEFT JOIN users reviewer ON reviewer.id = a.reviewed_by
-        WHERE a.status = 'approved' AND a.included_in_report_id IS NULL AND u.is_preview = false
+        WHERE a.status = 'approved' AND a.included_in_report_id IS NULL
         ORDER BY a.reviewed_at, a.id`
     );
     if (!applicationsResult.rows.length) return { skipped: true, reason: "no_applications" };
@@ -6831,7 +6463,7 @@ async function sendDailyPremiumSellerReport(force = false) {
     const applications = await client.query(
       `SELECT a.*,u.username,u.display_name,u.email,u.phone,u.first_name,u.last_name,u.other_name
          FROM premium_seller_applications a JOIN users u ON u.id=a.user_id
-        WHERE a.status='approved' AND a.included_in_report_id IS NULL AND u.is_preview=false ORDER BY a.reviewed_at,a.id`
+        WHERE a.status='approved' AND a.included_in_report_id IS NULL ORDER BY a.reviewed_at,a.id`
     );
     if (!applications.rows.length) return { sent:false, applicationCount:0 };
     const recipientsResult = await client.query("SELECT email FROM users WHERE is_admin=true AND COALESCE(admin_role,'super_admin')='super_admin' AND is_suspended=false AND email IS NOT NULL AND email<>''");
@@ -6965,9 +6597,7 @@ app.get("/admin/casual-seller-applications", authenticate, requireSuperAdmin, as
               a.id_expiration, a.status, a.decision_reason, a.automatic_checks, a.liveness_challenges,
               a.approved_at, a.suspended_at, a.created_at, u.username, u.email, u.phone,
               ARRAY(SELECT jsonb_object_keys(a.evidence_paths)) AS evidence_keys
-         FROM casual_seller_applications a JOIN users u ON u.id=a.user_id
-        WHERE u.is_preview=false
-        ORDER BY a.created_at DESC LIMIT 500`
+         FROM casual_seller_applications a JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT 500`
     );
     res.json({ applications: result.rows });
   } catch (err) { sendInternalError(res, err); }
@@ -6996,7 +6626,6 @@ app.patch("/admin/casual-seller-applications/:id/suspend", authenticate, require
     await client.query("UPDATE casual_seller_applications SET status='suspended', suspended_at=NOW(), decision_reason=$1, updated_at=NOW() WHERE id=$2", [String(req.body?.reason || "Suspended after verification review").slice(0, 500), req.params.id]);
     await client.query("UPDATE users SET casual_seller_status='suspended', casual_seller_suspended_at=NOW(), seller_suspended=true, seller_suspended_reason=$1 WHERE id=$2", [String(req.body?.reason || "Suspended after verification review").slice(0, 500), application.rows[0].user_id]);
     await client.query("UPDATE listings SET status='paused' WHERE owner_id=$1 AND status='active'", [application.rows[0].user_id]);
-    await cancelOpenCheckoutsForSeller(client, application.rows[0].user_id, "Seller verification was suspended before payment completed");
     await client.query("COMMIT");
     logAdminAction(req.user.id, "casual_seller_suspended", `Suspended casual seller application ${application.rows[0].reference}`);
     createNotification(application.rows[0].user_id, "verification_problem", "Your casual-seller verification was suspended. Your active listings have been paused.");
@@ -7124,7 +6753,7 @@ app.post("/admin/premium-seller-reports/run", authenticate, requireSuperAdmin, a
   res.json(result);
 });
 
-app.post("/listings", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
+app.post("/listings", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   const client = await pool.connect();
   try {
     const {
@@ -7253,17 +6882,13 @@ app.get("/listings", async (req, res) => {
     const result = await pool.query(
       `SELECT listings.*, users.display_name AS seller_name, users.username AS owner_username,
               users.is_approved AS seller_is_approved, users.casual_seller_status,
-              users.is_suspended AS seller_is_suspended, users.seller_suspended
+              users.is_suspended AS seller_is_suspended
        FROM listings
        JOIN users ON listings.owner_id = users.id
        WHERE (
          listings.status = 'active'
-         AND ((users.is_approved = true AND users.seller_tier IN ('verified', 'premium'))
-              OR users.casual_seller_status = 'approved')
+         AND (users.is_approved = true OR users.casual_seller_status = 'approved')
          AND users.is_suspended = false
-         AND users.seller_suspended = false
-         AND users.is_preview = false
-         AND listings.is_preview = false
        )
        OR ($1::integer IS NOT NULL AND listings.owner_id = $1)
        ORDER BY listings.created_at DESC`,
@@ -7272,7 +6897,7 @@ app.get("/listings", async (req, res) => {
 
     const rows = result.rows.map((row) => {
       if (validUserId && row.owner_id === validUserId) {
-        const { seller_is_approved, casual_seller_status, seller_is_suspended, seller_suspended, ...ownRow } = row;
+        const { seller_is_approved, casual_seller_status, seller_is_suspended, ...ownRow } = row;
         return ownRow;
       }
       return publicListingRow(row);
@@ -7368,9 +6993,6 @@ app.patch("/listings/:id", authenticate, async (req, res) => {
     if (sets.length === 0) throw Object.assign(new Error("No valid fields to update"), { statusCode: 400 });
     const nextStatusRaw = Object.prototype.hasOwnProperty.call(req.body, "status") ? req.body.status : existing.rows[0].status;
     const nextStatus = nextStatusRaw === "approved" ? "active" : nextStatusRaw;
-    if (existing.rows[0].is_preview && nextStatus === "active") {
-      throw Object.assign(new Error("Preview listings cannot be activated in the live marketplace."), { statusCode: 403, code: "PREVIEW_ACCOUNT_RESTRICTED" });
-    }
     if (existing.rows[0].owner_id === req.user.id && nextStatus === "active") {
       await assertSellerMayPublish(
         client, req.user.id,
@@ -7600,7 +7222,7 @@ app.post("/checkout", authenticate, rejectAdminMarketplaceUse, requireCompletePr
   });
 });
 
-app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
+app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   try {
     const { items, shippingAddress, currency, saveCard } = req.body;
     if (!isNigeriaCountry(shippingAddress?.country)) {
@@ -7620,33 +7242,19 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, reject
     let subtotal = 0;
     let shippingTotal = 0;
     const itemSnapshots = [];
-    const seenListingIds = new Set();
     for (const cartItem of items) {
       const qty = Number(cartItem.qty);
       if (!cartItem.listingId || !Number.isInteger(qty) || qty <= 0) {
         return res.status(400).json({ error: "Each cart item needs a valid listingId and a positive quantity" });
       }
-      const listingId = Number(cartItem.listingId);
       const listingResult = await pool.query(
-        `SELECT listings.* FROM listings
-          JOIN users ON users.id = listings.owner_id
-         WHERE listings.id = $1 AND listings.status = 'active'
-           AND listings.is_preview = false
-           AND users.is_preview = false
-           AND users.is_suspended = false
-           AND users.seller_suspended = false
-           AND ((users.is_approved = true AND users.seller_tier IN ('verified', 'premium'))
-                OR users.casual_seller_status = 'approved')`,
+        "SELECT * FROM listings WHERE id = $1 AND status = 'active'",
         [cartItem.listingId]
       );
       if (listingResult.rows.length === 0) {
         return res.status(404).json({ error: `Listing ${cartItem.listingId} isn't available` });
       }
       const listing = listingResult.rows[0];
-      const availableQuantity = Math.max(1, Number(listing.quantity || 1));
-      if (qty > availableQuantity) {
-        return res.status(409).json({ error: `Only ${availableQuantity} unit${availableQuantity === 1 ? " is" : "s are"} available for ${listing.title}` });
-      }
       const price = Number(listing.price);
       if (!(price > 0)) return res.status(400).json({ error: "Listing has an invalid price" });
       const shippingFee = Number(listing.shipping_fee) || 0;
@@ -7728,7 +7336,7 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, reject
   }
 });
 
-app.post("/checkout/verify/:reference", authenticate, rejectPreviewRealWorldAction, async (req, res) => {
+app.post("/checkout/verify/:reference", authenticate, async (req, res) => {
   try {
     if (!process.env.PAYSTACK_SECRET_KEY) {
       return res.status(500).json({ error: "Payments aren't configured — contact support" });
@@ -7748,48 +7356,19 @@ app.post("/checkout/verify/:reference", authenticate, rejectPreviewRealWorldActi
     try {
       assertPaystackMatchesCheckoutIntent(intent, verifyData.data);
     } catch (integrityErr) {
+      await markCheckoutIntent(req.params.reference, "integrity_failed", integrityErr.message);
       await recordPaymentAttempt(req.user.id, { reference: req.params.reference, method: "checkout_verify", status: "integrity_failed", amount: Number(verifyData.data?.amount || 0) / 100, currency: verifyData.data?.currency || "NGN", message: integrityErr.message });
-      try {
-        const refund = await requestAutomaticCheckoutRefund(req.params.reference, integrityErr.message, {
-          transactionReference: verifyData.data?.reference,
-          amountKobo: Number(verifyData.data?.amount),
-          currency: verifyData.data?.currency,
-        });
-        if (refund.status === "finalized" && refund.orderId) {
-          const recovered = await pool.query("SELECT * FROM orders WHERE id = $1", [refund.orderId]);
-          return res.json({ order: recovered.rows[0], alreadyFinalized: true });
-        }
-        return res.status(409).json({ error: "Payment was received but did not pass checkout verification. A full automatic refund has been submitted.", refund });
-      } catch (refundErr) {
-        return res.status(502).json({ error: "Payment was received but did not pass checkout verification, and the automatic refund needs support review.", reference: req.params.reference });
-      }
+      return res.status(409).json({ error: "Payment received but checkout verification did not match. Your order was not created; contact support with the payment reference." });
     }
     await recordPaymentAttempt(req.user.id, { reference: req.params.reference, method: "checkout_verify", status: "success", amount: Number(verifyData.data?.amount || 0) / 100, currency: verifyData.data?.currency || "NGN" });
-    try {
-      const { order } = await finalizeOrderFromPaystackCharge(req.params.reference, verifyData.data);
-      res.json({ order });
-    } catch (finalizeErr) {
-      try {
-        const refund = await requestAutomaticCheckoutRefund(req.params.reference, finalizeErr.message, {
-          transactionReference: verifyData.data?.reference,
-          amountKobo: Number(verifyData.data?.amount),
-          currency: verifyData.data?.currency,
-        });
-        if (refund.status === "finalized" && refund.orderId) {
-          const recovered = await pool.query("SELECT * FROM orders WHERE id = $1", [refund.orderId]);
-          return res.json({ order: recovered.rows[0], alreadyFinalized: true });
-        }
-        return res.status(409).json({ error: "Payment was received, but the order could not be completed. A full automatic refund has been submitted.", refund });
-      } catch (refundErr) {
-        return res.status(502).json({ error: "Payment was received, but the order could not be completed and the automatic refund needs support review.", reference: req.params.reference });
-      }
-    }
+    const { order } = await finalizeOrderFromPaystackCharge(req.params.reference, verifyData.data);
+    res.json({ order });
   } catch (err) {
     sendInternalError(res, err);
   }
 });
 
-app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
+app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUse, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   try {
     const { items, shippingAddress, currency, cardId } = req.body;
     if (!isNigeriaCountry(shippingAddress?.country)) {
@@ -7816,35 +7395,19 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
     let subtotal = 0;
     let shippingTotal = 0;
     const itemSnapshots = [];
-    const seenListingIds = new Set();
     for (const cartItem of items) {
       const qty = Number(cartItem.qty);
       if (!cartItem.listingId || !Number.isInteger(qty) || qty <= 0) {
         return res.status(400).json({ error: "Each cart item needs a valid listingId and a positive quantity" });
       }
-      const listingId = Number(cartItem.listingId);
-      if (seenListingIds.has(listingId)) return res.status(400).json({ error: "Each listing may appear only once in checkout" });
-      seenListingIds.add(listingId);
       const listingResult = await pool.query(
-        `SELECT listings.* FROM listings
-          JOIN users ON users.id = listings.owner_id
-         WHERE listings.id = $1 AND listings.status = 'active'
-           AND listings.is_preview = false
-           AND users.is_preview = false
-           AND users.is_suspended = false
-           AND users.seller_suspended = false
-           AND ((users.is_approved = true AND users.seller_tier IN ('verified', 'premium'))
-                OR users.casual_seller_status = 'approved')`,
+        "SELECT * FROM listings WHERE id = $1 AND status = 'active'",
         [cartItem.listingId]
       );
       if (listingResult.rows.length === 0) {
         return res.status(404).json({ error: `Listing ${cartItem.listingId} isn't available` });
       }
       const listing = listingResult.rows[0];
-      const availableQuantity = Math.max(1, Number(listing.quantity || 1));
-      if (qty > availableQuantity) {
-        return res.status(409).json({ error: `Only ${availableQuantity} unit${availableQuantity === 1 ? " is" : "s are"} available for ${listing.title}` });
-      }
       const price = Number(listing.price);
       if (!(price > 0)) return res.status(400).json({ error: "Listing has an invalid price" });
       const shippingFee = Number(listing.shipping_fee) || 0;
@@ -7914,42 +7477,13 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
     try {
       assertPaystackMatchesCheckoutIntent(await loadCheckoutIntent(reference), chargeData.data);
     } catch (integrityErr) {
+      await markCheckoutIntent(reference, "integrity_failed", integrityErr.message);
       await recordPaymentAttempt(req.user.id, { reference, method: "saved_card", status: "integrity_failed", amount: Number(chargeData.data?.amount || 0) / 100, currency: chargeData.data?.currency || "NGN", message: integrityErr.message });
-      try {
-        const refund = await requestAutomaticCheckoutRefund(reference, integrityErr.message, {
-          transactionReference: chargeData.data?.reference,
-          amountKobo: Number(chargeData.data?.amount),
-          currency: chargeData.data?.currency,
-        });
-        if (refund.status === "finalized" && refund.orderId) {
-          const recovered = await pool.query("SELECT * FROM orders WHERE id = $1", [refund.orderId]);
-          return res.json({ order: recovered.rows[0], alreadyFinalized: true });
-        }
-        return res.status(409).json({ error: "Payment was received but did not pass checkout verification. A full automatic refund has been submitted.", refund });
-      } catch (refundErr) {
-        return res.status(502).json({ error: "Payment was received but did not pass checkout verification, and the automatic refund needs support review.", reference });
-      }
+      return res.status(409).json({ error: "Payment received but checkout verification did not match. Your order was not created; contact support with the payment reference." });
     }
     await recordPaymentAttempt(req.user.id, { reference, method: "saved_card", status: "success", amount: total, currency: "NGN" });
-    try {
-      const { order } = await finalizeOrderFromPaystackCharge(reference, chargeData.data);
-      res.json({ order });
-    } catch (finalizeErr) {
-      try {
-        const refund = await requestAutomaticCheckoutRefund(reference, finalizeErr.message, {
-          transactionReference: chargeData.data?.reference,
-          amountKobo: Number(chargeData.data?.amount),
-          currency: chargeData.data?.currency,
-        });
-        if (refund.status === "finalized" && refund.orderId) {
-          const recovered = await pool.query("SELECT * FROM orders WHERE id = $1", [refund.orderId]);
-          return res.json({ order: recovered.rows[0], alreadyFinalized: true });
-        }
-        return res.status(409).json({ error: "Payment was received, but the order could not be completed. A full automatic refund has been submitted.", refund });
-      } catch (refundErr) {
-        return res.status(502).json({ error: "Payment was received, but the order could not be completed and the automatic refund needs support review.", reference });
-      }
-    }
+    const { order } = await finalizeOrderFromPaystackCharge(reference, chargeData.data);
+    res.json({ order });
   } catch (err) {
     sendInternalError(res, err);
   }
@@ -8036,7 +7570,7 @@ app.get("/orders/selling", authenticate, rejectAdminMarketplaceUse, async (req, 
 
 app.get("/orders", authenticate, requirePermission("order_access"), async (req, res) => {
   try {
-    const orders = await fetchOrdersWithItems("is_preview = false", [], { includeAdminPayouts: true });
+    const orders = await fetchOrdersWithItems("TRUE", [], { includeAdminPayouts: true });
     res.json({ orders });
   } catch (err) {
     sendInternalError(res, err);
@@ -8053,10 +7587,6 @@ app.patch("/orders/:id/release", authenticate, requirePermission("finance"), asy
       return res.status(404).json({ error: "Order not found" });
     }
     const order = orderResult.rows[0];
-    if (order.is_preview) {
-      await client.query("ROLLBACK");
-      return res.status(403).json({ error: "Preview orders cannot release real funds", code: "PREVIEW_ACCOUNT_RESTRICTED" });
-    }
     if (order.payment_status !== "held") {
       await client.query("ROLLBACK");
       return res.status(409).json({ error: `Only held payments can be released. This order is currently ${order.payment_status}.` });
@@ -8206,7 +7736,7 @@ app.patch("/orders/:id/release", authenticate, requirePermission("finance"), asy
   }
 });
 
-app.post("/orders/:id/buyer-cancel-refund", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, async (req, res) => {
+app.post("/orders/:id/buyer-cancel-refund", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   const client = await pool.connect();
   let order;
   try {
@@ -8216,20 +7746,7 @@ app.post("/orders/:id/buyer-cancel-refund", authenticate, rejectAdminMarketplace
     if (!process.env.PAYSTACK_SECRET_KEY) return res.status(500).json({ error: "Paystack refunds aren't configured — contact support" });
 
     await client.query("BEGIN");
-    const orderResult = await client.query(
-      `SELECT orders.*,
-              created_at + INTERVAL '3 hours' AS cancellation_deadline,
-              (NOW() < created_at + INTERVAL '3 hours'
-               OR (refund_type = 'buyer_cancellation'
-                   AND refund_status = 'failed'
-                   AND refund_requested_at IS NOT NULL
-                   AND refund_requested_at < created_at + INTERVAL '3 hours'
-                   AND refund_requested_by = buyer_id)) AS cancellation_window_open
-         FROM orders
-        WHERE id = $1
-        FOR UPDATE`,
-      [req.params.id]
-    );
+    const orderResult = await client.query("SELECT * FROM orders WHERE id = $1 FOR UPDATE", [req.params.id]);
     if (!orderResult.rows.length) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "Order not found" });
@@ -8238,13 +7755,6 @@ app.post("/orders/:id/buyer-cancel-refund", authenticate, rejectAdminMarketplace
     if (Number(order.buyer_id) !== Number(req.user.id)) {
       await client.query("ROLLBACK");
       return res.status(403).json({ error: "Only the buyer can cancel or refund this order" });
-    }
-    if (!order.cancellation_window_open) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({
-        error: "The 3-hour cancellation window for this order has closed",
-        cancellationDeadline: order.cancellation_deadline,
-      });
     }
     if (order.payment_status !== "held") {
       await client.query("ROLLBACK");
@@ -8259,10 +7769,6 @@ app.post("/orders/:id/buyer-cancel-refund", authenticate, rejectAdminMarketplace
     if (!items.length || items.some((item) => item.delivery_token_sent_at || item.delivery_token_redeemed_at)) {
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "Cancellation and refund are permanently closed because a delivery token was sent to a seller" });
-    }
-    if (items.some((item) => item.fulfillment_status === "delivered" || item.buyer_confirmed_at || item.proof_of_delivery_url)) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ error: "This order has already been recorded as delivered and can no longer be cancelled" });
     }
     const payoutLock = await client.query(
       `SELECT 1 FROM seller_payouts WHERE order_id = $1 AND status IN ('queued', 'processing', 'request_unknown', 'paid') LIMIT 1`,
@@ -8283,26 +7789,15 @@ app.post("/orders/:id/buyer-cancel-refund", authenticate, rejectAdminMarketplace
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "This order has no refundable balance" });
     }
+    const received = items.some((item) => item.fulfillment_status === "delivered" || item.buyer_confirmed_at || item.proof_of_delivery_url);
     const locked = await client.query(
       `UPDATE orders SET payment_status = 'refund_pending', refund_status = 'requesting',
        refund_previous_payment_status = 'held', refund_reason = $1, refund_requested_by = $2,
        refund_type = 'buyer_cancellation', refund_amount = $3, cancellation_fee = $4,
-       buyer_exit_type = $5, refund_requested_at = COALESCE(refund_requested_at, NOW()),
-       refunded_at = NULL, refund_failure_reason = NULL
-       WHERE id = $6
-         AND (NOW() < created_at + INTERVAL '3 hours'
-              OR (refund_type = 'buyer_cancellation'
-                  AND refund_status = 'failed'
-                  AND refund_requested_at IS NOT NULL
-                  AND refund_requested_at < created_at + INTERVAL '3 hours'
-                  AND refund_requested_by = buyer_id))
-       RETURNING *`,
-      [reason, req.user.id, refundAmount, cancellationFee, "cancellation", order.id]
+       buyer_exit_type = $5, refund_requested_at = NOW(), refunded_at = NULL, refund_failure_reason = NULL
+       WHERE id = $6 RETURNING *`,
+      [reason, req.user.id, refundAmount, cancellationFee, received ? "return_refund" : "cancellation", order.id]
     );
-    if (!locked.rows.length) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ error: "The 3-hour cancellation window for this order has closed" });
-    }
     order = locked.rows[0];
     await client.query("COMMIT");
 
@@ -8316,7 +7811,7 @@ app.post("/orders/:id/buyer-cancel-refund", authenticate, rejectAdminMarketplace
           transaction: order.paystack_reference,
           amount: Math.round(refundAmount * 100),
           currency: order.currency || "NGN",
-          customer_note: `Stallyard cancellation refund for order #${order.id}; 2% cancellation fee retained.`,
+          customer_note: `Stallyard ${received ? "return" : "cancellation"} refund for order #${order.id}; 2% cancellation fee retained.`,
           merchant_note: `Automatic buyer refund for order #${order.id}; fee ${cancellationFee}.`,
         }),
       });
@@ -8334,42 +7829,12 @@ app.post("/orders/:id/buyer-cancel-refund", authenticate, rejectAdminMarketplace
       return res.status(400).json({ error: message, order: restored.rows[0] });
     }
     const refund = paystackData.data || {};
-    const refundStatus = String(refund.status || "pending").toLowerCase();
-    let updated;
-    if (refundStatus === "processed") {
-      const completionClient = await pool.connect();
-      try {
-        await completionClient.query("BEGIN");
-        updated = await completionClient.query(
-          `UPDATE orders SET payment_status = 'refunded', refund_status = 'processed',
-             paystack_refund_id = $1, refunded_at = NOW(), refund_failure_reason = NULL
-           WHERE id = $2 RETURNING *`,
-          [refund.id || null, order.id]
-        );
-        await completionClient.query(
-          `UPDATE order_items SET fulfillment_status = 'cancelled',
-             cancellation_status = 'approved', cancellation_responded_at = NOW(),
-             delivery_token = NULL, delivery_token_generated_at = NULL,
-             live_location_enabled = FALSE, live_location_expires_at = NULL
-           WHERE order_id = $1 AND delivery_token_sent_at IS NULL AND delivery_token_redeemed_at IS NULL`,
-          [order.id]
-        );
-        await completionClient.query("COMMIT");
-      } catch (completionErr) {
-        await completionClient.query("ROLLBACK").catch(() => {});
-        throw completionErr;
-      } finally {
-        completionClient.release();
-      }
-      createNotification(order.buyer_id, "refund_processed", `Your refund of ${formatMoneyServer(refundAmount, order.currency)} for order #${order.id} was processed after the ${formatMoneyServer(cancellationFee, order.currency)} cancellation fee.`);
-    } else {
-      updated = await pool.query(
-        `UPDATE orders SET refund_status = $1, paystack_refund_id = $2, refund_failure_reason = NULL WHERE id = $3 RETURNING *`,
-        [refundStatus, refund.id || null, order.id]
-      );
-      createNotification(order.buyer_id, "refund_started", `Your ${formatMoneyServer(refundAmount, order.currency)} refund for order #${order.id} was submitted. Stallyard retained the disclosed ${formatMoneyServer(cancellationFee, order.currency)} cancellation fee.`);
-    }
-    res.json({ order: updated.rows[0], refundAmount, cancellationFee, buyerExitType: "cancellation" });
+    const updated = await pool.query(
+      `UPDATE orders SET refund_status = $1, paystack_refund_id = $2, refund_failure_reason = NULL WHERE id = $3 RETURNING *`,
+      [refund.status || "pending", refund.id || null, order.id]
+    );
+    createNotification(order.buyer_id, "refund_started", `Your ${formatMoneyServer(refundAmount, order.currency)} refund for order #${order.id} was submitted. Stallyard retained the disclosed ${formatMoneyServer(cancellationFee, order.currency)} cancellation fee.`);
+    res.json({ order: updated.rows[0], refundAmount, cancellationFee, buyerExitType: received ? "return_refund" : "cancellation" });
   } catch (err) {
     try { await client.query("ROLLBACK"); } catch {}
     sendInternalError(res, err);
@@ -8403,11 +7868,6 @@ app.patch("/orders/:id/refund", authenticate, requirePermission("finance"), asyn
       return res.status(404).json({ error: "Order not found" });
     }
     order = orderResult.rows[0];
-
-    if (order.is_preview) {
-      await client.query("ROLLBACK");
-      return res.status(403).json({ error: "Preview orders cannot be submitted to Paystack for refunds", code: "PREVIEW_ACCOUNT_RESTRICTED" });
-    }
 
     if (order.payment_status !== "held") {
       await client.query("ROLLBACK");
@@ -8564,10 +8024,6 @@ app.patch("/orders/:id/refund/partial", authenticate, requirePermission("finance
       return res.status(404).json({ error: "Order not found" });
     }
     order = orderResult.rows[0];
-    if (order.is_preview) {
-      await client.query("ROLLBACK");
-      return res.status(403).json({ error: "Preview orders cannot be submitted to Paystack for refunds", code: "PREVIEW_ACCOUNT_RESTRICTED" });
-    }
     if (order.payment_status !== "held") {
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "Refunds are closed because seller payment is no longer being held" });
@@ -8723,19 +8179,15 @@ app.patch("/orders/:id/refund/partial", authenticate, requirePermission("finance
   }
 });
 
-app.patch("/orders/:id/dispute", authenticate, rejectPreviewRealWorldAction, async (req, res) => {
+app.patch("/orders/:id/dispute", authenticate, async (req, res) => {
   const client = await pool.connect();
   try {
     const { isDisputed, reason, statement, evidenceUrls } = req.body;
     await client.query("BEGIN");
-    const orderCheck = await client.query("SELECT buyer_id, payment_status, is_preview FROM orders WHERE id = $1 FOR UPDATE", [req.params.id]);
+    const orderCheck = await client.query("SELECT buyer_id, payment_status FROM orders WHERE id = $1 FOR UPDATE", [req.params.id]);
     if (orderCheck.rows.length === 0) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "Order not found" });
-    }
-    if (orderCheck.rows[0].is_preview) {
-      await client.query("ROLLBACK");
-      return res.status(403).json({ error: "Preview orders cannot create real dispute cases", code: "PREVIEW_ACCOUNT_RESTRICTED" });
     }
 
     const buyerId = orderCheck.rows[0].buyer_id;
@@ -8850,7 +8302,6 @@ app.get("/disputes", authenticate, requirePermission("dispute_resolution"), asyn
       LEFT JOIN users resolver ON resolver.id = dc.resolved_by_id
       LEFT JOIN order_items oi ON oi.order_id = o.id
       LEFT JOIN users seller ON seller.id = oi.seller_id
-      WHERE dc.is_preview=false AND o.is_preview=false
       GROUP BY dc.id, opener.username, opener.display_name, resolver.username, resolver.display_name,
         buyer.username, buyer.display_name, o.total, o.currency, o.payment_status, o.created_at
       ORDER BY CASE dc.status WHEN 'open' THEN 0 WHEN 'in_review' THEN 1 ELSE 2 END, dc.updated_at DESC
@@ -8877,7 +8328,7 @@ app.get("/disputes/mine", authenticate, async (req, res) => {
   }
 });
 
-app.post("/disputes/:id/statement", authenticate, rejectPreviewRealWorldAction, async (req, res) => {
+app.post("/disputes/:id/statement", authenticate, async (req, res) => {
   try {
     const statement = String(req.body.statement || "").trim();
     if (!statement) return res.status(400).json({ error: "Enter a statement first" });
@@ -8912,7 +8363,7 @@ app.patch("/disputes/:id", authenticate, requirePermission("dispute_resolution")
     if (status && !DISPUTE_STATUSES.has(status)) return res.status(400).json({ error: "Invalid dispute status" });
     if (resolution && !DISPUTE_RESOLUTIONS.has(resolution)) return res.status(400).json({ error: "Invalid resolution" });
     await client.query("BEGIN");
-    const existing = await client.query("SELECT * FROM dispute_cases WHERE id = $1 AND is_preview=false FOR UPDATE", [req.params.id]);
+    const existing = await client.query("SELECT * FROM dispute_cases WHERE id = $1 FOR UPDATE", [req.params.id]);
     if (!existing.rows.length) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "Dispute case not found" });
@@ -9009,7 +8460,7 @@ const ORDER_ITEM_STATUSES = new Set(["new", "preparing", "shipped", "delivered",
 app.patch("/order-items/:id", authenticate, async (req, res) => {
   try {
     const existing = await pool.query(
-      "SELECT seller_id, cancellation_status, fulfillment_status, estimated_delivery_start, estimated_delivery_end FROM order_items WHERE id = $1",
+      "SELECT seller_id, cancellation_status, fulfillment_status, carrier, self_delivery_stage, self_delivery_person_photo_url, estimated_delivery_start, estimated_delivery_end FROM order_items WHERE id = $1",
       [req.params.id]
     );
     if (existing.rows.length === 0) return res.status(404).json({ error: "Order item not found" });
@@ -9028,12 +8479,29 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
       liveLocationLatitude,
       liveLocationLongitude,
       liveLocationAccuracy,
+      selfDeliveryStage,
+      selfDeliveryPersonPhotoUrl,
     } = req.body;
     if (fulfillmentStatus && existing.rows[0].cancellation_status === "requested") {
       return res.status(409).json({ error: "Approve or deny the buyer's cancellation request before changing fulfillment status" });
     }
     if (fulfillmentStatus && !ORDER_ITEM_STATUSES.has(fulfillmentStatus)) {
       return res.status(400).json({ error: "Invalid fulfillment status" });
+    }
+    const SELF_DELIVERY_STAGES = new Set(["started", "on_my_way", "arrived", "delivered"]);
+    if (selfDeliveryStage !== undefined && selfDeliveryStage !== null && !SELF_DELIVERY_STAGES.has(selfDeliveryStage)) {
+      return res.status(400).json({ error: "Invalid self-delivery status" });
+    }
+    if (selfDeliveryPersonPhotoUrl !== undefined && typeof selfDeliveryPersonPhotoUrl !== "string") {
+      return res.status(400).json({ error: "Invalid delivery-person photo" });
+    }
+    const effectiveCarrier = typeof carrier === "string" ? carrier : existing.rows[0].carrier;
+    const effectiveSelfie = typeof selfDeliveryPersonPhotoUrl === "string" ? selfDeliveryPersonPhotoUrl : existing.rows[0].self_delivery_person_photo_url;
+    if (selfDeliveryStage !== undefined && effectiveCarrier !== "Self delivery") {
+      return res.status(400).json({ error: "Self-delivery status requires Self delivery as the carrier" });
+    }
+    if (selfDeliveryStage === "arrived" && !effectiveSelfie) {
+      return res.status(409).json({ error: "Take the delivery person's photo before marking I'm here" });
     }
     const sets = [];
     const values = [];
@@ -9093,6 +8561,14 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
     if (typeof proofOfDeliveryUrl === "string") {
       sets.push(`proof_of_delivery_url = $${i++}`);
       values.push(proofOfDeliveryUrl);
+    }
+    if (typeof selfDeliveryPersonPhotoUrl === "string") {
+      sets.push(`self_delivery_person_photo_url = $${i++}`);
+      values.push(selfDeliveryPersonPhotoUrl);
+    }
+    if (selfDeliveryStage !== undefined) {
+      sets.push(`self_delivery_stage = $${i++}`);
+      values.push(selfDeliveryStage || null);
     }
     if (deliveryStart !== undefined) {
       sets.push(`estimated_delivery_start = $${i++}`);
@@ -9583,7 +9059,7 @@ app.post("/order-items/:id/redeem-delivery-token", authenticate, codeRateLimit, 
     const { token } = req.body;
     if (!token) return res.status(400).json({ error: "Enter the code the buyer gave you" });
     const existing = await pool.query(
-      `SELECT oi.*, o.payment_status, o.is_disputed, o.is_preview
+      `SELECT oi.*, o.payment_status, o.is_disputed
        FROM order_items oi
        JOIN orders o ON oi.order_id = o.id
        WHERE oi.id = $1`,
@@ -9591,9 +9067,6 @@ app.post("/order-items/:id/redeem-delivery-token", authenticate, codeRateLimit, 
     );
     if (existing.rows.length === 0) return res.status(404).json({ error: "Order item not found" });
     const item = existing.rows[0];
-    if (item.is_preview) {
-      return res.status(403).json({ error: "Preview delivery tokens cannot release real money", code: "PREVIEW_ACCOUNT_RESTRICTED" });
-    }
     if (item.seller_id !== req.user.id) {
       return res.status(403).json({ error: "Only the seller for this item can redeem the buyer's delivery code" });
     }
@@ -9660,13 +9133,7 @@ app.post("/webhook/paystack", async (req, res) => {
         await finalizeOrderFromPaystackCharge(event.data.reference, event.data);
       } catch (err) {
         if (event.data?.reference) {
-          await requestAutomaticCheckoutRefund(event.data.reference, err.message, {
-            transactionReference: event.data?.reference,
-            amountKobo: Number(event.data?.amount),
-            currency: event.data?.currency,
-          }).catch((refundErr) => {
-            console.error("Webhook automatic checkout refund needs review:", refundErr.message);
-          });
+          await markCheckoutIntent(event.data.reference, "integrity_failed", err.message).catch(() => {});
         }
         console.error("Webhook order finalization blocked:", err.message);
       }
@@ -9796,29 +9263,6 @@ app.post("/webhook/paystack", async (req, res) => {
                 [refundStatus, data.id || null, event.event === "refund.needs-attention" ? (data.reason || "Customer bank details are required") : null, order.id]
               );
             }
-          } else {
-            const checkout = await pool.query("SELECT buyer_id FROM checkout_intents WHERE reference=$1", [transactionReference]);
-            if (checkout.rows.length) {
-              const refundStatus = data.status || event.event.replace("refund.", "");
-              if (event.event === "refund.processed") {
-                await pool.query(
-                  "UPDATE checkout_intents SET status='refunded', refund_status='processed', paystack_refund_id=COALESCE($2,paystack_refund_id), refunded_at=NOW() WHERE reference=$1",
-                  [transactionReference, data.id || null]
-                );
-                createNotification(checkout.rows[0].buyer_id, "refund_processed", "Your full refund has been processed because the order could not be completed.");
-              } else if (event.event === "refund.failed") {
-                await pool.query(
-                  "UPDATE checkout_intents SET status='integrity_failed', refund_status='failed', paystack_refund_id=COALESCE($2,paystack_refund_id), failure_reason=$3 WHERE reference=$1",
-                  [transactionReference, data.id || null, data.reason || "Paystack reported that the refund failed"]
-                );
-                createNotification(checkout.rows[0].buyer_id, "refund_failed", "Your automatic refund could not be completed. Stallyard support will review it.");
-              } else {
-                await pool.query(
-                  "UPDATE checkout_intents SET status='refund_pending', refund_status=$2, paystack_refund_id=COALESCE($3,paystack_refund_id), failure_reason=CASE WHEN $4::boolean THEN $5 ELSE failure_reason END WHERE reference=$1",
-                  [transactionReference, refundStatus, data.id || null, event.event === "refund.needs-attention", data.reason || "Customer bank details are required"]
-                );
-              }
-            }
           }
         } catch (err) {
           console.error("Refund webhook handling error:", err.message);
@@ -9890,7 +9334,7 @@ async function resolvePaystackBankAccount(userId, bankCode, accountNumber) {
   };
 }
 
-app.post("/paystack/resolve-account", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, bankAccountResolveRateLimit, async (req, res) => {
+app.post("/paystack/resolve-account", authenticate, rejectAdminMarketplaceUse, bankAccountResolveRateLimit, async (req, res) => {
   try {
     const result = await resolvePaystackBankAccount(req.user.id, req.body?.bankCode, req.body?.accountNumber);
     if (result.error) return res.status(result.status).json({ error: result.error });
@@ -9937,7 +9381,6 @@ async function verifyAndSaveBankDetails(userId, bankCode, accountNumber, expecte
 app.post(
   "/sellers/bank-details",
   authenticate,
-  rejectPreviewRealWorldAction,
   bankChangeSendIpRateLimit,
   bankChangeSendUserRateLimit,
   async (req, res) => {
@@ -9969,11 +9412,10 @@ app.post(
     }
 
     const existing = await pool.query(
-      "SELECT account_number, email, username, display_name, is_admin, is_approved, is_preview FROM users WHERE id = $1",
+      "SELECT account_number, email, username, display_name, is_admin, is_approved FROM users WHERE id = $1",
       [targetUserId]
     );
     if (existing.rows.length === 0) return res.status(404).json({ error: "User not found" });
-    if (existing.rows[0].is_preview) return res.status(403).json({ error: "Preview accounts cannot store payout bank details" });
 
     // Admin override is only for marketplace sellers, never another staff
     // account. Staff/admin identities are deliberately separated from seller
@@ -10070,7 +9512,6 @@ app.post(
 app.post(
   "/sellers/bank-details/confirm",
   authenticate,
-  rejectPreviewRealWorldAction,
   bankChangeConfirmRateLimit,
   async (req, res) => {
   try {
@@ -10137,8 +9578,7 @@ async function queueAutomaticSellerPayouts(orderId, onlySellerId = null) {
     `SELECT oi.seller_id,
        ROUND(SUM((oi.price * oi.qty) - (oi.price * oi.qty * o.commission_rate) + (oi.shipping_fee * oi.qty))::numeric, 2) AS amount
      FROM order_items oi JOIN orders o ON o.id = oi.order_id
-     WHERE o.id = $1 AND o.is_preview = false
-       AND o.payment_status IN ('held', 'released') AND COALESCE(o.is_disputed, false) = false
+     WHERE o.id = $1 AND o.payment_status IN ('held', 'released') AND COALESCE(o.is_disputed, false) = false
        AND ($2::int IS NULL OR oi.seller_id = $2)
        AND oi.fulfillment_status NOT IN ('cancelled', 'returned')
        AND NOT EXISTS (
@@ -10236,11 +9676,7 @@ app.post("/seller-payouts/:id/retry", authenticate, requirePermission("finance")
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "Only confirmed failed, reversed, or bank-details-required payouts can be retried" });
     }
-    const userResult = await client.query("SELECT paystack_recipient_code, is_preview FROM users WHERE id = $1", [payout.seller_id]);
-    if (userResult.rows[0]?.is_preview) {
-      await client.query("ROLLBACK");
-      return res.status(403).json({ error: "Preview-account payouts cannot be retried" });
-    }
+    const userResult = await client.query("SELECT paystack_recipient_code FROM users WHERE id = $1", [payout.seller_id]);
     const encryptedRecipient = userResult.rows[0]?.paystack_recipient_code;
     if (!encryptedRecipient) {
       await client.query("ROLLBACK");
@@ -10297,13 +9733,10 @@ app.post("/sellers/payout", authenticate, requirePermission("finance"), async (r
     }
 
     const userResult = await pool.query(
-      "SELECT paystack_recipient_code, is_preview FROM users WHERE id = $1",
+      "SELECT paystack_recipient_code FROM users WHERE id = $1",
       [userId]
     );
 
-    if (userResult.rows[0]?.is_preview) {
-      return res.status(403).json({ error: "Preview accounts cannot receive real payouts" });
-    }
     if (userResult.rows.length === 0 || !userResult.rows[0].paystack_recipient_code) {
       return res.status(400).json({ error: "This seller hasn't added bank details yet" });
     }
@@ -10332,7 +9765,7 @@ async function computeAvailableBalance(client, sellerId) {
            ELSE 0 END) AS seller_proceeds
        FROM order_items oi
        JOIN orders o ON oi.order_id = o.id
-       WHERE oi.seller_id = $1 AND o.payment_status = 'released' AND o.is_preview = false
+       WHERE oi.seller_id = $1 AND o.payment_status = 'released'
        GROUP BY o.id, o.refund_type, o.refund_amount
      )
      SELECT COALESCE(SUM(
@@ -10353,7 +9786,7 @@ async function computeAvailableBalance(client, sellerId) {
   return Math.max(0, Math.round((released - reserved) * 100) / 100);
 }
 
-app.post("/withdrawals", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, async (req, res) => {
+app.post("/withdrawals", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   const client = await pool.connect();
   try {
     const amount = Math.round(Number(req.body.amount) * 100) / 100;
@@ -10431,12 +9864,7 @@ app.get("/withdrawals/mine", authenticate, rejectAdminMarketplaceUse, async (req
 
 app.get("/withdrawals", authenticate, requirePermission("finance"), async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT w.* FROM withdrawals w
-       JOIN users u ON u.id = w.seller_id
-       WHERE u.is_preview = false
-       ORDER BY w.requested_at DESC`
-    );
+    const result = await pool.query("SELECT * FROM withdrawals ORDER BY requested_at DESC");
     res.json({ withdrawals: result.rows });
   } catch (err) {
     sendInternalError(res, err);
@@ -10451,7 +9879,7 @@ app.get("/admin/buyer-risk", authenticate, requirePermission("user_management"),
     const hasPaymentAttempts = await pool.query(`SELECT to_regclass('public.payment_attempts') AS name`);
     const paymentAttemptsReady = !!hasPaymentAttempts.rows[0]?.name;
     const paymentAttemptSelect = paymentAttemptsReady
-      ? `(SELECT COUNT(*) FROM payment_attempts pa WHERE pa.user_id = u.id AND pa.is_preview=false AND pa.status = 'failed') AS failed_payment_count,`
+      ? `(SELECT COUNT(*) FROM payment_attempts pa WHERE pa.user_id = u.id AND pa.status = 'failed') AS failed_payment_count,`
       : `0 AS failed_payment_count,`;
 
     const result = await pool.query(`
@@ -10466,22 +9894,21 @@ app.get("/admin/buyer-risk", authenticate, requirePermission("user_management"),
         u.is_phone_verified,
         u.created_at AS joined_at,
         (SELECT MAX(lh.created_at) FROM login_history lh WHERE lh.user_id = u.id) AS last_login_at,
-        (SELECT COUNT(*) FROM orders o WHERE o.buyer_id = u.id AND o.is_preview=false) AS order_count,
-        (SELECT COUNT(*) FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.buyer_id = u.id AND o.is_preview=false AND oi.is_preview=false) AS item_count,
-        (SELECT COUNT(*) FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.buyer_id = u.id AND o.is_preview=false AND oi.is_preview=false AND oi.fulfillment_status = 'delivered') AS completed_items,
-        (SELECT COUNT(*) FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.buyer_id = u.id AND o.is_preview=false AND oi.is_preview=false AND oi.fulfillment_status = 'cancelled') AS cancelled_items,
-        (SELECT COUNT(*) FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.buyer_id = u.id AND o.is_preview=false AND oi.is_preview=false AND oi.return_status IS NOT NULL) AS return_count,
-        (SELECT COUNT(*) FROM dispute_cases dc JOIN orders o ON o.id = dc.order_id WHERE o.buyer_id = u.id AND o.is_preview=false AND dc.is_preview=false) AS dispute_count,
-        (SELECT COUNT(*) FROM dispute_cases dc JOIN orders o ON o.id = dc.order_id WHERE o.buyer_id = u.id AND o.is_preview=false AND dc.is_preview=false AND dc.status <> 'resolved') AS open_disputes,
-        (SELECT COUNT(*) FROM orders o WHERE o.buyer_id = u.id AND o.is_preview=false AND (o.refund_status IS NOT NULL OR o.payment_status = 'refunded')) AS refund_count,
-        (SELECT COUNT(*) FROM account_reports ar WHERE ar.user_id = u.id AND ar.is_preview=false) AS report_count,
-        (SELECT COUNT(*) FROM account_reports ar WHERE ar.user_id = u.id AND ar.is_preview=false AND ar.status = 'open') AS open_report_count,
+        (SELECT COUNT(*) FROM orders o WHERE o.buyer_id = u.id) AS order_count,
+        (SELECT COUNT(*) FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.buyer_id = u.id) AS item_count,
+        (SELECT COUNT(*) FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.buyer_id = u.id AND oi.fulfillment_status = 'delivered') AS completed_items,
+        (SELECT COUNT(*) FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.buyer_id = u.id AND oi.fulfillment_status = 'cancelled') AS cancelled_items,
+        (SELECT COUNT(*) FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.buyer_id = u.id AND oi.return_status IS NOT NULL) AS return_count,
+        (SELECT COUNT(*) FROM dispute_cases dc JOIN orders o ON o.id = dc.order_id WHERE o.buyer_id = u.id) AS dispute_count,
+        (SELECT COUNT(*) FROM dispute_cases dc JOIN orders o ON o.id = dc.order_id WHERE o.buyer_id = u.id AND dc.status <> 'resolved') AS open_disputes,
+        (SELECT COUNT(*) FROM orders o WHERE o.buyer_id = u.id AND (o.refund_status IS NOT NULL OR o.payment_status = 'refunded')) AS refund_count,
+        (SELECT COUNT(*) FROM account_reports ar WHERE ar.user_id = u.id) AS report_count,
+        (SELECT COUNT(*) FROM account_reports ar WHERE ar.user_id = u.id AND ar.status = 'open') AS open_report_count,
         ${paymentAttemptSelect}
-        (SELECT COALESCE(SUM(o.total), 0) FROM orders o WHERE o.buyer_id = u.id AND o.is_preview=false) AS lifetime_spend
+        (SELECT COALESCE(SUM(o.total), 0) FROM orders o WHERE o.buyer_id = u.id) AS lifetime_spend
       FROM users u
       WHERE u.is_admin = false
-        AND u.is_preview = false
-        AND EXISTS (SELECT 1 FROM orders o WHERE o.buyer_id = u.id AND o.is_preview=false)
+        AND EXISTS (SELECT 1 FROM orders o WHERE o.buyer_id = u.id)
       ORDER BY u.display_name ASC, u.username ASC
     `);
 
@@ -10613,35 +10040,34 @@ app.get("/admin/seller-performance", authenticate, requirePermission("seller_ver
         u.verification_status,
         u.created_at AS joined_at,
         (SELECT MAX(lh.created_at) FROM login_history lh WHERE lh.user_id = u.id) AS last_login_at,
-        (SELECT COUNT(DISTINCT oi.order_id) FROM order_items oi WHERE oi.seller_id = u.id AND oi.is_preview=false) AS order_count,
-        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.is_preview=false) AS item_count,
-        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.is_preview=false AND oi.fulfillment_status = 'delivered') AS completed_deliveries,
-        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.is_preview=false AND oi.fulfillment_status = 'cancelled') AS cancelled_count,
-        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.is_preview=false AND oi.fulfillment_status = 'returned') AS returned_count,
-        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.is_preview=false AND oi.ship_reminder_sent_at IS NOT NULL) AS ship_reminder_count,
-        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.is_preview=false AND oi.fulfillment_status = 'new' AND oi.created_at < NOW() - INTERVAL '24 hours') AS active_ship_reminders,
+        (SELECT COUNT(DISTINCT oi.order_id) FROM order_items oi WHERE oi.seller_id = u.id) AS order_count,
+        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id) AS item_count,
+        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.fulfillment_status = 'delivered') AS completed_deliveries,
+        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.fulfillment_status = 'cancelled') AS cancelled_count,
+        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.fulfillment_status = 'returned') AS returned_count,
+        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.ship_reminder_sent_at IS NOT NULL) AS ship_reminder_count,
+        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.fulfillment_status = 'new' AND oi.created_at < NOW() - INTERVAL '24 hours') AS active_ship_reminders,
         (SELECT AVG(EXTRACT(EPOCH FROM (oi.shipped_at - oi.created_at)) / 3600.0)
-           FROM order_items oi WHERE oi.seller_id = u.id AND oi.is_preview=false AND oi.shipped_at IS NOT NULL AND oi.shipped_at >= oi.created_at) AS average_hours_to_ship,
+           FROM order_items oi WHERE oi.seller_id = u.id AND oi.shipped_at IS NOT NULL AND oi.shipped_at >= oi.created_at) AS average_hours_to_ship,
         (SELECT COALESCE(SUM((oi.price * oi.qty) + (oi.shipping_fee * oi.qty)), 0)
-           FROM order_items oi WHERE oi.seller_id = u.id AND oi.is_preview=false AND oi.fulfillment_status NOT IN ('cancelled', 'returned')) AS gross_merchandise,
-        (SELECT COUNT(*) FROM reviews r WHERE r.seller_id = u.id AND r.is_preview=false) AS review_count,
-        (SELECT COALESCE(AVG(r.rating), 0) FROM reviews r WHERE r.seller_id = u.id AND r.is_preview=false) AS average_rating,
+           FROM order_items oi WHERE oi.seller_id = u.id AND oi.fulfillment_status NOT IN ('cancelled', 'returned')) AS gross_merchandise,
+        (SELECT COUNT(*) FROM reviews r WHERE r.seller_id = u.id) AS review_count,
+        (SELECT COALESCE(AVG(r.rating), 0) FROM reviews r WHERE r.seller_id = u.id) AS average_rating,
         (SELECT COUNT(*) FROM seller_warnings sw WHERE sw.user_id = u.id) AS warning_count,
         (SELECT COUNT(DISTINCT dc.id)
            FROM dispute_cases dc
-           WHERE dc.is_preview=false AND EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = dc.order_id AND oi.seller_id = u.id AND oi.is_preview=false)) AS dispute_count,
+           WHERE EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = dc.order_id AND oi.seller_id = u.id)) AS dispute_count,
         (SELECT COUNT(DISTINCT dc.id)
            FROM dispute_cases dc
-           WHERE dc.status <> 'resolved' AND dc.is_preview=false
-             AND EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = dc.order_id AND oi.seller_id = u.id AND oi.is_preview=false)) AS open_disputes,
+           WHERE dc.status <> 'resolved'
+             AND EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = dc.order_id AND oi.seller_id = u.id)) AS open_disputes,
         (SELECT COALESCE(SUM(amount), 0) FROM withdrawals w WHERE w.seller_id = u.id AND w.status = 'failed') AS failed_withdrawal_amount
       FROM users u
       WHERE u.is_admin = false
-        AND u.is_preview = false
         AND (
           u.is_approved = true
           OR u.has_applied_to_sell = true
-          OR EXISTS (SELECT 1 FROM order_items oi WHERE oi.seller_id = u.id AND oi.is_preview=false)
+          OR EXISTS (SELECT 1 FROM order_items oi WHERE oi.seller_id = u.id)
         )
       ORDER BY u.display_name ASC, u.username ASC
     `);
@@ -10828,7 +10254,7 @@ app.get("/admin/reports/:type", authenticate, async (req, res) => {
                COALESCE(SUM(oi.qty), 0) AS item_quantity
         FROM orders o
         LEFT JOIN order_items oi ON oi.order_id = o.id
-        ${where ? where + " AND o.is_preview = false" : "WHERE o.is_preview = false"}
+        ${where}
         GROUP BY o.id
         ORDER BY o.created_at DESC
         LIMIT 10000
@@ -10898,8 +10324,7 @@ app.get("/admin/reports/:type", authenticate, async (req, res) => {
         SELECT w.id, w.seller_username, w.amount, w.status, w.failure_reason,
                w.paystack_transfer_code, w.requested_at, w.processed_at
         FROM withdrawals w
-        JOIN users u ON u.id=w.seller_id
-        ${where}${where ? " AND" : " WHERE"} u.is_preview=false
+        ${where}
         ORDER BY w.requested_at DESC
         LIMIT 10000
       `, params);
@@ -10932,10 +10357,10 @@ app.get("/admin/reports/:type", authenticate, async (req, res) => {
                  JOIN orders o ON o.id = oi.order_id
                  WHERE oi.seller_id = u.id AND o.payment_status = 'released'
                ), 0) AS released_merchandise,
-               COALESCE((SELECT AVG(rv.rating) FROM reviews rv WHERE rv.seller_id = u.id AND rv.is_preview=false), 0) AS avg_rating,
-               COALESCE((SELECT COUNT(*) FROM reviews rv WHERE rv.seller_id = u.id AND rv.is_preview=false), 0) AS review_count
+               COALESCE((SELECT AVG(rv.rating) FROM reviews rv WHERE rv.seller_id = u.id), 0) AS avg_rating,
+               COALESCE((SELECT COUNT(*) FROM reviews rv WHERE rv.seller_id = u.id), 0) AS review_count
         FROM users u
-        ${where ? where + " AND u.is_preview = false AND (u.has_applied_to_sell = true OR u.is_approved = true)" : "WHERE u.is_preview = false AND (u.has_applied_to_sell = true OR u.is_approved = true)"}
+        ${where ? where + " AND (u.has_applied_to_sell = true OR u.is_approved = true)" : "WHERE (u.has_applied_to_sell = true OR u.is_approved = true)"}
         ORDER BY u.created_at DESC
         LIMIT 10000
       `, params);
@@ -10992,16 +10417,13 @@ app.get("/admin/reconciliation", authenticate, requirePermission("finance"), asy
         ) AS missing_pod_count
       FROM orders o
       LEFT JOIN order_items oi ON oi.order_id = o.id
-      WHERE o.is_preview = false
       GROUP BY o.id
       ORDER BY o.created_at DESC
       LIMIT 500
     `);
     const withdrawalsResult = await pool.query(`
       SELECT status, COALESCE(SUM(amount), 0) AS amount, COUNT(*) AS count
-      FROM withdrawals w
-      JOIN users u ON u.id=w.seller_id
-      WHERE u.is_preview=false
+      FROM withdrawals
       GROUP BY status
     `);
 
@@ -11190,20 +10612,6 @@ app.post("/threads", authenticate, rejectAdminMarketplaceUse, async (req, res) =
       return res.status(403).json({ error: "You can only start a thread you're a part of" });
     }
 
-    const isolation = await pool.query(
-      `SELECT l.owner_id, l.is_preview AS listing_preview, b.is_preview AS buyer_preview, s.is_preview AS seller_preview
-       FROM listings l JOIN users b ON b.id=$2 JOIN users s ON s.id=$3 WHERE l.id=$1`,
-      [listingId, buyerId, sellerId]
-    );
-    if (!isolation.rows.length) return res.status(404).json({ error: "Listing or participant not found" });
-    const flags = isolation.rows[0];
-    if (Number(flags.owner_id) !== Number(sellerId) || Number(buyerId) === Number(sellerId)) {
-      return res.status(400).json({ error: "The selected seller does not own this listing" });
-    }
-    if (!!flags.listing_preview !== !!req.user.isPreview || !!flags.buyer_preview !== !!req.user.isPreview || !!flags.seller_preview !== !!req.user.isPreview) {
-      return res.status(403).json({ error: "Preview conversations must remain inside the preview environment", code: "PREVIEW_ACCOUNT_RESTRICTED" });
-    }
-
     const existing = await pool.query(
       "SELECT * FROM threads WHERE listing_id = $1 AND buyer_id = $2 AND seller_id = $3",
       [listingId, buyerId, sellerId]
@@ -11214,8 +10622,8 @@ app.post("/threads", authenticate, rejectAdminMarketplaceUse, async (req, res) =
     }
 
     const result = await pool.query(
-      "INSERT INTO threads (listing_id, buyer_id, seller_id, is_preview) VALUES ($1, $2, $3, $4) RETURNING *",
-      [listingId, buyerId, sellerId, !!req.user.isPreview]
+      "INSERT INTO threads (listing_id, buyer_id, seller_id) VALUES ($1, $2, $3) RETURNING *",
+      [listingId, buyerId, sellerId]
     );
 
     res.status(201).json({ thread: result.rows[0] });
@@ -11247,18 +10655,15 @@ app.post("/messages", authenticate, rejectAdminMarketplaceUse, async (req, res) 
     if (!threadId) {
       return res.status(400).json({ error: "Missing threadId" });
     }
-    const thread = await pool.query("SELECT buyer_id, seller_id, is_preview FROM threads WHERE id = $1", [threadId]);
+    const thread = await pool.query("SELECT buyer_id, seller_id FROM threads WHERE id = $1", [threadId]);
     if (thread.rows.length === 0) return res.status(404).json({ error: "Thread not found" });
     if (thread.rows[0].buyer_id !== senderId && thread.rows[0].seller_id !== senderId) {
       return res.status(403).json({ error: "You're not a part of this thread" });
     }
-    if (!!thread.rows[0].is_preview !== !!req.user.isPreview) {
-      return res.status(403).json({ error: "Preview conversations must remain inside the preview environment", code: "PREVIEW_ACCOUNT_RESTRICTED" });
-    }
 
     const result = await pool.query(
-      `INSERT INTO messages (thread_id, sender_id, message_type, body, offer_amount, offer_status, image_url, order_id, is_preview)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `INSERT INTO messages (thread_id, sender_id, message_type, body, offer_amount, offer_status, image_url, order_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING *`,
       [
         threadId,
@@ -11269,7 +10674,6 @@ app.post("/messages", authenticate, rejectAdminMarketplaceUse, async (req, res) 
         messageType === "offer" ? "pending" : null,
         imageUrl || null,
         orderId || null,
-        !!req.user.isPreview,
       ]
     );
 
@@ -11353,7 +10757,7 @@ app.patch("/messages/:id/offer", authenticate, async (req, res) => {
   }
 });
 
-app.post("/messages/:id/report", authenticate, rejectPreviewRealWorldAction, async (req, res) => {
+app.post("/messages/:id/report", authenticate, async (req, res) => {
   try {
     const { reason } = req.body;
     const msgResult = await pool.query("SELECT thread_id FROM messages WHERE id = $1", [req.params.id]);
@@ -11390,7 +10794,6 @@ app.get("/message-reports", authenticate, requirePermission("dispute_resolution"
        LEFT JOIN users sender ON m.sender_id = sender.id
        LEFT JOIN users reporter ON mr.reporter_id = reporter.id
        LEFT JOIN listings l ON t.listing_id = l.id
-       WHERE mr.is_preview=false AND m.is_preview=false AND t.is_preview=false
        ORDER BY mr.created_at DESC`
     );
     res.json({ reports: result.rows });
@@ -11402,7 +10805,7 @@ app.get("/message-reports", authenticate, requirePermission("dispute_resolution"
 app.patch("/message-reports/:id/resolve", authenticate, requirePermission("dispute_resolution"), async (req, res) => {
   try {
     const result = await pool.query(
-      "UPDATE message_reports SET status = 'resolved', resolved_at = NOW() WHERE id = $1 AND is_preview=false RETURNING *",
+      "UPDATE message_reports SET status = 'resolved', resolved_at = NOW() WHERE id = $1 RETURNING *",
       [req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Report not found" });
@@ -11415,14 +10818,14 @@ app.patch("/message-reports/:id/resolve", authenticate, requirePermission("dispu
 
 app.get("/reviews", async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM reviews WHERE is_preview=false ORDER BY created_at DESC");
+    const result = await pool.query("SELECT * FROM reviews ORDER BY created_at DESC");
     res.json({ reviews: result.rows });
   } catch (err) {
     sendInternalError(res, err);
   }
 });
 
-app.post("/reviews", authenticate, rejectPreviewRealWorldAction, async (req, res) => {
+app.post("/reviews", authenticate, async (req, res) => {
   try {
     const { orderId, listingId, sellerId, rating, comment } = req.body;
     const buyerId = req.user.id;
@@ -11437,8 +10840,7 @@ app.post("/reviews", authenticate, rejectPreviewRealWorldAction, async (req, res
     const purchase = await pool.query(
       `SELECT oi.fulfillment_status, o.payment_status FROM orders o
        JOIN order_items oi ON oi.order_id = o.id
-       WHERE o.id = $1 AND o.buyer_id = $2 AND oi.listing_id = $3 AND oi.seller_id = $4
-         AND o.is_preview=false AND oi.is_preview=false`,
+       WHERE o.id = $1 AND o.buyer_id = $2 AND oi.listing_id = $3 AND oi.seller_id = $4`,
       [orderId, buyerId, listingId, sellerId]
     );
     if (purchase.rows.length === 0) {
@@ -11495,7 +10897,7 @@ app.patch("/reviews/:id", authenticate, async (req, res) => {
 app.get("/listings/:id/reviews", async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT * FROM reviews WHERE listing_id = $1 AND is_preview=false ORDER BY created_at DESC",
+      "SELECT * FROM reviews WHERE listing_id = $1 ORDER BY created_at DESC",
       [req.params.id]
     );
     res.json({ reviews: result.rows });
@@ -11507,7 +10909,7 @@ app.get("/listings/:id/reviews", async (req, res) => {
 app.get("/sellers/:id/reviews", async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT * FROM reviews WHERE seller_id = $1 AND is_preview=false ORDER BY created_at DESC",
+      "SELECT * FROM reviews WHERE seller_id = $1 ORDER BY created_at DESC",
       [req.params.id]
     );
     res.json({ reviews: result.rows });
@@ -11537,7 +10939,7 @@ app.patch("/reviews/:id/respond", authenticate, async (req, res) => {
   }
 });
 
-app.post("/reviews/:id/report", authenticate, rejectPreviewRealWorldAction, async (req, res) => {
+app.post("/reviews/:id/report", authenticate, async (req, res) => {
   try {
     const { reason } = req.body;
     const existing = await pool.query("SELECT id FROM reviews WHERE id = $1", [req.params.id]);
@@ -11565,7 +10967,6 @@ app.get("/review-reports", authenticate, requirePermission("dispute_resolution")
        LEFT JOIN users buyer ON r.buyer_id = buyer.id
        LEFT JOIN users seller ON r.seller_id = seller.id
        LEFT JOIN users reporter ON rr.reporter_id = reporter.id
-       WHERE rr.is_preview=false AND r.is_preview=false
        ORDER BY rr.created_at DESC`
     );
     res.json({ reports: result.rows });
@@ -11577,7 +10978,7 @@ app.get("/review-reports", authenticate, requirePermission("dispute_resolution")
 app.patch("/review-reports/:id/resolve", authenticate, requirePermission("dispute_resolution"), async (req, res) => {
   try {
     const result = await pool.query(
-      "UPDATE review_reports SET status = 'resolved', resolved_at = NOW() WHERE id = $1 AND is_preview=false RETURNING *",
+      "UPDATE review_reports SET status = 'resolved', resolved_at = NOW() WHERE id = $1 RETURNING *",
       [req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Report not found" });
@@ -11590,7 +10991,7 @@ app.patch("/review-reports/:id/resolve", authenticate, requirePermission("disput
 
 const SELLER_REPORT_REASONS = new Set(["fraud", "counterfeit", "harassment", "prohibited_item", "misleading_listing", "delivery_misconduct", "other"]);
 
-app.post("/seller-reports", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, async (req, res) => {
+app.post("/seller-reports", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     const sellerId = Number(req.body?.sellerId);
     const orderId = req.body?.orderId ? Number(req.body.orderId) : null;
@@ -11650,7 +11051,6 @@ app.get("/seller-reports", authenticate, requirePermission("seller_report_review
          seller.username AS seller_username, seller.display_name AS seller_display_name
        FROM seller_reports sr JOIN users reporter ON reporter.id = sr.reporter_id
        JOIN users seller ON seller.id = sr.reported_seller_id
-       WHERE sr.is_preview=false AND reporter.is_preview=false AND seller.is_preview=false
        ORDER BY CASE sr.status WHEN 'open' THEN 0 WHEN 'in_review' THEN 1 ELSE 2 END, sr.created_at DESC`
     );
     res.json({ reports: result.rows });
@@ -11665,7 +11065,7 @@ app.patch("/seller-reports/:id", authenticate, requirePermission("seller_report_
     const result = await pool.query(
       `UPDATE seller_reports SET status=$1, admin_note=$2, reviewed_by=$3, updated_at=NOW(),
          resolved_at=CASE WHEN $1 IN ('resolved','dismissed') THEN NOW() ELSE NULL END
-       WHERE id=$4 AND is_preview=false RETURNING *`, [status, adminNote || null, req.user.id, req.params.id]
+       WHERE id=$4 RETURNING *`, [status, adminNote || null, req.user.id, req.params.id]
     );
     if (!result.rows.length) return res.status(404).json({ error: "Seller report not found" });
     logAdminAction(req.user.id, "seller_report_updated", `Seller report ${result.rows[0].reference} marked ${status}`);
@@ -11673,7 +11073,7 @@ app.patch("/seller-reports/:id", authenticate, requirePermission("seller_report_
   } catch (err) { sendInternalError(res, err); }
 });
 
-app.post("/account-reports", authenticate, rejectPreviewRealWorldAction, async (req, res) => {
+app.post("/account-reports", authenticate, async (req, res) => {
   try {
     const { message } = req.body;
     if (!message || !message.trim()) {
@@ -11695,7 +11095,6 @@ app.get("/account-reports", authenticate, requirePermission("user_management"), 
       `SELECT ar.*, u.username, u.display_name
        FROM account_reports ar
        JOIN users u ON ar.user_id = u.id
-       WHERE ar.is_preview=false AND u.is_preview=false
        ORDER BY ar.created_at DESC`
     );
     res.json({ reports: result.rows });
@@ -11707,7 +11106,7 @@ app.get("/account-reports", authenticate, requirePermission("user_management"), 
 app.patch("/account-reports/:id/resolve", authenticate, requirePermission("user_management"), async (req, res) => {
   try {
     const result = await pool.query(
-      "UPDATE account_reports SET status = 'resolved', resolved_at = NOW() WHERE id = $1 AND is_preview=false RETURNING *",
+      "UPDATE account_reports SET status = 'resolved', resolved_at = NOW() WHERE id = $1 RETURNING *",
       [req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Report not found" });
@@ -11818,10 +11217,10 @@ app.put("/admin/homepage-ads/:slot", authenticate, requireAdmin, async (req, res
       return res.status(400).json({ error: "Invalid homepage ad slot" });
     }
 
-    const imageUrl = String(req.body?.imageUrl || "").trim(); // desktop image (or legacy Ad 1 video)
+    const imageUrl = String(req.body?.imageUrl || "").trim(); // primary media URL (image or Ad 1 video)
     const requestedMediaType = String(req.body?.mediaType || "image").trim().toLowerCase();
     const mediaType = requestedMediaType === "video" ? "video" : requestedMediaType === "image" ? "image" : "";
-    const posterUrl = String(req.body?.posterUrl || "").trim(); // mobile image (or legacy video poster)
+    const posterUrl = String(req.body?.posterUrl || "").trim();
     const linkUrl = String(req.body?.linkUrl || "").trim();
 
     if (!mediaType) {
@@ -11831,7 +11230,7 @@ app.put("/admin/homepage-ads/:slot", authenticate, requireAdmin, async (req, res
       return res.status(400).json({ error: "Only homepage Ad 1 can use video" });
     }
 
-    for (const [url, label] of [[imageUrl, "Desktop image"], [posterUrl, "Mobile image"]]) {
+    for (const [url, label] of [[imageUrl, "Ad media"], [posterUrl, "Video poster"]]) {
       if (!url) continue;
       try {
         const parsed = new URL(url);
@@ -11861,7 +11260,7 @@ app.put("/admin/homepage-ads/:slot", authenticate, requireAdmin, async (req, res
          updated_at = NOW(),
          updated_by = EXCLUDED.updated_by
        RETURNING slot, image_url, media_type, poster_url, link_url, updated_at`,
-      [slot, imageUrl, mediaType, posterUrl, linkUrl, req.user.id]
+      [slot, imageUrl, mediaType, mediaType === "video" ? posterUrl : "", linkUrl, req.user.id]
     );
     logAdminAction(req.user.id, "homepage_ad_updated", `Updated homepage ad slot #${slot}`);
     res.json({ ad: result.rows[0] });
@@ -12124,42 +11523,6 @@ app.get("/admin/system-health", authenticate, requirePermission("role_assignment
   // The request itself proves Express/Railway is serving traffic.
   add("backend", "Railway backend", "API server", "healthy", "Stallyard backend is responding.", { liveCheck: true, latencyMs: 0 });
 
-  const frontend = await timed(async () => {
-    const response = await fetchWithTimeout("https://stallyard.com", {
-      method: "HEAD",
-      redirect: "follow",
-      headers: { "User-Agent": "Stallyard-System-Health/1.0" },
-    });
-    if (!response.ok) throw new Error(`Marketplace returned HTTP ${response.status}`);
-    return response;
-  });
-  add(
-    "frontend",
-    "Marketplace frontend",
-    "Public Stallyard website",
-    frontend.ok ? "healthy" : "unhealthy",
-    frontend.ok ? "The public marketplace is reachable over HTTPS." : `Marketplace check failed: ${frontend.error?.message || "unknown error"}`,
-    { liveCheck: true, latencyMs: frontend.latencyMs }
-  );
-
-  const cloudflare = await timed(async () => {
-    const response = await fetchWithTimeout("https://legal.stallyard.com/user-agreement/", {
-      method: "HEAD",
-      redirect: "follow",
-      headers: { "User-Agent": "Stallyard-System-Health/1.0" },
-    });
-    if (!response.ok) throw new Error(`Legal site returned HTTP ${response.status}`);
-    return response;
-  });
-  add(
-    "cloudflare",
-    "Cloudflare DNS and TLS",
-    "Legal-site routing and HTTPS certificate",
-    cloudflare.ok ? "healthy" : "unhealthy",
-    cloudflare.ok ? "legal.stallyard.com resolved and completed a valid HTTPS request." : `Cloudflare/TLS check failed: ${cloudflare.error?.message || "unknown error"}`,
-    { liveCheck: true, latencyMs: cloudflare.latencyMs }
-  );
-
   const db = await timed(() => pool.query("SELECT 1 AS ok"));
   add(
     "postgres",
@@ -12204,35 +11567,6 @@ app.get("/admin/system-health", authenticate, requirePermission("role_assignment
       { liveCheck: true, latencyMs: ps.latencyMs });
   }
 
-  const paystackWebhookConfigured = !!process.env.PAYSTACK_SECRET_KEY;
-  add(
-    "paystack_webhook",
-    "Paystack webhook",
-    "Signed payment and transfer events",
-    paystackWebhookConfigured ? "configured" : "not_configured",
-    paystackWebhookConfigured
-      ? "The webhook endpoint is installed and signature verification uses the server-side Paystack key. Confirm delivery history in Paystack when investigating a specific event."
-      : "PAYSTACK_SECRET_KEY is missing, so webhook signatures cannot be verified.",
-    { liveCheck: false }
-  );
-
-  const awsConfigured = !!(
-    process.env.AWS_ACCESS_KEY_ID &&
-    process.env.AWS_SECRET_ACCESS_KEY &&
-    process.env.AWS_REGION &&
-    process.env.AWS_LIVENESS_ROLE_ARN
-  );
-  add(
-    "aws_rekognition",
-    "AWS Rekognition",
-    "Seller face matching and liveness",
-    awsConfigured ? "configured" : "not_configured",
-    awsConfigured
-      ? "Rekognition and Face Liveness credentials are present. A live biometric session is not created by System Health."
-      : "One or more AWS Rekognition/Liveness settings are missing.",
-    { liveCheck: false }
-  );
-
   // Resend production keys can intentionally be restricted to Sending access.
   // A send-only key is not allowed to call account-level endpoints such as
   // GET /domains, so using that endpoint as a health check produces a false
@@ -12267,52 +11601,6 @@ app.get("/admin/system-health", authenticate, requirePermission("role_assignment
   add("termii", "Termii", "SMS/phone verification", termiiConfigured ? "configured" : "not_configured",
     termiiConfigured ? "SMS API key is present. No test SMS is sent by this health check." : "TERMII_API_KEY is missing; SMS verification is unavailable.",
     { liveCheck: false });
-
-  const payoutQueue = await timed(() => pool.query(
-    `SELECT
-       COUNT(*) FILTER (WHERE status IN ('queued', 'processing'))::int AS active_count,
-       COUNT(*) FILTER (WHERE status = 'request_unknown' AND updated_at >= NOW() - INTERVAL '24 hours')::int AS unknown_count,
-       COUNT(*) FILTER (WHERE status = 'failed' AND updated_at >= NOW() - INTERVAL '24 hours')::int AS failed_count,
-       EXTRACT(EPOCH FROM (NOW() - MIN(created_at) FILTER (WHERE status IN ('queued', 'processing'))))::int AS oldest_active_seconds
-     FROM seller_payouts`
-  ));
-  if (!payoutQueue.ok) {
-    add("payout_queue", "Payout queue", "Automatic seller payout processing", "unhealthy",
-      `Queue check failed: ${payoutQueue.error?.message || "unknown error"}`, { liveCheck: true, latencyMs: payoutQueue.latencyMs });
-  } else {
-    const row = payoutQueue.value.rows[0] || {};
-    const activeCount = Number(row.active_count || 0);
-    const unknownCount = Number(row.unknown_count || 0);
-    const failedCount = Number(row.failed_count || 0);
-    const oldestActiveSeconds = Number(row.oldest_active_seconds || 0);
-    const stalled = activeCount > 0 && oldestActiveSeconds > 15 * 60;
-    const queueHealthy = !stalled && unknownCount === 0;
-    const details = `${activeCount} active; ${failedCount} failed and ${unknownCount} request-unknown in the last 24 hours.`;
-    add(
-      "payout_queue",
-      "Payout queue",
-      "Automatic seller payout processing",
-      queueHealthy ? "healthy" : "unhealthy",
-      queueHealthy ? `Queue is processing normally. ${details}` : `${stalled ? "One or more payouts have been active for over 15 minutes. " : ""}${details}`,
-      { liveCheck: true, latencyMs: payoutQueue.latencyMs }
-    );
-  }
-
-  const deploymentId = process.env.RAILWAY_DEPLOYMENT_ID || "";
-  const commitSha = process.env.RAILWAY_GIT_COMMIT_SHA || "";
-  const serviceName = process.env.RAILWAY_SERVICE_NAME || "Stallyard backend";
-  const deploymentConfigured = !!(deploymentId || commitSha);
-  const releaseReference = commitSha ? commitSha.slice(0, 12) : deploymentId ? deploymentId.slice(0, 12) : "unavailable";
-  add(
-    "deployment",
-    "Latest Railway deployment",
-    "Running backend release",
-    deploymentConfigured ? "configured" : "not_configured",
-    deploymentConfigured
-      ? `${serviceName} is running release ${releaseReference}.`
-      : "Railway deployment metadata is not available in this environment.",
-    { liveCheck: false }
-  );
 
   const problems = services.filter((service) => service.status === "unhealthy");
   res.json({
@@ -12422,11 +11710,10 @@ app.patch("/notifications/mark-all-read", authenticate, async (req, res) => {
 async function sendShipReminders() {
   try {
     const result = await pool.query(
-      `SELECT oi.* FROM order_items oi JOIN orders o ON o.id = oi.order_id
-       WHERE oi.fulfillment_status = 'new'
-         AND o.is_preview = false
-         AND oi.ship_reminder_sent_at IS NULL
-         AND oi.created_at < NOW() - INTERVAL '24 hours'`
+      `SELECT * FROM order_items
+       WHERE fulfillment_status = 'new'
+         AND ship_reminder_sent_at IS NULL
+         AND created_at < NOW() - INTERVAL '24 hours'`
     );
     for (const item of result.rows) {
       createNotification(item.seller_id, "ship_reminder", `Reminder: "${item.title}" hasn't shipped yet`);
@@ -12434,188 +11721,6 @@ async function sendShipReminders() {
     }
   } catch (err) {
     console.error("Ship reminder check failed:", err.message);
-  }
-}
-
-// Optional, private preview accounts for the owner to inspect buyer and seller
-// dashboards. They are created only when explicitly enabled in Railway and
-// both passwords are supplied there. The sample listing stays in draft and
-// the sample order has no Paystack reference, so no real payment or refund can
-// be initiated from these records. Re-running this setup is idempotent.
-async function ensurePreviewAccounts() {
-  if (String(process.env.PREVIEW_ACCOUNTS_ENABLED || "").toLowerCase() !== "true") return;
-
-  const buyerPassword = String(process.env.PREVIEW_BUYER_PASSWORD || "");
-  const sellerPassword = String(process.env.PREVIEW_SELLER_PASSWORD || "");
-  if (buyerPassword.length < 12 || sellerPassword.length < 12) {
-    throw new Error("Preview accounts require PREVIEW_BUYER_PASSWORD and PREVIEW_SELLER_PASSWORD with at least 12 characters");
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const buyerHash = await bcrypt.hash(buyerPassword, 10);
-    const sellerHash = await bcrypt.hash(sellerPassword, 10);
-
-    const upsertPreviewUser = async ({ username, email, passwordHash, displayName, intent, seller }) => {
-      const conflict = await client.query("SELECT id, email FROM users WHERE username = $1 FOR UPDATE", [username]);
-      if (conflict.rows.length && String(conflict.rows[0].email || "").toLowerCase() !== email) {
-        throw new Error(`The reserved preview username ${username} is already used by another account`);
-      }
-      const result = await client.query(
-        `INSERT INTO users (
-           username, email, password_hash, display_name, first_name, last_name,
-           date_of_birth, gender, nationality, state_of_residence, country,
-           is_admin, is_approved, is_verified, verification_status,
-           is_email_verified, is_phone_verified, profile_complete,
-           onboarding_intent, onboarding_completed_at, casual_seller_status,
-           seller_tier, seller_listing_limit, is_suspended, seller_suspended, is_preview
-         ) VALUES (
-           $1,$2,$3,$4,'Preview','Account','1990-01-01','prefer_not_to_say',
-           'Nigerian','Lagos','Nigeria',false,false,false,'none',true,true,true,$5,NOW(),
-           $6,$7,$8,false,false,true
-         )
-         ON CONFLICT (username) DO UPDATE SET
-           password_hash = EXCLUDED.password_hash,
-           display_name = EXCLUDED.display_name,
-           is_email_verified = true, is_phone_verified = true,
-           profile_complete = true, onboarding_completed_at = NOW(),
-           is_approved = EXCLUDED.is_approved, is_verified = EXCLUDED.is_verified,
-           verification_status = EXCLUDED.verification_status,
-           casual_seller_status = EXCLUDED.casual_seller_status,
-           seller_tier = EXCLUDED.seller_tier,
-           seller_listing_limit = EXCLUDED.seller_listing_limit,
-           is_suspended = false, seller_suspended = false, is_preview = true,
-           token_version = COALESCE(users.token_version, 0) + 1
-         RETURNING id, username`,
-        [
-          username, email, passwordHash, displayName, intent,
-          seller ? "approved" : "none",
-          seller ? "casual" : "buyer",
-          seller ? CASUAL_SELLER_LIMIT_NGN : 0,
-        ]
-      );
-      return result.rows[0];
-    };
-
-    const buyer = await upsertPreviewUser({
-      username: "stallyard_preview_buyer",
-      email: "preview-buyer@stallyard.test",
-      passwordHash: buyerHash,
-      displayName: "Stallyard Preview Buyer",
-      intent: "buy",
-      seller: false,
-    });
-    const seller = await upsertPreviewUser({
-      username: "stallyard_preview_seller",
-      email: "preview-seller@stallyard.test",
-      passwordHash: sellerHash,
-      displayName: "Stallyard Preview Seller",
-      intent: "sell",
-      seller: true,
-    });
-
-    let listingResult = await client.query(
-      "SELECT id FROM listings WHERE owner_id = $1 AND sku = 'STALLYARD-PREVIEW-ONLY' LIMIT 1 FOR UPDATE",
-      [seller.id]
-    );
-    if (!listingResult.rows.length) {
-      listingResult = await client.query(
-        `INSERT INTO listings (
-           owner_id,title,description,price,category,subcategory,condition,shipping_fee,
-           emoji,images,listing_type,currency,status,quantity,sku,brand,state,shipping_methods,return_policy,is_preview
-         ) VALUES ($1,'TEST DATA — Preview wireless headphones',
-           'Private preview listing. This draft is not visible in the marketplace.',45000,
-           'Electronics','Audio & Headphones','New',2500,'🎧','[]'::jsonb,'fixed','NGN',
-           'draft',3,'STALLYARD-PREVIEW-ONLY','Stallyard Preview','Lagos','[]'::jsonb,
-           'Preview data only',true) RETURNING id`,
-        [seller.id]
-      );
-    }
-    const listingId = listingResult.rows[0].id;
-    await client.query("UPDATE listings SET status='draft', is_preview=true WHERE id=$1", [listingId]);
-
-    let orderResult = await client.query(
-      "SELECT id FROM orders WHERE buyer_id = $1 AND shipping_address->>'previewData' = 'true' LIMIT 1 FOR UPDATE",
-      [buyer.id]
-    );
-    if (!orderResult.rows.length) {
-      orderResult = await client.query(
-        `INSERT INTO orders (
-           buyer_id,buyer_username,total,currency,shipping_address,subtotal,shipping_total,
-           commission_rate,commission_amount,tax_amount,payment_status,is_disputed,created_at,is_preview
-         ) VALUES ($1,$2,47500,'NGN',$3::jsonb,45000,2500,0.05,2250,0,'held',false,NOW(),true)
-         RETURNING id`,
-        [buyer.id, buyer.username, JSON.stringify({
-          previewData: true,
-          fullName: "Stallyard Preview Buyer",
-          phone: "+2348000000000",
-          street: "Preview address — not a real delivery location",
-          city: "Lagos",
-          state: "Lagos",
-          country: "Nigeria",
-        })]
-      );
-    }
-    const orderId = orderResult.rows[0].id;
-    await client.query("UPDATE orders SET is_preview=true, paystack_reference=NULL WHERE id=$1", [orderId]);
-
-    const itemResult = await client.query(
-      "SELECT id FROM order_items WHERE order_id = $1 AND listing_id = $2 LIMIT 1",
-      [orderId, listingId]
-    );
-    if (!itemResult.rows.length) {
-      await client.query(
-        `INSERT INTO order_items (
-           order_id,listing_id,title,emoji,price,qty,shipping_fee,seller_id,
-           seller_username,seller_name,fulfillment_status,delivery_token,delivery_token_generated_at,is_preview
-         ) VALUES ($1,$2,'TEST DATA — Preview wireless headphones','🎧',45000,1,2500,$3,$4,$5,
-           'new','PREVIEW1234',NOW(),true)`,
-        [orderId, listingId, seller.id, seller.username, "Stallyard Preview Seller"]
-      );
-    }
-    await client.query("UPDATE order_items SET is_preview=true WHERE order_id=$1", [orderId]);
-
-    let threadResult = await client.query(
-      "SELECT id FROM threads WHERE listing_id = $1 AND buyer_id = $2 AND seller_id = $3 LIMIT 1",
-      [listingId, buyer.id, seller.id]
-    );
-    if (!threadResult.rows.length) {
-      threadResult = await client.query(
-        "INSERT INTO threads (listing_id,buyer_id,seller_id,is_preview) VALUES ($1,$2,$3,true) RETURNING id",
-        [listingId, buyer.id, seller.id]
-      );
-    }
-    const threadId = threadResult.rows[0].id;
-    await client.query("UPDATE threads SET is_preview=true WHERE id=$1", [threadId]);
-    const messageExists = await client.query(
-      "SELECT 1 FROM messages WHERE thread_id = $1 AND body LIKE 'TEST DATA — Welcome to the preview%' LIMIT 1",
-      [threadId]
-    );
-    if (!messageExists.rows.length) {
-      await client.query(
-        `INSERT INTO messages (thread_id,sender_id,message_type,body,order_id,is_preview)
-         VALUES ($1,$2,'text','TEST DATA — Welcome to the preview conversation. Use these accounts to inspect buyer and seller messaging.', $3,true)`,
-        [threadId, buyer.id, orderId]
-      );
-    }
-
-    const addPreviewNotification = async (userId, type, message) => {
-      const existing = await client.query("SELECT 1 FROM notifications WHERE user_id=$1 AND message=$2 LIMIT 1", [userId, message]);
-      if (!existing.rows.length) {
-        await client.query("INSERT INTO notifications (user_id,type,message,read,is_preview) VALUES ($1,$2,$3,false,true)", [userId, type, message]);
-      }
-    };
-    await addPreviewNotification(buyer.id, "preview", "TEST DATA — Your preview order has been created.");
-    await addPreviewNotification(seller.id, "preview", "TEST DATA — You have a preview order waiting to be prepared.");
-
-    await client.query("COMMIT");
-    console.log("Preview buyer and seller accounts are ready.");
-  } catch (err) {
-    await client.query("ROLLBACK").catch(() => {});
-    throw err;
-  } finally {
-    client.release();
   }
 }
 // Final Express safety net for unexpected middleware/route failures. Never send
@@ -12633,7 +11738,6 @@ async function startServer() {
     await ensurePrivateVerificationBucket();
     await protectLegacySellerReports();
     await encryptLegacyTotpSecrets();
-    await ensurePreviewAccounts();
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
       setInterval(sendShipReminders, 60 * 60 * 1000).unref();
