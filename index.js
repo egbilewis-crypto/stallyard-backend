@@ -513,7 +513,11 @@ const authRateLimit = rateLimit({ scope: "auth", windowMs: 15 * 60 * 1000, max: 
 async function createNotification(userId, type, message) {
   if (!userId) return;
   try {
-    await pool.query("INSERT INTO notifications (user_id, type, message) VALUES ($1, $2, $3)", [userId, type, message]);
+    await pool.query(
+      `INSERT INTO notifications (user_id, type, message, is_preview)
+       SELECT id, $2, $3, is_preview FROM users WHERE id=$1`,
+      [userId, type, message]
+    );
   } catch (err) {
     console.error("Failed to create notification:", err.message);
   }
@@ -2984,6 +2988,48 @@ const SCHEMA_MIGRATIONS = [
     `ALTER TABLE orders ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
     `CREATE INDEX IF NOT EXISTS idx_users_is_preview ON users(is_preview)`,
     `CREATE INDEX IF NOT EXISTS idx_orders_is_preview ON orders(is_preview)`,
+  ] },
+  { version: 78, name: "isolate-all-preview-child-records", statements: [
+    `ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
+    `ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
+    `ALTER TABLE order_items ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
+    `ALTER TABLE threads ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
+    `ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
+    `ALTER TABLE notifications ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
+    `ALTER TABLE dispute_cases ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
+    `ALTER TABLE reviews ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
+    `ALTER TABLE message_reports ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
+    `ALTER TABLE review_reports ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
+    `ALTER TABLE seller_reports ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
+    `ALTER TABLE account_reports ADD COLUMN IF NOT EXISTS is_preview BOOLEAN NOT NULL DEFAULT FALSE`,
+    `UPDATE listings l SET is_preview=true FROM users u WHERE u.id=l.owner_id AND u.is_preview=true`,
+    `UPDATE orders o SET is_preview=true WHERE EXISTS (SELECT 1 FROM users u WHERE u.id=o.buyer_id AND u.is_preview=true)
+       OR EXISTS (SELECT 1 FROM order_items oi JOIN users u ON u.id=oi.seller_id WHERE oi.order_id=o.id AND u.is_preview=true)`,
+    `UPDATE checkout_intents ci SET is_preview=true FROM users u WHERE u.id=ci.buyer_id AND u.is_preview=true`,
+    `UPDATE payment_attempts pa SET is_preview=true FROM users u WHERE u.id=pa.user_id AND u.is_preview=true`,
+    `DELETE FROM listing_checkout_reservations r USING checkout_intents ci WHERE ci.reference=r.reference AND ci.is_preview=true`,
+    `UPDATE checkout_intents SET status='cancelled', failure_reason='Preview checkout isolated during security migration'
+       WHERE is_preview=true AND status='initialized'`,
+    `UPDATE order_items oi SET is_preview=true FROM orders o WHERE o.id=oi.order_id AND o.is_preview=true`,
+    `UPDATE threads t SET is_preview=true FROM users b, users s WHERE b.id=t.buyer_id AND s.id=t.seller_id AND (b.is_preview=true OR s.is_preview=true)`,
+    `UPDATE messages m SET is_preview=true FROM threads t WHERE t.id=m.thread_id AND t.is_preview=true`,
+    `UPDATE notifications n SET is_preview=true FROM users u WHERE u.id=n.user_id AND u.is_preview=true`,
+    `UPDATE dispute_cases d SET is_preview=true FROM orders o WHERE o.id=d.order_id AND o.is_preview=true`,
+    `UPDATE reviews r SET is_preview=true FROM orders o WHERE o.id=r.order_id AND o.is_preview=true`,
+    `UPDATE message_reports mr SET is_preview=true WHERE EXISTS (SELECT 1 FROM messages m WHERE m.id=mr.message_id AND m.is_preview=true)
+       OR EXISTS (SELECT 1 FROM users u WHERE u.id=mr.reporter_id AND u.is_preview=true)`,
+    `UPDATE review_reports rr SET is_preview=true WHERE EXISTS (SELECT 1 FROM reviews r WHERE r.id=rr.review_id AND r.is_preview=true)
+       OR EXISTS (SELECT 1 FROM users u WHERE u.id=rr.reporter_id AND u.is_preview=true)`,
+    `UPDATE seller_reports sr SET is_preview=true WHERE EXISTS (SELECT 1 FROM users u WHERE u.id=sr.reporter_id AND u.is_preview=true)
+       OR EXISTS (SELECT 1 FROM users u WHERE u.id=sr.reported_seller_id AND u.is_preview=true)
+       OR EXISTS (SELECT 1 FROM orders o WHERE o.id=sr.order_id AND o.is_preview=true)`,
+    `UPDATE account_reports ar SET is_preview=true FROM users u WHERE u.id=ar.user_id AND u.is_preview=true`,
+    `CREATE INDEX IF NOT EXISTS idx_order_items_is_preview ON order_items(is_preview)`,
+    `CREATE INDEX IF NOT EXISTS idx_threads_is_preview ON threads(is_preview)`,
+    `CREATE INDEX IF NOT EXISTS idx_messages_is_preview ON messages(is_preview)`,
+    `CREATE INDEX IF NOT EXISTS idx_disputes_is_preview ON dispute_cases(is_preview)`,
+    `CREATE INDEX IF NOT EXISTS idx_reviews_is_preview ON reviews(is_preview)`,
+    `CREATE INDEX IF NOT EXISTS idx_checkout_intents_is_preview ON checkout_intents(is_preview)`,
   ] },
 ];
 
@@ -8677,15 +8723,19 @@ app.patch("/orders/:id/refund/partial", authenticate, requirePermission("finance
   }
 });
 
-app.patch("/orders/:id/dispute", authenticate, async (req, res) => {
+app.patch("/orders/:id/dispute", authenticate, rejectPreviewRealWorldAction, async (req, res) => {
   const client = await pool.connect();
   try {
     const { isDisputed, reason, statement, evidenceUrls } = req.body;
     await client.query("BEGIN");
-    const orderCheck = await client.query("SELECT buyer_id, payment_status FROM orders WHERE id = $1 FOR UPDATE", [req.params.id]);
+    const orderCheck = await client.query("SELECT buyer_id, payment_status, is_preview FROM orders WHERE id = $1 FOR UPDATE", [req.params.id]);
     if (orderCheck.rows.length === 0) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "Order not found" });
+    }
+    if (orderCheck.rows[0].is_preview) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Preview orders cannot create real dispute cases", code: "PREVIEW_ACCOUNT_RESTRICTED" });
     }
 
     const buyerId = orderCheck.rows[0].buyer_id;
@@ -8800,6 +8850,7 @@ app.get("/disputes", authenticate, requirePermission("dispute_resolution"), asyn
       LEFT JOIN users resolver ON resolver.id = dc.resolved_by_id
       LEFT JOIN order_items oi ON oi.order_id = o.id
       LEFT JOIN users seller ON seller.id = oi.seller_id
+      WHERE dc.is_preview=false AND o.is_preview=false
       GROUP BY dc.id, opener.username, opener.display_name, resolver.username, resolver.display_name,
         buyer.username, buyer.display_name, o.total, o.currency, o.payment_status, o.created_at
       ORDER BY CASE dc.status WHEN 'open' THEN 0 WHEN 'in_review' THEN 1 ELSE 2 END, dc.updated_at DESC
@@ -8826,7 +8877,7 @@ app.get("/disputes/mine", authenticate, async (req, res) => {
   }
 });
 
-app.post("/disputes/:id/statement", authenticate, async (req, res) => {
+app.post("/disputes/:id/statement", authenticate, rejectPreviewRealWorldAction, async (req, res) => {
   try {
     const statement = String(req.body.statement || "").trim();
     if (!statement) return res.status(400).json({ error: "Enter a statement first" });
@@ -8861,7 +8912,7 @@ app.patch("/disputes/:id", authenticate, requirePermission("dispute_resolution")
     if (status && !DISPUTE_STATUSES.has(status)) return res.status(400).json({ error: "Invalid dispute status" });
     if (resolution && !DISPUTE_RESOLUTIONS.has(resolution)) return res.status(400).json({ error: "Invalid resolution" });
     await client.query("BEGIN");
-    const existing = await client.query("SELECT * FROM dispute_cases WHERE id = $1 FOR UPDATE", [req.params.id]);
+    const existing = await client.query("SELECT * FROM dispute_cases WHERE id = $1 AND is_preview=false FOR UPDATE", [req.params.id]);
     if (!existing.rows.length) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "Dispute case not found" });
@@ -10400,7 +10451,7 @@ app.get("/admin/buyer-risk", authenticate, requirePermission("user_management"),
     const hasPaymentAttempts = await pool.query(`SELECT to_regclass('public.payment_attempts') AS name`);
     const paymentAttemptsReady = !!hasPaymentAttempts.rows[0]?.name;
     const paymentAttemptSelect = paymentAttemptsReady
-      ? `(SELECT COUNT(*) FROM payment_attempts pa WHERE pa.user_id = u.id AND pa.status = 'failed') AS failed_payment_count,`
+      ? `(SELECT COUNT(*) FROM payment_attempts pa WHERE pa.user_id = u.id AND pa.is_preview=false AND pa.status = 'failed') AS failed_payment_count,`
       : `0 AS failed_payment_count,`;
 
     const result = await pool.query(`
@@ -10415,22 +10466,22 @@ app.get("/admin/buyer-risk", authenticate, requirePermission("user_management"),
         u.is_phone_verified,
         u.created_at AS joined_at,
         (SELECT MAX(lh.created_at) FROM login_history lh WHERE lh.user_id = u.id) AS last_login_at,
-        (SELECT COUNT(*) FROM orders o WHERE o.buyer_id = u.id) AS order_count,
-        (SELECT COUNT(*) FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.buyer_id = u.id) AS item_count,
-        (SELECT COUNT(*) FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.buyer_id = u.id AND oi.fulfillment_status = 'delivered') AS completed_items,
-        (SELECT COUNT(*) FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.buyer_id = u.id AND oi.fulfillment_status = 'cancelled') AS cancelled_items,
-        (SELECT COUNT(*) FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.buyer_id = u.id AND oi.return_status IS NOT NULL) AS return_count,
-        (SELECT COUNT(*) FROM dispute_cases dc JOIN orders o ON o.id = dc.order_id WHERE o.buyer_id = u.id) AS dispute_count,
-        (SELECT COUNT(*) FROM dispute_cases dc JOIN orders o ON o.id = dc.order_id WHERE o.buyer_id = u.id AND dc.status <> 'resolved') AS open_disputes,
-        (SELECT COUNT(*) FROM orders o WHERE o.buyer_id = u.id AND (o.refund_status IS NOT NULL OR o.payment_status = 'refunded')) AS refund_count,
-        (SELECT COUNT(*) FROM account_reports ar WHERE ar.user_id = u.id) AS report_count,
-        (SELECT COUNT(*) FROM account_reports ar WHERE ar.user_id = u.id AND ar.status = 'open') AS open_report_count,
+        (SELECT COUNT(*) FROM orders o WHERE o.buyer_id = u.id AND o.is_preview=false) AS order_count,
+        (SELECT COUNT(*) FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.buyer_id = u.id AND o.is_preview=false AND oi.is_preview=false) AS item_count,
+        (SELECT COUNT(*) FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.buyer_id = u.id AND o.is_preview=false AND oi.is_preview=false AND oi.fulfillment_status = 'delivered') AS completed_items,
+        (SELECT COUNT(*) FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.buyer_id = u.id AND o.is_preview=false AND oi.is_preview=false AND oi.fulfillment_status = 'cancelled') AS cancelled_items,
+        (SELECT COUNT(*) FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.buyer_id = u.id AND o.is_preview=false AND oi.is_preview=false AND oi.return_status IS NOT NULL) AS return_count,
+        (SELECT COUNT(*) FROM dispute_cases dc JOIN orders o ON o.id = dc.order_id WHERE o.buyer_id = u.id AND o.is_preview=false AND dc.is_preview=false) AS dispute_count,
+        (SELECT COUNT(*) FROM dispute_cases dc JOIN orders o ON o.id = dc.order_id WHERE o.buyer_id = u.id AND o.is_preview=false AND dc.is_preview=false AND dc.status <> 'resolved') AS open_disputes,
+        (SELECT COUNT(*) FROM orders o WHERE o.buyer_id = u.id AND o.is_preview=false AND (o.refund_status IS NOT NULL OR o.payment_status = 'refunded')) AS refund_count,
+        (SELECT COUNT(*) FROM account_reports ar WHERE ar.user_id = u.id AND ar.is_preview=false) AS report_count,
+        (SELECT COUNT(*) FROM account_reports ar WHERE ar.user_id = u.id AND ar.is_preview=false AND ar.status = 'open') AS open_report_count,
         ${paymentAttemptSelect}
-        (SELECT COALESCE(SUM(o.total), 0) FROM orders o WHERE o.buyer_id = u.id) AS lifetime_spend
+        (SELECT COALESCE(SUM(o.total), 0) FROM orders o WHERE o.buyer_id = u.id AND o.is_preview=false) AS lifetime_spend
       FROM users u
       WHERE u.is_admin = false
         AND u.is_preview = false
-        AND EXISTS (SELECT 1 FROM orders o WHERE o.buyer_id = u.id)
+        AND EXISTS (SELECT 1 FROM orders o WHERE o.buyer_id = u.id AND o.is_preview=false)
       ORDER BY u.display_name ASC, u.username ASC
     `);
 
@@ -10562,27 +10613,27 @@ app.get("/admin/seller-performance", authenticate, requirePermission("seller_ver
         u.verification_status,
         u.created_at AS joined_at,
         (SELECT MAX(lh.created_at) FROM login_history lh WHERE lh.user_id = u.id) AS last_login_at,
-        (SELECT COUNT(DISTINCT oi.order_id) FROM order_items oi WHERE oi.seller_id = u.id) AS order_count,
-        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id) AS item_count,
-        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.fulfillment_status = 'delivered') AS completed_deliveries,
-        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.fulfillment_status = 'cancelled') AS cancelled_count,
-        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.fulfillment_status = 'returned') AS returned_count,
-        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.ship_reminder_sent_at IS NOT NULL) AS ship_reminder_count,
-        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.fulfillment_status = 'new' AND oi.created_at < NOW() - INTERVAL '24 hours') AS active_ship_reminders,
+        (SELECT COUNT(DISTINCT oi.order_id) FROM order_items oi WHERE oi.seller_id = u.id AND oi.is_preview=false) AS order_count,
+        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.is_preview=false) AS item_count,
+        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.is_preview=false AND oi.fulfillment_status = 'delivered') AS completed_deliveries,
+        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.is_preview=false AND oi.fulfillment_status = 'cancelled') AS cancelled_count,
+        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.is_preview=false AND oi.fulfillment_status = 'returned') AS returned_count,
+        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.is_preview=false AND oi.ship_reminder_sent_at IS NOT NULL) AS ship_reminder_count,
+        (SELECT COUNT(*) FROM order_items oi WHERE oi.seller_id = u.id AND oi.is_preview=false AND oi.fulfillment_status = 'new' AND oi.created_at < NOW() - INTERVAL '24 hours') AS active_ship_reminders,
         (SELECT AVG(EXTRACT(EPOCH FROM (oi.shipped_at - oi.created_at)) / 3600.0)
-           FROM order_items oi WHERE oi.seller_id = u.id AND oi.shipped_at IS NOT NULL AND oi.shipped_at >= oi.created_at) AS average_hours_to_ship,
+           FROM order_items oi WHERE oi.seller_id = u.id AND oi.is_preview=false AND oi.shipped_at IS NOT NULL AND oi.shipped_at >= oi.created_at) AS average_hours_to_ship,
         (SELECT COALESCE(SUM((oi.price * oi.qty) + (oi.shipping_fee * oi.qty)), 0)
-           FROM order_items oi WHERE oi.seller_id = u.id AND oi.fulfillment_status NOT IN ('cancelled', 'returned')) AS gross_merchandise,
-        (SELECT COUNT(*) FROM reviews r WHERE r.seller_id = u.id) AS review_count,
-        (SELECT COALESCE(AVG(r.rating), 0) FROM reviews r WHERE r.seller_id = u.id) AS average_rating,
+           FROM order_items oi WHERE oi.seller_id = u.id AND oi.is_preview=false AND oi.fulfillment_status NOT IN ('cancelled', 'returned')) AS gross_merchandise,
+        (SELECT COUNT(*) FROM reviews r WHERE r.seller_id = u.id AND r.is_preview=false) AS review_count,
+        (SELECT COALESCE(AVG(r.rating), 0) FROM reviews r WHERE r.seller_id = u.id AND r.is_preview=false) AS average_rating,
         (SELECT COUNT(*) FROM seller_warnings sw WHERE sw.user_id = u.id) AS warning_count,
         (SELECT COUNT(DISTINCT dc.id)
            FROM dispute_cases dc
-           WHERE EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = dc.order_id AND oi.seller_id = u.id)) AS dispute_count,
+           WHERE dc.is_preview=false AND EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = dc.order_id AND oi.seller_id = u.id AND oi.is_preview=false)) AS dispute_count,
         (SELECT COUNT(DISTINCT dc.id)
            FROM dispute_cases dc
-           WHERE dc.status <> 'resolved'
-             AND EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = dc.order_id AND oi.seller_id = u.id)) AS open_disputes,
+           WHERE dc.status <> 'resolved' AND dc.is_preview=false
+             AND EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = dc.order_id AND oi.seller_id = u.id AND oi.is_preview=false)) AS open_disputes,
         (SELECT COALESCE(SUM(amount), 0) FROM withdrawals w WHERE w.seller_id = u.id AND w.status = 'failed') AS failed_withdrawal_amount
       FROM users u
       WHERE u.is_admin = false
@@ -10590,7 +10641,7 @@ app.get("/admin/seller-performance", authenticate, requirePermission("seller_ver
         AND (
           u.is_approved = true
           OR u.has_applied_to_sell = true
-          OR EXISTS (SELECT 1 FROM order_items oi WHERE oi.seller_id = u.id)
+          OR EXISTS (SELECT 1 FROM order_items oi WHERE oi.seller_id = u.id AND oi.is_preview=false)
         )
       ORDER BY u.display_name ASC, u.username ASC
     `);
@@ -10881,8 +10932,8 @@ app.get("/admin/reports/:type", authenticate, async (req, res) => {
                  JOIN orders o ON o.id = oi.order_id
                  WHERE oi.seller_id = u.id AND o.payment_status = 'released'
                ), 0) AS released_merchandise,
-               COALESCE((SELECT AVG(rv.rating) FROM reviews rv WHERE rv.seller_id = u.id), 0) AS avg_rating,
-               COALESCE((SELECT COUNT(*) FROM reviews rv WHERE rv.seller_id = u.id), 0) AS review_count
+               COALESCE((SELECT AVG(rv.rating) FROM reviews rv WHERE rv.seller_id = u.id AND rv.is_preview=false), 0) AS avg_rating,
+               COALESCE((SELECT COUNT(*) FROM reviews rv WHERE rv.seller_id = u.id AND rv.is_preview=false), 0) AS review_count
         FROM users u
         ${where ? where + " AND u.is_preview = false AND (u.has_applied_to_sell = true OR u.is_approved = true)" : "WHERE u.is_preview = false AND (u.has_applied_to_sell = true OR u.is_approved = true)"}
         ORDER BY u.created_at DESC
@@ -11139,6 +11190,20 @@ app.post("/threads", authenticate, rejectAdminMarketplaceUse, async (req, res) =
       return res.status(403).json({ error: "You can only start a thread you're a part of" });
     }
 
+    const isolation = await pool.query(
+      `SELECT l.owner_id, l.is_preview AS listing_preview, b.is_preview AS buyer_preview, s.is_preview AS seller_preview
+       FROM listings l JOIN users b ON b.id=$2 JOIN users s ON s.id=$3 WHERE l.id=$1`,
+      [listingId, buyerId, sellerId]
+    );
+    if (!isolation.rows.length) return res.status(404).json({ error: "Listing or participant not found" });
+    const flags = isolation.rows[0];
+    if (Number(flags.owner_id) !== Number(sellerId) || Number(buyerId) === Number(sellerId)) {
+      return res.status(400).json({ error: "The selected seller does not own this listing" });
+    }
+    if (!!flags.listing_preview !== !!req.user.isPreview || !!flags.buyer_preview !== !!req.user.isPreview || !!flags.seller_preview !== !!req.user.isPreview) {
+      return res.status(403).json({ error: "Preview conversations must remain inside the preview environment", code: "PREVIEW_ACCOUNT_RESTRICTED" });
+    }
+
     const existing = await pool.query(
       "SELECT * FROM threads WHERE listing_id = $1 AND buyer_id = $2 AND seller_id = $3",
       [listingId, buyerId, sellerId]
@@ -11149,8 +11214,8 @@ app.post("/threads", authenticate, rejectAdminMarketplaceUse, async (req, res) =
     }
 
     const result = await pool.query(
-      "INSERT INTO threads (listing_id, buyer_id, seller_id) VALUES ($1, $2, $3) RETURNING *",
-      [listingId, buyerId, sellerId]
+      "INSERT INTO threads (listing_id, buyer_id, seller_id, is_preview) VALUES ($1, $2, $3, $4) RETURNING *",
+      [listingId, buyerId, sellerId, !!req.user.isPreview]
     );
 
     res.status(201).json({ thread: result.rows[0] });
@@ -11182,15 +11247,18 @@ app.post("/messages", authenticate, rejectAdminMarketplaceUse, async (req, res) 
     if (!threadId) {
       return res.status(400).json({ error: "Missing threadId" });
     }
-    const thread = await pool.query("SELECT buyer_id, seller_id FROM threads WHERE id = $1", [threadId]);
+    const thread = await pool.query("SELECT buyer_id, seller_id, is_preview FROM threads WHERE id = $1", [threadId]);
     if (thread.rows.length === 0) return res.status(404).json({ error: "Thread not found" });
     if (thread.rows[0].buyer_id !== senderId && thread.rows[0].seller_id !== senderId) {
       return res.status(403).json({ error: "You're not a part of this thread" });
     }
+    if (!!thread.rows[0].is_preview !== !!req.user.isPreview) {
+      return res.status(403).json({ error: "Preview conversations must remain inside the preview environment", code: "PREVIEW_ACCOUNT_RESTRICTED" });
+    }
 
     const result = await pool.query(
-      `INSERT INTO messages (thread_id, sender_id, message_type, body, offer_amount, offer_status, image_url, order_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      `INSERT INTO messages (thread_id, sender_id, message_type, body, offer_amount, offer_status, image_url, order_id, is_preview)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING *`,
       [
         threadId,
@@ -11201,6 +11269,7 @@ app.post("/messages", authenticate, rejectAdminMarketplaceUse, async (req, res) 
         messageType === "offer" ? "pending" : null,
         imageUrl || null,
         orderId || null,
+        !!req.user.isPreview,
       ]
     );
 
@@ -11284,7 +11353,7 @@ app.patch("/messages/:id/offer", authenticate, async (req, res) => {
   }
 });
 
-app.post("/messages/:id/report", authenticate, async (req, res) => {
+app.post("/messages/:id/report", authenticate, rejectPreviewRealWorldAction, async (req, res) => {
   try {
     const { reason } = req.body;
     const msgResult = await pool.query("SELECT thread_id FROM messages WHERE id = $1", [req.params.id]);
@@ -11321,6 +11390,7 @@ app.get("/message-reports", authenticate, requirePermission("dispute_resolution"
        LEFT JOIN users sender ON m.sender_id = sender.id
        LEFT JOIN users reporter ON mr.reporter_id = reporter.id
        LEFT JOIN listings l ON t.listing_id = l.id
+       WHERE mr.is_preview=false AND m.is_preview=false AND t.is_preview=false
        ORDER BY mr.created_at DESC`
     );
     res.json({ reports: result.rows });
@@ -11332,7 +11402,7 @@ app.get("/message-reports", authenticate, requirePermission("dispute_resolution"
 app.patch("/message-reports/:id/resolve", authenticate, requirePermission("dispute_resolution"), async (req, res) => {
   try {
     const result = await pool.query(
-      "UPDATE message_reports SET status = 'resolved', resolved_at = NOW() WHERE id = $1 RETURNING *",
+      "UPDATE message_reports SET status = 'resolved', resolved_at = NOW() WHERE id = $1 AND is_preview=false RETURNING *",
       [req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Report not found" });
@@ -11345,14 +11415,14 @@ app.patch("/message-reports/:id/resolve", authenticate, requirePermission("dispu
 
 app.get("/reviews", async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM reviews ORDER BY created_at DESC");
+    const result = await pool.query("SELECT * FROM reviews WHERE is_preview=false ORDER BY created_at DESC");
     res.json({ reviews: result.rows });
   } catch (err) {
     sendInternalError(res, err);
   }
 });
 
-app.post("/reviews", authenticate, async (req, res) => {
+app.post("/reviews", authenticate, rejectPreviewRealWorldAction, async (req, res) => {
   try {
     const { orderId, listingId, sellerId, rating, comment } = req.body;
     const buyerId = req.user.id;
@@ -11367,7 +11437,8 @@ app.post("/reviews", authenticate, async (req, res) => {
     const purchase = await pool.query(
       `SELECT oi.fulfillment_status, o.payment_status FROM orders o
        JOIN order_items oi ON oi.order_id = o.id
-       WHERE o.id = $1 AND o.buyer_id = $2 AND oi.listing_id = $3 AND oi.seller_id = $4`,
+       WHERE o.id = $1 AND o.buyer_id = $2 AND oi.listing_id = $3 AND oi.seller_id = $4
+         AND o.is_preview=false AND oi.is_preview=false`,
       [orderId, buyerId, listingId, sellerId]
     );
     if (purchase.rows.length === 0) {
@@ -11424,7 +11495,7 @@ app.patch("/reviews/:id", authenticate, async (req, res) => {
 app.get("/listings/:id/reviews", async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT * FROM reviews WHERE listing_id = $1 ORDER BY created_at DESC",
+      "SELECT * FROM reviews WHERE listing_id = $1 AND is_preview=false ORDER BY created_at DESC",
       [req.params.id]
     );
     res.json({ reviews: result.rows });
@@ -11436,7 +11507,7 @@ app.get("/listings/:id/reviews", async (req, res) => {
 app.get("/sellers/:id/reviews", async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT * FROM reviews WHERE seller_id = $1 ORDER BY created_at DESC",
+      "SELECT * FROM reviews WHERE seller_id = $1 AND is_preview=false ORDER BY created_at DESC",
       [req.params.id]
     );
     res.json({ reviews: result.rows });
@@ -11466,7 +11537,7 @@ app.patch("/reviews/:id/respond", authenticate, async (req, res) => {
   }
 });
 
-app.post("/reviews/:id/report", authenticate, async (req, res) => {
+app.post("/reviews/:id/report", authenticate, rejectPreviewRealWorldAction, async (req, res) => {
   try {
     const { reason } = req.body;
     const existing = await pool.query("SELECT id FROM reviews WHERE id = $1", [req.params.id]);
@@ -11494,6 +11565,7 @@ app.get("/review-reports", authenticate, requirePermission("dispute_resolution")
        LEFT JOIN users buyer ON r.buyer_id = buyer.id
        LEFT JOIN users seller ON r.seller_id = seller.id
        LEFT JOIN users reporter ON rr.reporter_id = reporter.id
+       WHERE rr.is_preview=false AND r.is_preview=false
        ORDER BY rr.created_at DESC`
     );
     res.json({ reports: result.rows });
@@ -11505,7 +11577,7 @@ app.get("/review-reports", authenticate, requirePermission("dispute_resolution")
 app.patch("/review-reports/:id/resolve", authenticate, requirePermission("dispute_resolution"), async (req, res) => {
   try {
     const result = await pool.query(
-      "UPDATE review_reports SET status = 'resolved', resolved_at = NOW() WHERE id = $1 RETURNING *",
+      "UPDATE review_reports SET status = 'resolved', resolved_at = NOW() WHERE id = $1 AND is_preview=false RETURNING *",
       [req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Report not found" });
@@ -11518,7 +11590,7 @@ app.patch("/review-reports/:id/resolve", authenticate, requirePermission("disput
 
 const SELLER_REPORT_REASONS = new Set(["fraud", "counterfeit", "harassment", "prohibited_item", "misleading_listing", "delivery_misconduct", "other"]);
 
-app.post("/seller-reports", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+app.post("/seller-reports", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, async (req, res) => {
   try {
     const sellerId = Number(req.body?.sellerId);
     const orderId = req.body?.orderId ? Number(req.body.orderId) : null;
@@ -11578,6 +11650,7 @@ app.get("/seller-reports", authenticate, requirePermission("seller_report_review
          seller.username AS seller_username, seller.display_name AS seller_display_name
        FROM seller_reports sr JOIN users reporter ON reporter.id = sr.reporter_id
        JOIN users seller ON seller.id = sr.reported_seller_id
+       WHERE sr.is_preview=false AND reporter.is_preview=false AND seller.is_preview=false
        ORDER BY CASE sr.status WHEN 'open' THEN 0 WHEN 'in_review' THEN 1 ELSE 2 END, sr.created_at DESC`
     );
     res.json({ reports: result.rows });
@@ -11592,7 +11665,7 @@ app.patch("/seller-reports/:id", authenticate, requirePermission("seller_report_
     const result = await pool.query(
       `UPDATE seller_reports SET status=$1, admin_note=$2, reviewed_by=$3, updated_at=NOW(),
          resolved_at=CASE WHEN $1 IN ('resolved','dismissed') THEN NOW() ELSE NULL END
-       WHERE id=$4 RETURNING *`, [status, adminNote || null, req.user.id, req.params.id]
+       WHERE id=$4 AND is_preview=false RETURNING *`, [status, adminNote || null, req.user.id, req.params.id]
     );
     if (!result.rows.length) return res.status(404).json({ error: "Seller report not found" });
     logAdminAction(req.user.id, "seller_report_updated", `Seller report ${result.rows[0].reference} marked ${status}`);
@@ -11600,7 +11673,7 @@ app.patch("/seller-reports/:id", authenticate, requirePermission("seller_report_
   } catch (err) { sendInternalError(res, err); }
 });
 
-app.post("/account-reports", authenticate, async (req, res) => {
+app.post("/account-reports", authenticate, rejectPreviewRealWorldAction, async (req, res) => {
   try {
     const { message } = req.body;
     if (!message || !message.trim()) {
@@ -11622,6 +11695,7 @@ app.get("/account-reports", authenticate, requirePermission("user_management"), 
       `SELECT ar.*, u.username, u.display_name
        FROM account_reports ar
        JOIN users u ON ar.user_id = u.id
+       WHERE ar.is_preview=false AND u.is_preview=false
        ORDER BY ar.created_at DESC`
     );
     res.json({ reports: result.rows });
@@ -11633,7 +11707,7 @@ app.get("/account-reports", authenticate, requirePermission("user_management"), 
 app.patch("/account-reports/:id/resolve", authenticate, requirePermission("user_management"), async (req, res) => {
   try {
     const result = await pool.query(
-      "UPDATE account_reports SET status = 'resolved', resolved_at = NOW() WHERE id = $1 RETURNING *",
+      "UPDATE account_reports SET status = 'resolved', resolved_at = NOW() WHERE id = $1 AND is_preview=false RETURNING *",
       [req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Report not found" });
@@ -12383,12 +12457,13 @@ async function ensurePreviewAccounts() {
       await client.query(
         `INSERT INTO order_items (
            order_id,listing_id,title,emoji,price,qty,shipping_fee,seller_id,
-           seller_username,seller_name,fulfillment_status,delivery_token,delivery_token_generated_at
+           seller_username,seller_name,fulfillment_status,delivery_token,delivery_token_generated_at,is_preview
          ) VALUES ($1,$2,'TEST DATA — Preview wireless headphones','🎧',45000,1,2500,$3,$4,$5,
-           'new','PREVIEW1234',NOW())`,
+           'new','PREVIEW1234',NOW(),true)`,
         [orderId, listingId, seller.id, seller.username, "Stallyard Preview Seller"]
       );
     }
+    await client.query("UPDATE order_items SET is_preview=true WHERE order_id=$1", [orderId]);
 
     let threadResult = await client.query(
       "SELECT id FROM threads WHERE listing_id = $1 AND buyer_id = $2 AND seller_id = $3 LIMIT 1",
@@ -12396,19 +12471,20 @@ async function ensurePreviewAccounts() {
     );
     if (!threadResult.rows.length) {
       threadResult = await client.query(
-        "INSERT INTO threads (listing_id,buyer_id,seller_id) VALUES ($1,$2,$3) RETURNING id",
+        "INSERT INTO threads (listing_id,buyer_id,seller_id,is_preview) VALUES ($1,$2,$3,true) RETURNING id",
         [listingId, buyer.id, seller.id]
       );
     }
     const threadId = threadResult.rows[0].id;
+    await client.query("UPDATE threads SET is_preview=true WHERE id=$1", [threadId]);
     const messageExists = await client.query(
       "SELECT 1 FROM messages WHERE thread_id = $1 AND body LIKE 'TEST DATA — Welcome to the preview%' LIMIT 1",
       [threadId]
     );
     if (!messageExists.rows.length) {
       await client.query(
-        `INSERT INTO messages (thread_id,sender_id,message_type,body,order_id)
-         VALUES ($1,$2,'text','TEST DATA — Welcome to the preview conversation. Use these accounts to inspect buyer and seller messaging.', $3)`,
+        `INSERT INTO messages (thread_id,sender_id,message_type,body,order_id,is_preview)
+         VALUES ($1,$2,'text','TEST DATA — Welcome to the preview conversation. Use these accounts to inspect buyer and seller messaging.', $3,true)`,
         [threadId, buyer.id, orderId]
       );
     }
@@ -12416,7 +12492,7 @@ async function ensurePreviewAccounts() {
     const addPreviewNotification = async (userId, type, message) => {
       const existing = await client.query("SELECT 1 FROM notifications WHERE user_id=$1 AND message=$2 LIMIT 1", [userId, message]);
       if (!existing.rows.length) {
-        await client.query("INSERT INTO notifications (user_id,type,message,read) VALUES ($1,$2,$3,false)", [userId, type, message]);
+        await client.query("INSERT INTO notifications (user_id,type,message,read,is_preview) VALUES ($1,$2,$3,false,true)", [userId, type, message]);
       }
     };
     await addPreviewNotification(buyer.id, "preview", "TEST DATA — Your preview order has been created.");
