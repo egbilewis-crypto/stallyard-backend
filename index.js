@@ -12124,6 +12124,42 @@ app.get("/admin/system-health", authenticate, requirePermission("role_assignment
   // The request itself proves Express/Railway is serving traffic.
   add("backend", "Railway backend", "API server", "healthy", "Stallyard backend is responding.", { liveCheck: true, latencyMs: 0 });
 
+  const frontend = await timed(async () => {
+    const response = await fetchWithTimeout("https://stallyard.com", {
+      method: "HEAD",
+      redirect: "follow",
+      headers: { "User-Agent": "Stallyard-System-Health/1.0" },
+    });
+    if (!response.ok) throw new Error(`Marketplace returned HTTP ${response.status}`);
+    return response;
+  });
+  add(
+    "frontend",
+    "Marketplace frontend",
+    "Public Stallyard website",
+    frontend.ok ? "healthy" : "unhealthy",
+    frontend.ok ? "The public marketplace is reachable over HTTPS." : `Marketplace check failed: ${frontend.error?.message || "unknown error"}`,
+    { liveCheck: true, latencyMs: frontend.latencyMs }
+  );
+
+  const cloudflare = await timed(async () => {
+    const response = await fetchWithTimeout("https://legal.stallyard.com/user-agreement/", {
+      method: "HEAD",
+      redirect: "follow",
+      headers: { "User-Agent": "Stallyard-System-Health/1.0" },
+    });
+    if (!response.ok) throw new Error(`Legal site returned HTTP ${response.status}`);
+    return response;
+  });
+  add(
+    "cloudflare",
+    "Cloudflare DNS and TLS",
+    "Legal-site routing and HTTPS certificate",
+    cloudflare.ok ? "healthy" : "unhealthy",
+    cloudflare.ok ? "legal.stallyard.com resolved and completed a valid HTTPS request." : `Cloudflare/TLS check failed: ${cloudflare.error?.message || "unknown error"}`,
+    { liveCheck: true, latencyMs: cloudflare.latencyMs }
+  );
+
   const db = await timed(() => pool.query("SELECT 1 AS ok"));
   add(
     "postgres",
@@ -12168,6 +12204,35 @@ app.get("/admin/system-health", authenticate, requirePermission("role_assignment
       { liveCheck: true, latencyMs: ps.latencyMs });
   }
 
+  const paystackWebhookConfigured = !!process.env.PAYSTACK_SECRET_KEY;
+  add(
+    "paystack_webhook",
+    "Paystack webhook",
+    "Signed payment and transfer events",
+    paystackWebhookConfigured ? "configured" : "not_configured",
+    paystackWebhookConfigured
+      ? "The webhook endpoint is installed and signature verification uses the server-side Paystack key. Confirm delivery history in Paystack when investigating a specific event."
+      : "PAYSTACK_SECRET_KEY is missing, so webhook signatures cannot be verified.",
+    { liveCheck: false }
+  );
+
+  const awsConfigured = !!(
+    process.env.AWS_ACCESS_KEY_ID &&
+    process.env.AWS_SECRET_ACCESS_KEY &&
+    process.env.AWS_REGION &&
+    process.env.AWS_LIVENESS_ROLE_ARN
+  );
+  add(
+    "aws_rekognition",
+    "AWS Rekognition",
+    "Seller face matching and liveness",
+    awsConfigured ? "configured" : "not_configured",
+    awsConfigured
+      ? "Rekognition and Face Liveness credentials are present. A live biometric session is not created by System Health."
+      : "One or more AWS Rekognition/Liveness settings are missing.",
+    { liveCheck: false }
+  );
+
   // Resend production keys can intentionally be restricted to Sending access.
   // A send-only key is not allowed to call account-level endpoints such as
   // GET /domains, so using that endpoint as a health check produces a false
@@ -12202,6 +12267,52 @@ app.get("/admin/system-health", authenticate, requirePermission("role_assignment
   add("termii", "Termii", "SMS/phone verification", termiiConfigured ? "configured" : "not_configured",
     termiiConfigured ? "SMS API key is present. No test SMS is sent by this health check." : "TERMII_API_KEY is missing; SMS verification is unavailable.",
     { liveCheck: false });
+
+  const payoutQueue = await timed(() => pool.query(
+    `SELECT
+       COUNT(*) FILTER (WHERE status IN ('queued', 'processing'))::int AS active_count,
+       COUNT(*) FILTER (WHERE status = 'request_unknown' AND updated_at >= NOW() - INTERVAL '24 hours')::int AS unknown_count,
+       COUNT(*) FILTER (WHERE status = 'failed' AND updated_at >= NOW() - INTERVAL '24 hours')::int AS failed_count,
+       EXTRACT(EPOCH FROM (NOW() - MIN(created_at) FILTER (WHERE status IN ('queued', 'processing'))))::int AS oldest_active_seconds
+     FROM seller_payouts`
+  ));
+  if (!payoutQueue.ok) {
+    add("payout_queue", "Payout queue", "Automatic seller payout processing", "unhealthy",
+      `Queue check failed: ${payoutQueue.error?.message || "unknown error"}`, { liveCheck: true, latencyMs: payoutQueue.latencyMs });
+  } else {
+    const row = payoutQueue.value.rows[0] || {};
+    const activeCount = Number(row.active_count || 0);
+    const unknownCount = Number(row.unknown_count || 0);
+    const failedCount = Number(row.failed_count || 0);
+    const oldestActiveSeconds = Number(row.oldest_active_seconds || 0);
+    const stalled = activeCount > 0 && oldestActiveSeconds > 15 * 60;
+    const queueHealthy = !stalled && unknownCount === 0;
+    const details = `${activeCount} active; ${failedCount} failed and ${unknownCount} request-unknown in the last 24 hours.`;
+    add(
+      "payout_queue",
+      "Payout queue",
+      "Automatic seller payout processing",
+      queueHealthy ? "healthy" : "unhealthy",
+      queueHealthy ? `Queue is processing normally. ${details}` : `${stalled ? "One or more payouts have been active for over 15 minutes. " : ""}${details}`,
+      { liveCheck: true, latencyMs: payoutQueue.latencyMs }
+    );
+  }
+
+  const deploymentId = process.env.RAILWAY_DEPLOYMENT_ID || "";
+  const commitSha = process.env.RAILWAY_GIT_COMMIT_SHA || "";
+  const serviceName = process.env.RAILWAY_SERVICE_NAME || "Stallyard backend";
+  const deploymentConfigured = !!(deploymentId || commitSha);
+  const releaseReference = commitSha ? commitSha.slice(0, 12) : deploymentId ? deploymentId.slice(0, 12) : "unavailable";
+  add(
+    "deployment",
+    "Latest Railway deployment",
+    "Running backend release",
+    deploymentConfigured ? "configured" : "not_configured",
+    deploymentConfigured
+      ? `${serviceName} is running release ${releaseReference}.`
+      : "Railway deployment metadata is not available in this environment.",
+    { liveCheck: false }
+  );
 
   const problems = services.filter((service) => service.status === "unhealthy");
   res.json({
