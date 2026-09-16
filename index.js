@@ -617,6 +617,8 @@ async function reserveCheckoutListings(client, { buyerId, reference, items }) {
       `SELECT listings.id, listings.status, listings.quantity FROM listings
         JOIN users ON users.id = listings.owner_id
        WHERE listings.id = $1
+         AND listings.is_preview = false
+         AND users.is_preview = false
          AND users.is_suspended = false
          AND users.seller_suspended = false
          AND ((users.is_approved = true AND users.seller_tier IN ('verified', 'premium'))
@@ -889,6 +891,8 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
         `SELECT listings.* FROM listings
           JOIN users ON users.id = listings.owner_id
          WHERE listings.id = $1 AND listings.status = 'active'
+           AND listings.is_preview = false
+           AND users.is_preview = false
            AND users.is_suspended = false
            AND users.seller_suspended = false
            AND ((users.is_approved = true AND users.seller_tier IN ('verified', 'premium'))
@@ -5681,12 +5685,15 @@ async function activeListingValue(client, ownerId, excludeListingId = null) {
 
 async function assertSellerMayPublish(client, ownerId, proposedPrice, proposedQuantity, excludeListingId = null) {
   const userResult = await client.query(
-    `SELECT is_approved, is_suspended, seller_suspended, casual_seller_status, casual_seller_limit, seller_tier, seller_listing_limit, username, display_name
+      `SELECT is_approved, is_suspended, is_preview, seller_suspended, casual_seller_status, casual_seller_limit, seller_tier, seller_listing_limit, username, display_name
        FROM users WHERE id = $1 FOR UPDATE`,
     [ownerId]
   );
   if (!userResult.rows.length) throw Object.assign(new Error("Seller account not found"), { statusCode: 404 });
   const seller = userResult.rows[0];
+  if (seller.is_preview) {
+    throw Object.assign(new Error("Preview listings cannot be published to the live marketplace."), { statusCode: 403, code: "PREVIEW_ACCOUNT_RESTRICTED" });
+  }
   if (seller.is_suspended || seller.seller_suspended) {
     throw Object.assign(new Error("Selling is suspended on this account. Contact Stallyard support."), { statusCode: 403, code: "SELLER_SUSPENDED" });
   }
@@ -7315,6 +7322,9 @@ app.patch("/listings/:id", authenticate, async (req, res) => {
     if (sets.length === 0) throw Object.assign(new Error("No valid fields to update"), { statusCode: 400 });
     const nextStatusRaw = Object.prototype.hasOwnProperty.call(req.body, "status") ? req.body.status : existing.rows[0].status;
     const nextStatus = nextStatusRaw === "approved" ? "active" : nextStatusRaw;
+    if (existing.rows[0].is_preview && nextStatus === "active") {
+      throw Object.assign(new Error("Preview listings cannot be activated in the live marketplace."), { statusCode: 403, code: "PREVIEW_ACCOUNT_RESTRICTED" });
+    }
     if (existing.rows[0].owner_id === req.user.id && nextStatus === "active") {
       await assertSellerMayPublish(
         client, req.user.id,
@@ -7571,12 +7581,12 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, reject
         return res.status(400).json({ error: "Each cart item needs a valid listingId and a positive quantity" });
       }
       const listingId = Number(cartItem.listingId);
-      if (seenListingIds.has(listingId)) return res.status(400).json({ error: "Each listing may appear only once in checkout" });
-      seenListingIds.add(listingId);
       const listingResult = await pool.query(
         `SELECT listings.* FROM listings
           JOIN users ON users.id = listings.owner_id
          WHERE listings.id = $1 AND listings.status = 'active'
+           AND listings.is_preview = false
+           AND users.is_preview = false
            AND users.is_suspended = false
            AND users.seller_suspended = false
            AND ((users.is_approved = true AND users.seller_tier IN ('verified', 'premium'))
@@ -7773,6 +7783,8 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
         `SELECT listings.* FROM listings
           JOIN users ON users.id = listings.owner_id
          WHERE listings.id = $1 AND listings.status = 'active'
+           AND listings.is_preview = false
+           AND users.is_preview = false
            AND users.is_suspended = false
            AND users.seller_suspended = false
            AND ((users.is_approved = true AND users.seller_tier IN ('verified', 'premium'))
@@ -7978,7 +7990,7 @@ app.get("/orders/selling", authenticate, rejectAdminMarketplaceUse, async (req, 
 
 app.get("/orders", authenticate, requirePermission("order_access"), async (req, res) => {
   try {
-    const orders = await fetchOrdersWithItems("TRUE", [], { includeAdminPayouts: true });
+    const orders = await fetchOrdersWithItems("is_preview = false", [], { includeAdminPayouts: true });
     res.json({ orders });
   } catch (err) {
     sendInternalError(res, err);
@@ -7995,6 +8007,10 @@ app.patch("/orders/:id/release", authenticate, requirePermission("finance"), asy
       return res.status(404).json({ error: "Order not found" });
     }
     const order = orderResult.rows[0];
+    if (order.is_preview) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Preview orders cannot release real funds", code: "PREVIEW_ACCOUNT_RESTRICTED" });
+    }
     if (order.payment_status !== "held") {
       await client.query("ROLLBACK");
       return res.status(409).json({ error: `Only held payments can be released. This order is currently ${order.payment_status}.` });
@@ -8342,6 +8358,11 @@ app.patch("/orders/:id/refund", authenticate, requirePermission("finance"), asyn
     }
     order = orderResult.rows[0];
 
+    if (order.is_preview) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Preview orders cannot be submitted to Paystack for refunds", code: "PREVIEW_ACCOUNT_RESTRICTED" });
+    }
+
     if (order.payment_status !== "held") {
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "Refunds are closed because seller payment is no longer being held" });
@@ -8497,6 +8518,10 @@ app.patch("/orders/:id/refund/partial", authenticate, requirePermission("finance
       return res.status(404).json({ error: "Order not found" });
     }
     order = orderResult.rows[0];
+    if (order.is_preview) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Preview orders cannot be submitted to Paystack for refunds", code: "PREVIEW_ACCOUNT_RESTRICTED" });
+    }
     if (order.payment_status !== "held") {
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "Refunds are closed because seller payment is no longer being held" });
@@ -10355,7 +10380,12 @@ app.get("/withdrawals/mine", authenticate, rejectAdminMarketplaceUse, async (req
 
 app.get("/withdrawals", authenticate, requirePermission("finance"), async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM withdrawals ORDER BY requested_at DESC");
+    const result = await pool.query(
+      `SELECT w.* FROM withdrawals w
+       JOIN users u ON u.id = w.seller_id
+       WHERE u.is_preview = false
+       ORDER BY w.requested_at DESC`
+    );
     res.json({ withdrawals: result.rows });
   } catch (err) {
     sendInternalError(res, err);
