@@ -5,6 +5,7 @@ const fetch = require("node-fetch");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
+const sharp = require("sharp");
 const { RekognitionClient, CreateFaceLivenessSessionCommand, GetFaceLivenessSessionResultsCommand, CompareFacesCommand } = require("@aws-sdk/client-rekognition");
 const { STSClient, AssumeRoleCommand } = require("@aws-sdk/client-sts");
 
@@ -1088,6 +1089,9 @@ const imageUploadUserDailyRateLimit = rateLimit({
   keyFn: (req) => `user:${req.user?.id || "unknown"}`,
 });
 const MAX_IMAGE_UPLOAD_BYTES = 8 * 1024 * 1024;
+const MAX_IMAGE_INPUT_PIXELS = 40 * 1000 * 1000;
+const MAX_PUBLIC_IMAGE_DIMENSION = 1600;
+const PUBLIC_IMAGE_WEBP_QUALITY = 82;
 
 // Homepage Ad 1 may use a short promotional video. Keep this much tighter than
 // general file hosting so the admin tool cannot become an accidental large-file store.
@@ -5053,22 +5057,55 @@ app.post("/uploads/image", authenticate, imageUploadIpBurstRateLimit, imageUploa
       return res.status(413).json({ error: "Image is too large — maximum upload size is 8 MB" });
     }
 
-    const extension = mimeType === "image/png" ? "png" : mimeType === "image/webp" ? "webp" : mimeType === "image/avif" ? "avif" : "jpg";
     const safeFolder = String(folder || "listings")
       .replace(/^\/+|\/+$/g, "")
       .replace(/[^a-zA-Z0-9/_-]/g, "-") || "listings";
-    const objectPath = `${safeFolder}/${req.user.id}/${Date.now()}-${crypto.randomBytes(8).toString("hex")}.${extension}`;
+
+    // Enforce optimization on the server. Browser-side resizing improves the
+    // user experience, but it must not be trusted because callers can bypass
+    // the browser and post directly to this endpoint. Sharp decodes the image,
+    // auto-rotates it, limits its dimensions, strips EXIF/GPS metadata by
+    // default, and creates one predictable next-generation WebP asset.
+    let optimizedBuffer;
+    let optimizedInfo;
+    try {
+      const image = sharp(imageBuffer, {
+        failOn: "warning",
+        limitInputPixels: MAX_IMAGE_INPUT_PIXELS,
+        sequentialRead: true,
+      });
+      const metadata = await image.metadata();
+      if (!metadata.width || !metadata.height) {
+        return res.status(400).json({ error: "Couldn't read image dimensions" });
+      }
+      ({ data: optimizedBuffer, info: optimizedInfo } = await image
+        .rotate()
+        .resize({
+          width: MAX_PUBLIC_IMAGE_DIMENSION,
+          height: MAX_PUBLIC_IMAGE_DIMENSION,
+          fit: "inside",
+          withoutEnlargement: true,
+        })
+        .webp({ quality: PUBLIC_IMAGE_WEBP_QUALITY, effort: 4, smartSubsample: true })
+        .toBuffer({ resolveWithObject: true }));
+    } catch (error) {
+      console.warn("Rejected invalid image upload:", error?.message || error);
+      return res.status(400).json({ error: "This image couldn't be processed — try a different JPEG, PNG, WebP, or AVIF file" });
+    }
+
+    const outputMimeType = "image/webp";
+    const objectPath = `${safeFolder}/${req.user.id}/${Date.now()}-${crypto.randomBytes(8).toString("hex")}.webp`;
 
     const uploadUrl = `${SUPABASE_URL}/storage/v1/object/${encodeURIComponent(SUPABASE_BUCKET)}/${objectPath.split("/").map(encodeURIComponent).join("/")}`;
     const storageRes = await fetch(uploadUrl, {
       method: "POST",
       headers: {
         apikey: SUPABASE_SECRET_KEY,
-        "Content-Type": mimeType,
+        "Content-Type": outputMimeType,
         "x-upsert": "false",
         "Cache-Control": "public, max-age=31536000, immutable",
       },
-      body: imageBuffer,
+      body: optimizedBuffer,
     });
 
     let storageData = {};
@@ -5088,6 +5125,10 @@ app.post("/uploads/image", authenticate, imageUploadIpBurstRateLimit, imageUploa
       url: publicUrl,
       path: objectPath,
       publicId: objectPath, // compatibility with the existing frontend response shape
+      format: "webp",
+      width: optimizedInfo.width,
+      height: optimizedInfo.height,
+      sizeBytes: optimizedInfo.size,
     });
   } catch (err) {
     sendInternalError(res, err);
