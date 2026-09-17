@@ -1092,6 +1092,7 @@ const MAX_IMAGE_UPLOAD_BYTES = 8 * 1024 * 1024;
 const MAX_IMAGE_INPUT_PIXELS = 40 * 1000 * 1000;
 const MAX_PUBLIC_IMAGE_DIMENSION = 1600;
 const PUBLIC_IMAGE_WEBP_QUALITY = 82;
+const RESPONSIVE_LISTING_WIDTHS = [400, 800, 1200, 1600];
 
 // Homepage Ad 1 may use a short promotional video. Keep this much tighter than
 // general file hosting so the admin tool cannot become an accidental large-file store.
@@ -5061,74 +5062,92 @@ app.post("/uploads/image", authenticate, imageUploadIpBurstRateLimit, imageUploa
       .replace(/^\/+|\/+$/g, "")
       .replace(/[^a-zA-Z0-9/_-]/g, "-") || "listings";
 
-    // Enforce optimization on the server. Browser-side resizing improves the
-    // user experience, but it must not be trusted because callers can bypass
-    // the browser and post directly to this endpoint. Sharp decodes the image,
-    // auto-rotates it, limits its dimensions, strips EXIF/GPS metadata by
-    // default, and creates one predictable next-generation WebP asset.
-    let optimizedBuffer;
-    let optimizedInfo;
+    // Product photos get a responsive family. Other uploads (avatars, proof
+    // photos, homepage creatives, etc.) retain one optimized WebP so private
+    // operational media does not consume four times the storage.
+    const responsiveProductPhoto = safeFolder === "listings/products";
+    const requestedWidths = responsiveProductPhoto ? RESPONSIVE_LISTING_WIDTHS : [MAX_PUBLIC_IMAGE_DIMENSION];
+    let optimizedImages;
     try {
-      const image = sharp(imageBuffer, {
+      const probe = sharp(imageBuffer, {
         failOn: "warning",
         limitInputPixels: MAX_IMAGE_INPUT_PIXELS,
         sequentialRead: true,
       });
-      const metadata = await image.metadata();
+      const metadata = await probe.metadata();
       if (!metadata.width || !metadata.height) {
         return res.status(400).json({ error: "Couldn't read image dimensions" });
       }
-      ({ data: optimizedBuffer, info: optimizedInfo } = await image
-        .rotate()
-        .resize({
-          width: MAX_PUBLIC_IMAGE_DIMENSION,
-          height: MAX_PUBLIC_IMAGE_DIMENSION,
-          fit: "inside",
-          withoutEnlargement: true,
+      optimizedImages = await Promise.all(requestedWidths.map(async (width) => {
+        const { data, info } = await sharp(imageBuffer, {
+          failOn: "warning",
+          limitInputPixels: MAX_IMAGE_INPUT_PIXELS,
+          sequentialRead: true,
         })
-        .webp({ quality: PUBLIC_IMAGE_WEBP_QUALITY, effort: 4, smartSubsample: true })
-        .toBuffer({ resolveWithObject: true }));
+          .rotate()
+          .resize({
+            width,
+            height: width,
+            fit: "inside",
+            withoutEnlargement: !responsiveProductPhoto,
+          })
+          .webp({ quality: PUBLIC_IMAGE_WEBP_QUALITY, effort: 4, smartSubsample: true })
+          .toBuffer({ resolveWithObject: true });
+        return { requestedWidth: width, data, info };
+      }));
     } catch (error) {
       console.warn("Rejected invalid image upload:", error?.message || error);
       return res.status(400).json({ error: "This image couldn't be processed — try a different JPEG, PNG, WebP, or AVIF file" });
     }
 
     const outputMimeType = "image/webp";
-    const objectPath = `${safeFolder}/${req.user.id}/${Date.now()}-${crypto.randomBytes(8).toString("hex")}.webp`;
-
-    const uploadUrl = `${SUPABASE_URL}/storage/v1/object/${encodeURIComponent(SUPABASE_BUCKET)}/${objectPath.split("/").map(encodeURIComponent).join("/")}`;
-    const storageRes = await fetch(uploadUrl, {
-      method: "POST",
-      headers: {
-        apikey: SUPABASE_SECRET_KEY,
-        "Content-Type": outputMimeType,
-        "x-upsert": "false",
-        "Cache-Control": "public, max-age=31536000, immutable",
-      },
-      body: optimizedBuffer,
+    const assetId = `${Date.now()}-${crypto.randomBytes(8).toString("hex")}`;
+    const uploadedImages = await Promise.all(optimizedImages.map(async (optimized) => {
+      const widthSuffix = responsiveProductPhoto ? `-${optimized.requestedWidth}` : "";
+      const path = `${safeFolder}/${req.user.id}/${assetId}${widthSuffix}.webp`;
+      const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+      const uploadUrl = `${SUPABASE_URL}/storage/v1/object/${encodeURIComponent(SUPABASE_BUCKET)}/${encodedPath}`;
+      const storageRes = await fetch(uploadUrl, {
+        method: "POST",
+        headers: {
+          apikey: SUPABASE_SECRET_KEY,
+          "Content-Type": outputMimeType,
+          "x-upsert": "false",
+          "Cache-Control": "public, max-age=31536000, immutable",
+        },
+        body: optimized.data,
+      });
+      let storageData = {};
+      try { storageData = await storageRes.json(); } catch {}
+      if (!storageRes.ok) {
+        const uploadError = new Error(storageData.message || storageData.error || "Upload to Supabase Storage failed");
+        uploadError.status = storageRes.status;
+        throw uploadError;
+      }
+      return {
+        ...optimized,
+        path,
+        url: `${SUPABASE_URL}/storage/v1/object/public/${encodeURIComponent(SUPABASE_BUCKET)}/${encodedPath}`,
+      };
+    })).catch((error) => {
+      console.error("Supabase Storage upload failed:", error.status || "unknown", error.message);
+      return null;
     });
-
-    let storageData = {};
-    try {
-      storageData = await storageRes.json();
-    } catch {
-      // Supabase may return a non-JSON error body; the generic message below is enough for the client.
-    }
-    if (!storageRes.ok) {
-      console.error("Supabase Storage upload failed:", storageRes.status, storageData);
-      return res.status(400).json({ error: storageData.message || storageData.error || "Upload to Supabase Storage failed" });
+    if (!uploadedImages) {
+      return res.status(400).json({ error: "Upload to Supabase Storage failed" });
     }
 
-    const encodedPath = objectPath.split("/").map(encodeURIComponent).join("/");
-    const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/${encodeURIComponent(SUPABASE_BUCKET)}/${encodedPath}`;
+    const primaryImage = uploadedImages[uploadedImages.length - 1];
+    const variants = Object.fromEntries(uploadedImages.map((image) => [image.requestedWidth, image.url]));
     res.json({
-      url: publicUrl,
-      path: objectPath,
-      publicId: objectPath, // compatibility with the existing frontend response shape
+      url: primaryImage.url,
+      path: primaryImage.path,
+      publicId: primaryImage.path, // compatibility with the existing frontend response shape
       format: "webp",
-      width: optimizedInfo.width,
-      height: optimizedInfo.height,
-      sizeBytes: optimizedInfo.size,
+      width: primaryImage.info.width,
+      height: primaryImage.info.height,
+      sizeBytes: primaryImage.info.size,
+      variants: responsiveProductPhoto ? variants : undefined,
     });
   } catch (err) {
     sendInternalError(res, err);
