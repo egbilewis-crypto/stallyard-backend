@@ -3046,6 +3046,16 @@ const SCHEMA_MIGRATIONS = [
        ADD COLUMN IF NOT EXISTS live_location_expires_at TIMESTAMP`,
     `UPDATE order_items SET carrier = '' WHERE carrier IS NULL`,
   ] },
+  { version: 80, name: "self-delivery-workflow", statements: [
+    `ALTER TABLE order_items
+       ADD COLUMN IF NOT EXISTS self_delivery_status TEXT,
+       ADD COLUMN IF NOT EXISTS delivery_person_selfie_url TEXT,
+       ADD COLUMN IF NOT EXISTS self_delivery_started_at TIMESTAMP,
+       ADD COLUMN IF NOT EXISTS self_delivery_on_my_way_at TIMESTAMP,
+       ADD COLUMN IF NOT EXISTS self_delivery_arrived_at TIMESTAMP,
+       ADD COLUMN IF NOT EXISTS self_delivery_delivered_at TIMESTAMP`,
+    `CREATE INDEX IF NOT EXISTS idx_order_items_self_delivery_status ON order_items(self_delivery_status)`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -9024,7 +9034,7 @@ const ORDER_ITEM_STATUSES = new Set(["new", "preparing", "shipped", "delivered",
 app.patch("/order-items/:id", authenticate, async (req, res) => {
   try {
     const existing = await pool.query(
-      "SELECT seller_id, cancellation_status, fulfillment_status, estimated_delivery_start, estimated_delivery_end FROM order_items WHERE id = $1",
+      "SELECT seller_id, cancellation_status, fulfillment_status, carrier, self_delivery_status, estimated_delivery_start, estimated_delivery_end FROM order_items WHERE id = $1",
       [req.params.id]
     );
     if (existing.rows.length === 0) return res.status(404).json({ error: "Order item not found" });
@@ -9048,11 +9058,17 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
     if (carrier !== undefined && (typeof carrier !== "string" || !allowedCarriers.has(carrier))) {
       return res.status(400).json({ error: "Select a valid delivery carrier" });
     }
+    if (typeof carrier === "string" && existing.rows[0].self_delivery_status && carrier !== "Self delivery") {
+      return res.status(409).json({ error: "Self delivery has already started and cannot be changed to another carrier" });
+    }
     if (fulfillmentStatus && existing.rows[0].cancellation_status === "requested") {
       return res.status(409).json({ error: "Approve or deny the buyer's cancellation request before changing fulfillment status" });
     }
     if (fulfillmentStatus && !ORDER_ITEM_STATUSES.has(fulfillmentStatus)) {
       return res.status(400).json({ error: "Invalid fulfillment status" });
+    }
+    if (fulfillmentStatus && existing.rows[0].carrier === "Self delivery" && ["shipped", "delivered"].includes(fulfillmentStatus)) {
+      return res.status(409).json({ error: "Use the Self delivery steps to update this order" });
     }
     const sets = [];
     const values = [];
@@ -9161,6 +9177,125 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
   } catch (err) {
     if (err.statusCode === 400) return res.status(400).json({ error: err.message });
     sendInternalError(res, err);
+  }
+});
+
+const SELF_DELIVERY_ACTIONS = new Set(["start", "on_my_way", "selfie", "arrived", "delivered"]);
+
+app.patch("/order-items/:id/self-delivery", authenticate, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await client.query(
+      `SELECT * FROM order_items WHERE id = $1 FOR UPDATE`,
+      [req.params.id]
+    );
+    if (!result.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Order item not found" });
+    }
+    const item = result.rows[0];
+    if (item.seller_id !== req.user.id) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Only the seller can run Self delivery" });
+    }
+    const action = String(req.body?.action || "");
+    if (!SELF_DELIVERY_ACTIONS.has(action)) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Invalid Self delivery step" });
+    }
+    if (["cancelled", "returned"].includes(item.fulfillment_status)) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Self delivery is unavailable for a cancelled or returned item" });
+    }
+
+    let updated;
+    let eventLabel;
+    if (action === "start") {
+      if (item.self_delivery_status) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "Self delivery has already started" });
+      }
+      updated = await client.query(
+        `UPDATE order_items SET carrier='Self delivery', self_delivery_status='started',
+           self_delivery_started_at=NOW(), fulfillment_status=CASE WHEN fulfillment_status='new' THEN 'preparing' ELSE fulfillment_status END
+         WHERE id=$1 RETURNING *`,
+        [item.id]
+      );
+      eventLabel = "Seller started Self delivery";
+    } else if (action === "on_my_way") {
+      if (item.self_delivery_status !== "started") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "Start Self delivery first" });
+      }
+      updated = await client.query(
+        `UPDATE order_items SET self_delivery_status='on_my_way',
+           self_delivery_on_my_way_at=NOW(), fulfillment_status='shipped', shipped_at=COALESCE(shipped_at,NOW())
+         WHERE id=$1 RETURNING *`,
+        [item.id]
+      );
+      eventLabel = "Seller is on the way";
+    } else if (action === "selfie") {
+      if (item.self_delivery_status !== "on_my_way") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "Mark On my way before uploading the delivery-person selfie" });
+      }
+      const selfieUrl = String(req.body?.deliveryPersonSelfieUrl || "").trim();
+      if (!selfieUrl) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "A delivery-person selfie is required" });
+      }
+      updated = await client.query(
+        `UPDATE order_items SET delivery_person_selfie_url=$1 WHERE id=$2 RETURNING *`,
+        [selfieUrl, item.id]
+      );
+      eventLabel = "Delivery-person selfie uploaded";
+    } else if (action === "arrived") {
+      if (item.self_delivery_status !== "on_my_way") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "Mark On my way before marking arrival" });
+      }
+      if (!item.delivery_person_selfie_url) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "Upload the required delivery-person selfie before marking I’m here" });
+      }
+      updated = await client.query(
+        `UPDATE order_items SET self_delivery_status='arrived', self_delivery_arrived_at=NOW(),
+           live_location_enabled=FALSE, live_location_expires_at=NULL
+         WHERE id=$1 RETURNING *`,
+        [item.id]
+      );
+      eventLabel = "Seller has arrived";
+    } else {
+      if (item.self_delivery_status !== "arrived") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "Mark I’m here before completing delivery" });
+      }
+      if (!item.proof_of_delivery_url) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "Upload the delivery-proof photo before marking Delivered" });
+      }
+      updated = await client.query(
+        `UPDATE order_items SET self_delivery_status='delivered', self_delivery_delivered_at=NOW(),
+           fulfillment_status='delivered', live_location_enabled=FALSE, live_location_expires_at=NULL
+         WHERE id=$1 RETURNING *`,
+        [item.id]
+      );
+      eventLabel = "Self delivery completed";
+    }
+
+    await client.query(
+      `INSERT INTO order_item_status_events(order_item_id,event_type,label)
+       VALUES ($1,$2,$3)`,
+      [item.id, `self_delivery_${action}`, eventLabel]
+    );
+    await client.query("COMMIT");
+    res.json({ item: updated.rows[0] });
+  } catch (err) {
+    try { await client.query("ROLLBACK"); } catch {}
+    sendInternalError(res, err);
+  } finally {
+    client.release();
   }
 });
 
