@@ -3061,6 +3061,16 @@ const SCHEMA_MIGRATIONS = [
        ADD COLUMN IF NOT EXISTS self_delivery_delivered_at TIMESTAMP`,
     `CREATE INDEX IF NOT EXISTS idx_order_items_self_delivery_status ON order_items(self_delivery_status)`,
   ] },
+  { version: 81, name: "listing-feed-performance", statements: [
+    `CREATE INDEX IF NOT EXISTS idx_listings_public_feed
+       ON listings(status, is_preview, created_at DESC, id DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_listings_public_category_feed
+       ON listings(category, subcategory, status, created_at DESC, id DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_listings_public_price
+       ON listings(status, price)`,
+    `CREATE INDEX IF NOT EXISTS idx_listings_owner_created
+       ON listings(owner_id, created_at DESC, id DESC)`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -7319,6 +7329,29 @@ function publicListingRow(row) {
 // A signed-in marketplace user additionally receives their own listings in all
 // statuses so drafts/pending items still appear in My Stall. Moderation-only
 // fields are never exposed for somebody else's listing.
+const LISTING_FEED_PAGE_SIZE = 20;
+const LISTING_FEED_MAX_PAGE_SIZE = 50;
+const LISTING_FEED_CACHE_TTL_MS = 30_000;
+const listingFeedCache = new Map();
+
+function getCachedListingFeed(key) {
+  const cached = listingFeedCache.get(key);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    listingFeedCache.delete(key);
+    return null;
+  }
+  return cached.value;
+}
+
+function setCachedListingFeed(key, value) {
+  if (listingFeedCache.size >= 100) {
+    const oldestKey = listingFeedCache.keys().next().value;
+    if (oldestKey) listingFeedCache.delete(oldestKey);
+  }
+  listingFeedCache.set(key, { value, expiresAt: Date.now() + LISTING_FEED_CACHE_TTL_MS });
+}
+
 app.get("/listings", async (req, res) => {
   try {
     let validUserId = null;
@@ -7335,34 +7368,89 @@ app.get("/listings", async (req, res) => {
       }
     }
 
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(
+      LISTING_FEED_MAX_PAGE_SIZE,
+      Math.max(1, Number.parseInt(req.query.limit, 10) || LISTING_FEED_PAGE_SIZE)
+    );
+    const mineOnly = req.query.mine === "true";
+    if (mineOnly && !validUserId) return res.status(401).json({ error: "Log in to view your listings" });
+
+    const category = String(req.query.category || "").trim();
+    const subcategory = String(req.query.subcategory || "").trim();
+    const condition = String(req.query.condition || "").trim();
+    const search = String(req.query.search || "").trim().slice(0, 120);
+    const minPrice = req.query.minPrice === undefined || req.query.minPrice === "" ? null : Number(req.query.minPrice);
+    const maxPrice = req.query.maxPrice === undefined || req.query.maxPrice === "" ? null : Number(req.query.maxPrice);
+    const sort = ["featured", "newest", "price-asc", "price-desc"].includes(req.query.sort)
+      ? req.query.sort
+      : "featured";
+
+    const cacheKey = !validUserId && !mineOnly ? req.originalUrl : null;
+    if (cacheKey) {
+      const cached = getCachedListingFeed(cacheKey);
+      if (cached) return res.json(cached);
+    }
+
+    const values = [];
+    const where = [];
+    const addValue = (value) => {
+      values.push(value);
+      return `$${values.length}`;
+    };
+
+    if (mineOnly) {
+      where.push(`listings.owner_id = ${addValue(validUserId)}`);
+    } else {
+      where.push(`listings.status = 'active'`);
+      where.push(`((users.is_approved = true AND users.seller_tier IN ('verified', 'premium')) OR users.casual_seller_status = 'approved')`);
+      where.push(`users.is_suspended = false`);
+      where.push(`users.seller_suspended = false`);
+      where.push(`users.is_preview = false`);
+      where.push(`listings.is_preview = false`);
+    }
+    if (category) where.push(`listings.category = ${addValue(category)}`);
+    if (subcategory) where.push(`listings.subcategory = ${addValue(subcategory)}`);
+    if (condition) where.push(`listings.condition = ${addValue(condition)}`);
+    if (search) {
+      const searchValue = addValue(`%${search}%`);
+      where.push(`(listings.title ILIKE ${searchValue} OR listings.description ILIKE ${searchValue})`);
+    }
+    if (Number.isFinite(minPrice)) where.push(`listings.price >= ${addValue(minPrice)}`);
+    if (Number.isFinite(maxPrice)) where.push(`listings.price <= ${addValue(maxPrice)}`);
+
+    const orderBy = {
+      featured: "listings.is_featured DESC, listings.created_at DESC, listings.id DESC",
+      newest: "listings.created_at DESC, listings.id DESC",
+      "price-asc": "listings.price ASC, listings.created_at DESC, listings.id DESC",
+      "price-desc": "listings.price DESC, listings.created_at DESC, listings.id DESC",
+    }[sort];
+    const fetchLimit = addValue(limit + 1);
+    const offset = addValue((page - 1) * limit);
+
     const result = await pool.query(
       `SELECT listings.*, users.display_name AS seller_name, users.username AS owner_username,
               users.is_approved AS seller_is_approved, users.casual_seller_status,
               users.is_suspended AS seller_is_suspended, users.seller_suspended
        FROM listings
        JOIN users ON listings.owner_id = users.id
-       WHERE (
-         listings.status = 'active'
-         AND ((users.is_approved = true AND users.seller_tier IN ('verified', 'premium'))
-              OR users.casual_seller_status = 'approved')
-         AND users.is_suspended = false
-         AND users.seller_suspended = false
-         AND users.is_preview = false
-         AND listings.is_preview = false
-       )
-       OR ($1::integer IS NOT NULL AND listings.owner_id = $1)
-       ORDER BY listings.created_at DESC`,
-      [validUserId]
+       WHERE ${where.join(" AND ")}
+       ORDER BY ${orderBy}
+       LIMIT ${fetchLimit} OFFSET ${offset}`,
+      values
     );
 
-    const rows = result.rows.map((row) => {
+    const hasMore = result.rows.length > limit;
+    const rows = result.rows.slice(0, limit).map((row) => {
       if (validUserId && row.owner_id === validUserId) {
         const { seller_is_approved, casual_seller_status, seller_is_suspended, seller_suspended, ...ownRow } = row;
         return ownRow;
       }
       return publicListingRow(row);
     });
-    res.json({ listings: rows });
+    const payload = { listings: rows, page, pageSize: limit, hasMore, nextPage: hasMore ? page + 1 : null };
+    if (cacheKey) setCachedListingFeed(cacheKey, payload);
+    res.json(payload);
   } catch (err) {
     sendInternalError(res, err);
   }
