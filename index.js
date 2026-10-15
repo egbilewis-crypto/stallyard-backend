@@ -602,9 +602,7 @@ async function createCheckoutIntent({ reference, buyerId, buyerUsername, buyerEm
   );
 }
 
-const CHECKOUT_RESERVATION_MINUTES = 15;
-
-async function reserveCheckoutListings(client, { buyerId, reference, items }) {
+async function validateCheckoutStock(client, { buyerId, reference, items }) {
   const requestedByListing = new Map();
   for (const item of items || []) {
     const listingId = Number(item.listingId);
@@ -614,10 +612,10 @@ async function reserveCheckoutListings(client, { buyerId, reference, items }) {
     }
   }
   const listingIds = [...requestedByListing.keys()].sort((a, b) => a - b);
-  if (!listingIds.length) throw new Error("Checkout has no valid listings to reserve");
+  if (!listingIds.length) throw new Error("Checkout has no valid listings");
 
   for (const listingId of listingIds) {
-    // Lock the listing row so two checkout transactions cannot reserve it simultaneously.
+    // Briefly lock while validating stock; unpaid checkouts never hold inventory.
     const listingResult = await client.query(
       `SELECT listings.id, listings.status, listings.quantity FROM listings
         JOIN users ON users.id = listings.owner_id
@@ -643,57 +641,12 @@ async function reserveCheckoutListings(client, { buyerId, reference, items }) {
       throw err;
     }
 
-    // Expired reservations never block a new buyer.
-    await client.query(
-      "DELETE FROM listing_checkout_reservations WHERE listing_id = $1 AND expires_at <= NOW()",
-      [listingId]
-    );
-
-    const existing = await client.query(
-      "SELECT buyer_id, reference, expires_at FROM listing_checkout_reservations WHERE listing_id = $1 FOR UPDATE",
-      [listingId]
-    );
-    if (existing.rows.length) {
-      const err = new Error("One or more items are temporarily reserved by another checkout. Please try again shortly.");
-      err.code = "LISTING_RESERVED";
-      err.listingId = listingId;
-      throw err;
-    }
-
-    await client.query(
-      `INSERT INTO listing_checkout_reservations (listing_id, buyer_id, reference, expires_at)
-       VALUES ($1, $2, $3, NOW() + ($4 * INTERVAL '1 minute'))`,
-      [listingId, Number(buyerId), reference, CHECKOUT_RESERVATION_MINUTES]
-    );
   }
 }
 
 async function releaseCheckoutReservations(reference, client = pool) {
+  // Clean up reservations created by older deployments only.
   await client.query("DELETE FROM listing_checkout_reservations WHERE reference = $1", [reference]);
-}
-
-async function assertCheckoutReservationsOwned(client, intent) {
-  const listingIds = [...new Set((Array.isArray(intent.items) ? intent.items : []).map((item) => Number(item.listingId)))].filter(Number.isInteger).sort((a, b) => a - b);
-  if (!listingIds.length) throw new Error("Payment integrity check failed: checkout intent has no reservable listings");
-
-  const reservations = await client.query(
-    `SELECT listing_id, buyer_id, reference, expires_at
-     FROM listing_checkout_reservations
-     WHERE listing_id = ANY($1::int[])
-     FOR UPDATE`,
-    [listingIds]
-  );
-  const byListing = new Map(reservations.rows.map((row) => [Number(row.listing_id), row]));
-
-  for (const listingId of listingIds) {
-    const reservation = byListing.get(listingId);
-    if (!reservation || String(reservation.reference) !== String(intent.reference) || Number(reservation.buyer_id) !== Number(intent.buyer_id)) {
-      throw new Error(`Paid listing ${listingId} is no longer reserved for this checkout — payment requires manual review`);
-    }
-    if (new Date(reservation.expires_at).getTime() <= Date.now()) {
-      throw new Error(`Paid listing ${listingId} reservation expired — payment requires manual review`);
-    }
-  }
 }
 
 async function loadCheckoutIntent(reference, client = pool) {
@@ -881,7 +834,9 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
     assertPaystackMatchesCheckoutIntent(intent, paystackData);
     const cartItems = Array.isArray(intent.items) ? intent.items : [];
     if (!cartItems.length) throw new Error("Payment integrity check failed: checkout intent has no items");
-    await assertCheckoutReservationsOwned(client, intent);
+    // Lock stock in a stable order below. Only successfully finalized orders
+    // consume inventory; abandoned or expired payment pages do not block buyers.
+    cartItems.sort((a, b) => Number(a.listingId) - Number(b.listingId));
 
     let subtotal = 0;
     let shippingTotal = 0;
@@ -906,7 +861,7 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
         [cartItem.listingId]
       );
       if (listingResult.rows.length === 0) {
-        throw new Error(`Paid listing ${cartItem.listingId} is no longer available — payment requires manual review`);
+        throw new Error(`Paid listing ${cartItem.listingId} is no longer available — payment requires an automatic refund`);
       }
       const listing = listingResult.rows[0];
       const availableQuantity = Math.max(1, Number(listing.quantity || 1));
@@ -7932,13 +7887,10 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, reject
         reference, buyerId: req.user.id, buyerUsername: req.user.username, buyerEmail: email,
         amountKobo, items: itemSnapshots, shippingAddress: normalizedShippingAddress, saveCard: !!saveCard,
       }, reservationClient);
-      await reserveCheckoutListings(reservationClient, { buyerId: req.user.id, reference, items: itemSnapshots });
+      await validateCheckoutStock(reservationClient, { buyerId: req.user.id, reference, items: itemSnapshots });
       await reservationClient.query("COMMIT");
     } catch (reservationErr) {
       await reservationClient.query("ROLLBACK");
-      if (reservationErr.code === "LISTING_RESERVED") {
-        return res.status(409).json({ error: reservationErr.message, code: "LISTING_RESERVED" });
-      }
       if (reservationErr.code === "LISTING_UNAVAILABLE") {
         return res.status(409).json({ error: reservationErr.message, code: "LISTING_UNAVAILABLE" });
       }
@@ -8128,13 +8080,10 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
         reference, buyerId: req.user.id, buyerUsername: req.user.username, buyerEmail: email,
         amountKobo, items: itemSnapshots, shippingAddress: normalizedShippingAddress, saveCard: false,
       }, reservationClient);
-      await reserveCheckoutListings(reservationClient, { buyerId: req.user.id, reference, items: itemSnapshots });
+      await validateCheckoutStock(reservationClient, { buyerId: req.user.id, reference, items: itemSnapshots });
       await reservationClient.query("COMMIT");
     } catch (reservationErr) {
       await reservationClient.query("ROLLBACK");
-      if (reservationErr.code === "LISTING_RESERVED") {
-        return res.status(409).json({ error: reservationErr.message, code: "LISTING_RESERVED" });
-      }
       if (reservationErr.code === "LISTING_UNAVAILABLE") {
         return res.status(409).json({ error: reservationErr.message, code: "LISTING_UNAVAILABLE" });
       }
