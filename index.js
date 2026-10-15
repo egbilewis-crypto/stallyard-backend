@@ -13036,8 +13036,7 @@ async function startServer() {
       // Check hourly; the persisted report date and advisory lock guarantee a
       // single daily send at/after 08:00 Africa/Lagos, even across restarts.
       setInterval(() => sendDailyCasualSellerReport(false), 60 * 60 * 1000).unref();
-      setInterval(() => sendDailyVerifiedSellerReport(false), 60 * 60 * 1000).unref();
-      setInterval(() => sendDailyPremiumSellerReport(false), 60 * 60 * 1000).unref();
+      setInterval(() => sendDailyVerifiedSellerReport(false), 60 * 60 * 1000).unref();Preview delivery tokens cannot release real money
       sendShipReminders();
       sendDailyCasualSellerReport(false);
       sendDailyVerifiedSellerReport(false);
