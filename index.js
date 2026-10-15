@@ -9533,12 +9533,12 @@ app.patch("/order-items/:id/self-delivery", authenticate, async (req, res) => {
   }
 });
 
-async function markItemReceivedAndMaybeRelease(itemId) {
+async function markItemReceivedAndMaybeRelease(itemId, token, sellerId) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     const locked = await client.query(
-      `SELECT oi.*, o.payment_status, o.is_disputed
+      `SELECT oi.*, o.payment_status, o.is_disputed, o.is_preview
        FROM order_items oi JOIN orders o ON o.id = oi.order_id
        WHERE oi.id = $1
        FOR UPDATE OF oi, o`,
@@ -9546,6 +9546,10 @@ async function markItemReceivedAndMaybeRelease(itemId) {
     );
     if (!locked.rows.length) throw new Error("Order item not found");
     const current = locked.rows[0];
+    if (current.is_preview || current.seller_id !== sellerId) throw new Error("This seller cannot release this payment");
+    if (current.fulfillment_status !== "delivered" || !current.proof_of_delivery_url) throw new Error("Delivery and delivery photo are required before release");
+    if (!current.delivery_token_sent_at) throw new Error("The buyer must send the delivery token from their dashboard first");
+    if (!/^\d{10}$/.test(String(token).trim()) || current.delivery_token !== String(token).trim()) throw new Error("The delivery code is no longer valid");
     if (current.payment_status !== "held" || current.is_disputed) {
       throw new Error("Payment is no longer eligible for release");
     }
@@ -9574,7 +9578,8 @@ async function markItemReceivedAndMaybeRelease(itemId) {
     const relevant = allItems.rows.filter((r) => !["cancelled", "returned"].includes(r.fulfillment_status));
     const allConfirmed = relevant.length > 0 && relevant.every(
       (r) => r.proof_of_delivery_url && r.delivery_token_redeemed_at &&
-        !["requested", "approved"].includes(r.return_status)
+        !["requested", "approved"].includes(r.return_status) &&
+        !["requested", "approved"].includes(r.cancellation_status)
     );
     let order = null;
     if (allConfirmed) {
@@ -10003,13 +10008,16 @@ app.post("/order-items/:id/redeem-delivery-token", authenticate, codeRateLimit, 
     if (!item.proof_of_delivery_url) {
       return res.status(400).json({ error: "Upload a delivery picture before entering the buyer's code" });
     }
+    if (!item.delivery_token_sent_at) {
+      return res.status(409).json({ error: "The buyer must use Send token to seller before payment can be released" });
+    }
     if (!item.delivery_token) {
       return res.status(400).json({ error: "No active delivery code exists for this item" });
     }
     if (item.delivery_token !== String(token).trim()) {
       return res.status(400).json({ error: "That code doesn't match — check and try again" });
     }
-    const { item: updatedItem, order } = await markItemReceivedAndMaybeRelease(req.params.id);
+    const { item: updatedItem, order } = await markItemReceivedAndMaybeRelease(req.params.id, token, req.user.id);
     res.json({ item: updatedItem, order });
   } catch (err) {
     sendInternalError(res, err);
