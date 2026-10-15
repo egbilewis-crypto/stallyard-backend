@@ -12841,6 +12841,12 @@ async function sendShipReminders() {
 async function ensurePreviewAccounts() {
   if (String(process.env.PREVIEW_ACCOUNTS_ENABLED || "").toLowerCase() !== "true") return;
 
+  // Change this non-secret key to create a fresh isolated test order. Keep
+  // the same value across restarts to preserve that order's progress.
+  const previewOrderKey = String(process.env.PREVIEW_ORDER_KEY || "default").trim();
+  if (!/^[A-Za-z0-9_-]{1,80}$/.test(previewOrderKey)) {
+    throw new Error("PREVIEW_ORDER_KEY must contain 1–80 letters, numbers, underscores or hyphens");
+  }
   const buyerPassword = String(process.env.PREVIEW_BUYER_PASSWORD || "");
   const sellerPassword = String(process.env.PREVIEW_SELLER_PASSWORD || "");
   if (buyerPassword.length < 12 || sellerPassword.length < 12) {
@@ -12932,8 +12938,8 @@ async function ensurePreviewAccounts() {
     await client.query("UPDATE listings SET status='draft', is_preview=true WHERE id=$1", [listingId]);
 
     let orderResult = await client.query(
-      "SELECT id FROM orders WHERE buyer_id = $1 AND shipping_address->>'previewData' = 'true' LIMIT 1 FOR UPDATE",
-      [buyer.id]
+      "SELECT id FROM orders WHERE buyer_id = $1 AND is_preview=true AND shipping_address->>'previewData' = 'true' AND COALESCE(shipping_address->>'previewOrderKey', 'default') = $2 ORDER BY id DESC LIMIT 1 FOR UPDATE",
+      [buyer.id, previewOrderKey]
     );
     if (!orderResult.rows.length) {
       orderResult = await client.query(
@@ -12944,6 +12950,7 @@ async function ensurePreviewAccounts() {
          RETURNING id`,
         [buyer.id, buyer.username, JSON.stringify({
           previewData: true,
+          previewOrderKey,
           fullName: "Stallyard Preview Buyer",
           phone: "+2348000000000",
           street: "Preview address — not a real delivery location",
@@ -12985,8 +12992,8 @@ async function ensurePreviewAccounts() {
     const threadId = threadResult.rows[0].id;
     await client.query("UPDATE threads SET is_preview=true WHERE id=$1", [threadId]);
     const messageExists = await client.query(
-      "SELECT 1 FROM messages WHERE thread_id = $1 AND body LIKE 'TEST DATA — Welcome to the preview%' LIMIT 1",
-      [threadId]
+      "SELECT 1 FROM messages WHERE thread_id = $1 AND order_id = $2 AND body LIKE 'TEST DATA — Welcome to the preview%' LIMIT 1",
+      [threadId, orderId]
     );
     if (!messageExists.rows.length) {
       await client.query(
@@ -13036,7 +13043,8 @@ async function startServer() {
       // Check hourly; the persisted report date and advisory lock guarantee a
       // single daily send at/after 08:00 Africa/Lagos, even across restarts.
       setInterval(() => sendDailyCasualSellerReport(false), 60 * 60 * 1000).unref();
-      setInterval(() => sendDailyVerifiedSellerReport(false), 60 * 60 * 1000).unref();Preview delivery tokens cannot release real money
+      setInterval(() => sendDailyVerifiedSellerReport(false), 60 * 60 * 1000).unref();
+      setInterval(() => sendDailyPremiumSellerReport(false), 60 * 60 * 1000).unref();
       sendShipReminders();
       sendDailyCasualSellerReport(false);
       sendDailyVerifiedSellerReport(false);
