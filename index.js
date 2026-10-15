@@ -3061,16 +3061,6 @@ const SCHEMA_MIGRATIONS = [
        ADD COLUMN IF NOT EXISTS self_delivery_delivered_at TIMESTAMP`,
     `CREATE INDEX IF NOT EXISTS idx_order_items_self_delivery_status ON order_items(self_delivery_status)`,
   ] },
-  { version: 81, name: "listing-feed-performance", statements: [
-    `CREATE INDEX IF NOT EXISTS idx_listings_public_feed
-       ON listings(status, is_preview, created_at DESC, id DESC)`,
-    `CREATE INDEX IF NOT EXISTS idx_listings_public_category_feed
-       ON listings(category, subcategory, status, created_at DESC, id DESC)`,
-    `CREATE INDEX IF NOT EXISTS idx_listings_public_price
-       ON listings(status, price)`,
-    `CREATE INDEX IF NOT EXISTS idx_listings_owner_created
-       ON listings(owner_id, created_at DESC, id DESC)`,
-  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -3795,7 +3785,7 @@ const USER_PUBLIC_FIELDS = `id, username, display_name, country, account_type, c
   avatar_url, store_bio, store_policies`;
 
 const USER_FULL_FIELDS = `id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, office_location,
-  country, is_admin, is_approved, is_verified, is_suspended, seller_suspended, seller_suspended_reason, account_type, id_type, id_country,
+  country, is_admin, is_approved, is_verified, is_suspended, is_preview, seller_suspended, seller_suspended_reason, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
   bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
   is_email_verified, is_phone_verified, admin_role, profile_complete, onboarding_intent, onboarding_completed_at`;
@@ -3804,12 +3794,13 @@ const USER_FULL_FIELDS = `id, username, email, phone, display_name, first_name, 
 // documents. This intentionally excludes email/phone, ID/license data, document
 // URLs, bank statements, and seller-verification rejection details.
 const USER_ADMIN_SAFE_FIELDS = `id, username, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, office_location,
-  country, is_admin, is_approved, is_verified, is_suspended, account_type, verification_status, created_at,
+  country, is_admin, is_approved, is_verified, is_suspended, is_preview, account_type, verification_status, created_at,
   avatar_url, store_bio, store_policies, two_factor_enabled, is_email_verified, is_phone_verified, admin_role`;
 
 app.get("/users", async (req, res) => {
   try {
     let fields = USER_PUBLIC_FIELDS;
+    let includePreviewAccounts = false;
     const requester = getRequester(req);
 
     // /users remains usable for public storefront/profile discovery, but cookie-
@@ -3851,11 +3842,14 @@ app.get("/users", async (req, res) => {
           const role = current.admin_role || "super_admin";
           const canReviewSellerPrivateData = role === "super_admin" || role === "seller_verification";
           fields = canReviewSellerPrivateData ? USER_FULL_FIELDS : USER_ADMIN_SAFE_FIELDS;
+          includePreviewAccounts = true;
         }
       }
     }
 
-    const result = await pool.query(`SELECT ${fields} FROM users ORDER BY display_name ASC`);
+    const result = await pool.query(
+      `SELECT ${fields} FROM users ${includePreviewAccounts ? "" : "WHERE is_preview = false"} ORDER BY display_name ASC`
+    );
     res.json({ users: result.rows });
   } catch (err) {
     console.error("Users directory error:", err);
@@ -3864,7 +3858,7 @@ app.get("/users", async (req, res) => {
 });
 
 const USER_RETURNING_FIELDS = `id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, office_location,
-  country, is_admin, is_approved, is_verified, is_suspended, seller_suspended, seller_suspended_reason, account_type, id_type, id_country,
+  country, is_admin, is_approved, is_verified, is_suspended, is_preview, seller_suspended, seller_suspended_reason, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
   bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
   is_email_verified, is_phone_verified, token_version, admin_role, casual_seller_status,
@@ -4341,7 +4335,13 @@ app.patch("/users/:id/reject", authenticate, requireSuperAdmin, async (req, res)
 
 app.delete("/users/:id", authenticate, requirePermission("user_management"), async (req, res) => {
   try {
-    const target = await pool.query("SELECT username FROM users WHERE id = $1", [req.params.id]);
+    const target = await pool.query("SELECT username, is_preview FROM users WHERE id = $1", [req.params.id]);
+    if (target.rows[0]?.is_preview) {
+      return res.status(409).json({
+        error: "Preview accounts must be deleted with the protected preview cleanup action.",
+        code: "USE_PREVIEW_DELETE",
+      });
+    }
     const result = await pool.query("DELETE FROM users WHERE id = $1 RETURNING id", [req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
     logAdminAction(req.user.id, "user_deleted", `Deleted member ${target.rows[0]?.username || req.params.id}`);
@@ -4392,6 +4392,170 @@ app.post("/admin/create-member", authenticate, requirePermission("user_managemen
       return res.status(409).json({ error: "Username, email, or phone already in use" });
     }
     sendInternalError(res, err);
+  }
+});
+
+// Preview-account controls are deliberately separate from ordinary member
+// controls. The database predicate is part of every mutation, so a forged or
+// stale frontend request can never verify or erase a real customer account.
+app.patch("/admin/preview-users/:id/phone-verification", authenticate, requirePermission("user_management"), async (req, res) => {
+  try {
+    const isVerified = req.body?.isVerified !== false;
+    const result = await pool.query(
+      `UPDATE users
+          SET is_phone_verified = $1
+        WHERE id = $2 AND is_preview = true AND is_admin = false
+        RETURNING ${USER_RETURNING_FIELDS}`,
+      [isVerified, req.params.id]
+    );
+    if (!result.rows.length) {
+      return res.status(404).json({
+        error: "Preview account not found. Real accounts can only verify by completing the normal phone-code flow.",
+        code: "PREVIEW_ACCOUNT_REQUIRED",
+      });
+    }
+    const user = result.rows[0];
+    logAdminAction(
+      req.user.id,
+      isVerified ? "preview_phone_verified" : "preview_phone_unverified",
+      `${isVerified ? "Verified" : "Unverified"} the test phone for preview account ${user.username}`
+    );
+    res.json({ user });
+  } catch (err) {
+    sendInternalError(res, err);
+  }
+});
+
+app.delete("/admin/preview-users/:id", authenticate, requirePermission("user_management"), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const targetResult = await client.query(
+      `SELECT id, username, is_preview, is_admin
+         FROM users WHERE id = $1 FOR UPDATE`,
+      [req.params.id]
+    );
+    const target = targetResult.rows[0];
+    if (!target || !target.is_preview || target.is_admin) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        error: "Preview account not found. This action cannot delete real or admin accounts.",
+        code: "PREVIEW_ACCOUNT_REQUIRED",
+      });
+    }
+
+    // These records should never exist for a preview identity. Stop rather
+    // than guessing if an old deployment allowed the isolation boundary to be
+    // crossed; an operator can then inspect the data without losing evidence.
+    const unsafeResult = await client.query(
+      `SELECT
+         EXISTS (SELECT 1 FROM listings WHERE owner_id=$1 AND is_preview=false) OR
+         EXISTS (SELECT 1 FROM orders WHERE buyer_id=$1 AND is_preview=false) OR
+         EXISTS (SELECT 1 FROM order_items WHERE seller_id=$1 AND is_preview=false) OR
+         EXISTS (SELECT 1 FROM checkout_intents WHERE buyer_id=$1 AND is_preview=false) OR
+         EXISTS (SELECT 1 FROM payment_attempts WHERE user_id=$1 AND is_preview=false) OR
+         EXISTS (SELECT 1 FROM threads WHERE (buyer_id=$1 OR seller_id=$1) AND is_preview=false) OR
+         EXISTS (SELECT 1 FROM messages WHERE sender_id=$1 AND is_preview=false) OR
+         EXISTS (SELECT 1 FROM seller_payouts WHERE seller_id=$1) OR
+         EXISTS (SELECT 1 FROM withdrawals WHERE seller_id=$1) OR
+         EXISTS (SELECT 1 FROM casual_seller_applications WHERE user_id=$1) OR
+         EXISTS (SELECT 1 FROM verified_seller_applications WHERE user_id=$1) OR
+         EXISTS (SELECT 1 FROM premium_seller_applications WHERE user_id=$1)
+         AS unsafe`,
+      [target.id]
+    );
+    if (unsafeResult.rows[0]?.unsafe) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error: "This preview account has protected or non-preview history. It was not deleted; inspect its records first.",
+        code: "PREVIEW_BOUNDARY_CONFLICT",
+      });
+    }
+
+    await client.query(
+      `DELETE FROM message_reports
+        WHERE is_preview=true AND (
+          reporter_id=$1 OR
+          message_id IN (SELECT id FROM messages WHERE is_preview=true AND sender_id=$1) OR
+          thread_id IN (SELECT id FROM threads WHERE is_preview=true AND (buyer_id=$1 OR seller_id=$1))
+        )`,
+      [target.id]
+    );
+    await client.query(
+      `DELETE FROM messages
+        WHERE is_preview=true AND (
+          sender_id=$1 OR thread_id IN (
+            SELECT id FROM threads WHERE is_preview=true AND (buyer_id=$1 OR seller_id=$1)
+          )
+        )`,
+      [target.id]
+    );
+    await client.query(
+      "DELETE FROM threads WHERE is_preview=true AND (buyer_id=$1 OR seller_id=$1)",
+      [target.id]
+    );
+    await client.query(
+      `DELETE FROM review_reports WHERE is_preview=true AND (
+         reporter_id=$1 OR review_id IN (
+           SELECT id FROM reviews WHERE is_preview=true AND (buyer_id=$1 OR seller_id=$1)
+         )
+       )`,
+      [target.id]
+    );
+    await client.query(
+      "DELETE FROM reviews WHERE is_preview=true AND (buyer_id=$1 OR seller_id=$1)",
+      [target.id]
+    );
+    await client.query(
+      "DELETE FROM seller_reports WHERE is_preview=true AND (reporter_id=$1 OR reported_seller_id=$1)",
+      [target.id]
+    );
+    await client.query("DELETE FROM account_reports WHERE is_preview=true AND user_id=$1", [target.id]);
+    await client.query(
+      `DELETE FROM dispute_cases
+        WHERE is_preview=true AND order_id IN (
+          SELECT DISTINCT o.id
+            FROM orders o
+            LEFT JOIN order_items oi ON oi.order_id=o.id
+           WHERE o.is_preview=true AND (o.buyer_id=$1 OR oi.seller_id=$1)
+        )`,
+      [target.id]
+    );
+    await client.query(
+      `DELETE FROM orders
+        WHERE is_preview=true AND (
+          buyer_id=$1 OR EXISTS (
+            SELECT 1 FROM order_items oi
+             WHERE oi.order_id=orders.id AND oi.seller_id=$1 AND oi.is_preview=true
+          )
+        )`,
+      [target.id]
+    );
+    await client.query("DELETE FROM checkout_intents WHERE buyer_id=$1 AND is_preview=true", [target.id]);
+    await client.query("DELETE FROM payment_attempts WHERE user_id=$1 AND is_preview=true", [target.id]);
+    await client.query(
+      "DELETE FROM cart_items WHERE listing_id IN (SELECT id FROM listings WHERE owner_id=$1 AND is_preview=true)",
+      [target.id]
+    );
+    await client.query(
+      "DELETE FROM watchlist_items WHERE listing_id IN (SELECT id FROM listings WHERE owner_id=$1 AND is_preview=true)",
+      [target.id]
+    );
+    await client.query("DELETE FROM listings WHERE owner_id=$1 AND is_preview=true", [target.id]);
+    await client.query("DELETE FROM support_ticket_messages WHERE sender_id=$1", [target.id]);
+    await client.query("DELETE FROM support_tickets WHERE user_id=$1", [target.id]);
+    await client.query("DELETE FROM admin_notes WHERE entity_type='member' AND entity_id=$1", [target.id]);
+    await client.query("DELETE FROM follows WHERE follower_username=$1 OR followed_username=$1", [target.username]);
+    await client.query("DELETE FROM users WHERE id=$1 AND is_preview=true AND is_admin=false", [target.id]);
+    await client.query("COMMIT");
+
+    logAdminAction(req.user.id, "preview_account_deleted", `Deleted preview account ${target.username} and its isolated test data`);
+    res.json({ success: true });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    sendInternalError(res, err);
+  } finally {
+    client.release();
   }
 });
 
@@ -7329,29 +7493,6 @@ function publicListingRow(row) {
 // A signed-in marketplace user additionally receives their own listings in all
 // statuses so drafts/pending items still appear in My Stall. Moderation-only
 // fields are never exposed for somebody else's listing.
-const LISTING_FEED_PAGE_SIZE = 20;
-const LISTING_FEED_MAX_PAGE_SIZE = 50;
-const LISTING_FEED_CACHE_TTL_MS = 30_000;
-const listingFeedCache = new Map();
-
-function getCachedListingFeed(key) {
-  const cached = listingFeedCache.get(key);
-  if (!cached) return null;
-  if (cached.expiresAt <= Date.now()) {
-    listingFeedCache.delete(key);
-    return null;
-  }
-  return cached.value;
-}
-
-function setCachedListingFeed(key, value) {
-  if (listingFeedCache.size >= 100) {
-    const oldestKey = listingFeedCache.keys().next().value;
-    if (oldestKey) listingFeedCache.delete(oldestKey);
-  }
-  listingFeedCache.set(key, { value, expiresAt: Date.now() + LISTING_FEED_CACHE_TTL_MS });
-}
-
 app.get("/listings", async (req, res) => {
   try {
     let validUserId = null;
@@ -7368,89 +7509,34 @@ app.get("/listings", async (req, res) => {
       }
     }
 
-    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
-    const limit = Math.min(
-      LISTING_FEED_MAX_PAGE_SIZE,
-      Math.max(1, Number.parseInt(req.query.limit, 10) || LISTING_FEED_PAGE_SIZE)
-    );
-    const mineOnly = req.query.mine === "true";
-    if (mineOnly && !validUserId) return res.status(401).json({ error: "Log in to view your listings" });
-
-    const category = String(req.query.category || "").trim();
-    const subcategory = String(req.query.subcategory || "").trim();
-    const condition = String(req.query.condition || "").trim();
-    const search = String(req.query.search || "").trim().slice(0, 120);
-    const minPrice = req.query.minPrice === undefined || req.query.minPrice === "" ? null : Number(req.query.minPrice);
-    const maxPrice = req.query.maxPrice === undefined || req.query.maxPrice === "" ? null : Number(req.query.maxPrice);
-    const sort = ["featured", "newest", "price-asc", "price-desc"].includes(req.query.sort)
-      ? req.query.sort
-      : "featured";
-
-    const cacheKey = !validUserId && !mineOnly ? req.originalUrl : null;
-    if (cacheKey) {
-      const cached = getCachedListingFeed(cacheKey);
-      if (cached) return res.json(cached);
-    }
-
-    const values = [];
-    const where = [];
-    const addValue = (value) => {
-      values.push(value);
-      return `$${values.length}`;
-    };
-
-    if (mineOnly) {
-      where.push(`listings.owner_id = ${addValue(validUserId)}`);
-    } else {
-      where.push(`listings.status = 'active'`);
-      where.push(`((users.is_approved = true AND users.seller_tier IN ('verified', 'premium')) OR users.casual_seller_status = 'approved')`);
-      where.push(`users.is_suspended = false`);
-      where.push(`users.seller_suspended = false`);
-      where.push(`users.is_preview = false`);
-      where.push(`listings.is_preview = false`);
-    }
-    if (category) where.push(`listings.category = ${addValue(category)}`);
-    if (subcategory) where.push(`listings.subcategory = ${addValue(subcategory)}`);
-    if (condition) where.push(`listings.condition = ${addValue(condition)}`);
-    if (search) {
-      const searchValue = addValue(`%${search}%`);
-      where.push(`(listings.title ILIKE ${searchValue} OR listings.description ILIKE ${searchValue})`);
-    }
-    if (Number.isFinite(minPrice)) where.push(`listings.price >= ${addValue(minPrice)}`);
-    if (Number.isFinite(maxPrice)) where.push(`listings.price <= ${addValue(maxPrice)}`);
-
-    const orderBy = {
-      featured: "listings.is_featured DESC, listings.created_at DESC, listings.id DESC",
-      newest: "listings.created_at DESC, listings.id DESC",
-      "price-asc": "listings.price ASC, listings.created_at DESC, listings.id DESC",
-      "price-desc": "listings.price DESC, listings.created_at DESC, listings.id DESC",
-    }[sort];
-    const fetchLimit = addValue(limit + 1);
-    const offset = addValue((page - 1) * limit);
-
     const result = await pool.query(
       `SELECT listings.*, users.display_name AS seller_name, users.username AS owner_username,
               users.is_approved AS seller_is_approved, users.casual_seller_status,
               users.is_suspended AS seller_is_suspended, users.seller_suspended
        FROM listings
        JOIN users ON listings.owner_id = users.id
-       WHERE ${where.join(" AND ")}
-       ORDER BY ${orderBy}
-       LIMIT ${fetchLimit} OFFSET ${offset}`,
-      values
+       WHERE (
+         listings.status = 'active'
+         AND ((users.is_approved = true AND users.seller_tier IN ('verified', 'premium'))
+              OR users.casual_seller_status = 'approved')
+         AND users.is_suspended = false
+         AND users.seller_suspended = false
+         AND users.is_preview = false
+         AND listings.is_preview = false
+       )
+       OR ($1::integer IS NOT NULL AND listings.owner_id = $1)
+       ORDER BY listings.created_at DESC`,
+      [validUserId]
     );
 
-    const hasMore = result.rows.length > limit;
-    const rows = result.rows.slice(0, limit).map((row) => {
+    const rows = result.rows.map((row) => {
       if (validUserId && row.owner_id === validUserId) {
         const { seller_is_approved, casual_seller_status, seller_is_suspended, seller_suspended, ...ownRow } = row;
         return ownRow;
       }
       return publicListingRow(row);
     });
-    const payload = { listings: rows, page, pageSize: limit, hasMore, nextPage: hasMore ? page + 1 : null };
-    if (cacheKey) setCachedListingFeed(cacheKey, payload);
-    res.json(payload);
+    res.json({ listings: rows });
   } catch (err) {
     sendInternalError(res, err);
   }
