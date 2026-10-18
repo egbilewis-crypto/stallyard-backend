@@ -9070,7 +9070,7 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
       liveLocationLongitude,
       liveLocationAccuracy,
     } = req.body;
-    const allowedCarriers = new Set(["", "Self delivery", "DHL", "GIG Logistics", "NIPOST", "UPS", "FedEx", "Other"]);
+    const allowedCarriers = new Set(["", "DHL", "Self delivery", "Local Delivery Driver"]);
     if (carrier !== undefined && (typeof carrier !== "string" || !allowedCarriers.has(carrier))) {
       return res.status(400).json({ error: "Select a valid delivery carrier" });
     }
@@ -12840,3 +12840,4 @@ async function startServer() {
 }
 
 startServer();
+
