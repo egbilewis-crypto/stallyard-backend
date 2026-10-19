@@ -3016,6 +3016,31 @@ const SCHEMA_MIGRATIONS = [
        ADD COLUMN IF NOT EXISTS self_delivery_delivered_at TIMESTAMP`,
     `CREATE INDEX IF NOT EXISTS idx_order_items_self_delivery_status ON order_items(self_delivery_status)`,
   ] },
+  { version: 81, name: "local-delivery-driver-assignments", statements: [
+    `CREATE TABLE IF NOT EXISTS delivery_assignments (
+       id BIGSERIAL PRIMARY KEY,
+       order_item_id INTEGER NOT NULL UNIQUE REFERENCES order_items(id) ON DELETE CASCADE,
+       order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+       seller_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+       driver_name TEXT NOT NULL,
+       driver_phone_encrypted TEXT NOT NULL,
+       delivery_fee NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (delivery_fee >= 0),
+       payment_method TEXT NOT NULL DEFAULT 'cash' CHECK (payment_method IN ('cash','bank_transfer')),
+       pickup_at TIMESTAMP,
+       delivery_due_at TIMESTAMP,
+       package_description TEXT NOT NULL DEFAULT '',
+       status TEXT NOT NULL DEFAULT 'assigned',
+       access_token_hash TEXT UNIQUE,
+       activation_code_hash TEXT,
+       access_expires_at TIMESTAMP NOT NULL,
+       revoked_at TIMESTAMP,
+       is_preview BOOLEAN NOT NULL DEFAULT FALSE,
+       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_delivery_assignments_seller ON delivery_assignments(seller_id, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_delivery_assignments_status ON delivery_assignments(status, access_expires_at)`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -9183,9 +9208,17 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
     if (sets.length === 0) return res.status(400).json({ error: "No valid fields to update" });
     values.push(req.params.id);
     const result = await pool.query(
-      `UPDATE order_items SET ${sets.join(", ")} WHERE id = $${i} RETURNING *`,
+      `UPDATE order_items SET ${sets.join(", ")} WHERE id = ${i} RETURNING *`,
       values
     );
+    if (typeof carrier === "string" && carrier !== "Local Delivery Driver") {
+      await pool.query(
+        `UPDATE delivery_assignments
+         SET status='revoked',access_token_hash=NULL,activation_code_hash=NULL,revoked_at=NOW(),updated_at=NOW()
+         WHERE order_item_id=$1 AND status='assigned'`,
+        [req.params.id]
+      );
+    }
     if (!isOwnSellerItem) {
       logAdminAction(req.user.id, "order_item_fulfillment_updated", `Updated fulfillment details for order item #${req.params.id}`);
     }
@@ -9193,6 +9226,214 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
   } catch (err) {
     if (err.statusCode === 400) return res.status(400).json({ error: err.message });
     sendInternalError(res, err);
+  }
+});
+
+function sellerDeliveryAssignmentPayload(row) {
+  if (!row) return null;
+  let driverPhone = "";
+  try {
+    driverPhone = decryptFieldSafe(row.driver_phone_encrypted) || "";
+  } catch {
+    driverPhone = "";
+  }
+  return {
+    id: row.id,
+    orderItemId: row.order_item_id,
+    orderId: row.order_id,
+    driverName: row.driver_name,
+    driverPhone,
+    deliveryFee: Number(row.delivery_fee || 0),
+    paymentMethod: row.payment_method,
+    pickupAt: row.pickup_at,
+    deliveryDueAt: row.delivery_due_at,
+    packageDescription: row.package_description || "",
+    status: row.status,
+    accessExpiresAt: row.access_expires_at,
+    revokedAt: row.revoked_at,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function deliveryAssignmentExpiry(deliveryDueAt) {
+  const now = Date.now();
+  const due = deliveryDueAt ? Date.parse(deliveryDueAt) : NaN;
+  const requested = Number.isFinite(due) ? due + (48 * 60 * 60 * 1000) : now + (7 * 24 * 60 * 60 * 1000);
+  return new Date(Math.min(Math.max(requested, now + (24 * 60 * 60 * 1000)), now + (30 * 24 * 60 * 60 * 1000)));
+}
+
+function newDeliveryAccessCredentials() {
+  const accessToken = crypto.randomBytes(32).toString("base64url");
+  const accessTokenHash = crypto.createHash("sha256").update(accessToken).digest("hex");
+  const activationCode = String(crypto.randomInt(100000, 1000000));
+  return { accessToken, accessTokenHash, activationCode };
+}
+
+app.get("/delivery-assignments/mine", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM delivery_assignments WHERE seller_id=$1 ORDER BY created_at DESC`,
+      [req.user.id]
+    );
+    res.json({ assignments: result.rows.map(sellerDeliveryAssignmentPayload) });
+  } catch (err) {
+    sendInternalError(res, err, "load seller delivery assignments");
+  }
+});
+
+app.post("/order-items/:id/delivery-assignment", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  try {
+    const itemResult = await pool.query(
+      `SELECT oi.*, o.payment_status
+       FROM order_items oi
+       JOIN orders o ON o.id=oi.order_id
+       WHERE oi.id=$1`,
+      [req.params.id]
+    );
+    if (!itemResult.rows.length) return res.status(404).json({ error: "Order item not found" });
+    const item = itemResult.rows[0];
+    if (Number(item.seller_id) !== Number(req.user.id)) {
+      return res.status(403).json({ error: "Only the seller can assign a delivery driver" });
+    }
+    if (item.carrier !== "Local Delivery Driver") {
+      return res.status(409).json({ error: "Select Local Delivery Driver before creating an assignment" });
+    }
+    if (["delivered", "cancelled", "returned"].includes(item.fulfillment_status) || item.payment_status === "refunded") {
+      return res.status(409).json({ error: "A driver cannot be assigned to a closed order item" });
+    }
+
+    const driverName = String(req.body?.driverName || "").trim();
+    const driverPhone = normalizeNigerianPhone(req.body?.driverPhone);
+    const deliveryFee = Number(req.body?.deliveryFee);
+    const paymentMethod = String(req.body?.paymentMethod || "cash");
+    const packageDescription = String(req.body?.packageDescription || item.title || "").trim();
+    const pickupAt = req.body?.pickupAt ? new Date(req.body.pickupAt) : null;
+    const deliveryDueAt = req.body?.deliveryDueAt ? new Date(req.body.deliveryDueAt) : null;
+
+    if (driverName.length < 2 || driverName.length > 100) {
+      return res.status(400).json({ error: "Enter the driver's full name" });
+    }
+    if (!driverPhone) {
+      return res.status(400).json({ error: "Enter a valid Nigerian driver phone number" });
+    }
+    if (!Number.isFinite(deliveryFee) || deliveryFee <= 0 || deliveryFee > 10000000) {
+      return res.status(400).json({ error: "Enter a valid delivery fee greater than ₦0" });
+    }
+    if (!new Set(["cash", "bank_transfer"]).has(paymentMethod)) {
+      return res.status(400).json({ error: "Select cash or bank transfer for the driver" });
+    }
+    if (packageDescription.length > 500) {
+      return res.status(400).json({ error: "Package description must be 500 characters or fewer" });
+    }
+    if ((pickupAt && Number.isNaN(pickupAt.getTime())) || (deliveryDueAt && Number.isNaN(deliveryDueAt.getTime()))) {
+      return res.status(400).json({ error: "Enter valid pickup and delivery dates" });
+    }
+    if (pickupAt && deliveryDueAt && deliveryDueAt <= pickupAt) {
+      return res.status(400).json({ error: "Delivery time must be later than pickup time" });
+    }
+
+    const { accessToken, accessTokenHash, activationCode } = newDeliveryAccessCredentials();
+    const activationCodeHash = await bcrypt.hash(activationCode, 10);
+    const accessExpiresAt = deliveryAssignmentExpiry(deliveryDueAt?.toISOString());
+    const assignment = await pool.query(
+      `INSERT INTO delivery_assignments (
+         order_item_id,order_id,seller_id,driver_name,driver_phone_encrypted,delivery_fee,
+         payment_method,pickup_at,delivery_due_at,package_description,status,
+         access_token_hash,activation_code_hash,access_expires_at,revoked_at,is_preview,updated_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'assigned',$11,$12,$13,NULL,$14,NOW())
+       ON CONFLICT (order_item_id) DO UPDATE SET
+         driver_name=EXCLUDED.driver_name,
+         driver_phone_encrypted=EXCLUDED.driver_phone_encrypted,
+         delivery_fee=EXCLUDED.delivery_fee,
+         payment_method=EXCLUDED.payment_method,
+         pickup_at=EXCLUDED.pickup_at,
+         delivery_due_at=EXCLUDED.delivery_due_at,
+         package_description=EXCLUDED.package_description,
+         status='assigned',
+         access_token_hash=EXCLUDED.access_token_hash,
+         activation_code_hash=EXCLUDED.activation_code_hash,
+         access_expires_at=EXCLUDED.access_expires_at,
+         revoked_at=NULL,
+         updated_at=NOW()
+       RETURNING *`,
+      [
+        item.id,
+        item.order_id,
+        req.user.id,
+        driverName,
+        encryptField(driverPhone),
+        deliveryFee.toFixed(2),
+        paymentMethod,
+        pickupAt,
+        deliveryDueAt,
+        packageDescription,
+        accessTokenHash,
+        activationCodeHash,
+        accessExpiresAt,
+        !!item.is_preview,
+      ]
+    );
+
+    await pool.query(
+      `INSERT INTO order_item_status_events(order_item_id,event_type,label,details)
+       VALUES ($1,'local_driver_assigned','Local Delivery Driver assigned',$2)`,
+      [item.id, JSON.stringify({ driverName, deliveryFee, paymentMethod, accessExpiresAt })]
+    );
+    res.status(201).json({
+      assignment: sellerDeliveryAssignmentPayload(assignment.rows[0]),
+      accessPath: `/driver/delivery/${accessToken}`,
+      activationCode,
+    });
+  } catch (err) {
+    sendInternalError(res, err, "create local delivery assignment");
+  }
+});
+
+app.post("/delivery-assignments/:id/regenerate-access", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  try {
+    const current = await pool.query(
+      `SELECT * FROM delivery_assignments WHERE id=$1 AND seller_id=$2`,
+      [req.params.id, req.user.id]
+    );
+    if (!current.rows.length) return res.status(404).json({ error: "Driver assignment not found" });
+    if (!["assigned", "revoked"].includes(current.rows[0].status)) {
+      return res.status(409).json({ error: "Access cannot be regenerated after the driver starts delivery" });
+    }
+    const { accessToken, accessTokenHash, activationCode } = newDeliveryAccessCredentials();
+    const activationCodeHash = await bcrypt.hash(activationCode, 10);
+    const accessExpiresAt = deliveryAssignmentExpiry(current.rows[0].delivery_due_at);
+    const result = await pool.query(
+      `UPDATE delivery_assignments SET status='assigned',access_token_hash=$1,activation_code_hash=$2,
+       access_expires_at=$3,revoked_at=NULL,updated_at=NOW()
+       WHERE id=$4 AND seller_id=$5 RETURNING *`,
+      [accessTokenHash, activationCodeHash, accessExpiresAt, req.params.id, req.user.id]
+    );
+    res.json({
+      assignment: sellerDeliveryAssignmentPayload(result.rows[0]),
+      accessPath: `/driver/delivery/${accessToken}`,
+      activationCode,
+    });
+  } catch (err) {
+    sendInternalError(res, err, "regenerate local delivery access");
+  }
+});
+
+app.post("/delivery-assignments/:id/revoke", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE delivery_assignments
+       SET status='revoked',access_token_hash=NULL,activation_code_hash=NULL,revoked_at=NOW(),updated_at=NOW()
+       WHERE id=$1 AND seller_id=$2 AND status IN ('assigned','revoked')
+       RETURNING *`,
+      [req.params.id, req.user.id]
+    );
+    if (!result.rows.length) {
+      return res.status(404).json({ error: "Assignment not found or it can no longer be revoked" });
+    }
+    res.json({ assignment: sellerDeliveryAssignmentPayload(result.rows[0]) });
+  } catch (err) {
+    sendInternalError(res, err, "revoke local delivery access");
   }
 });
 
@@ -12840,4 +13081,5 @@ async function startServer() {
 }
 
 startServer();
+
 
