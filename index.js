@@ -9208,7 +9208,7 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
     if (sets.length === 0) return res.status(400).json({ error: "No valid fields to update" });
     values.push(req.params.id);
     const result = await pool.query(
-      `UPDATE order_items SET ${sets.join(", ")} WHERE id = ${i} RETURNING *`,
+      `UPDATE order_items SET ${sets.join(", ")} WHERE id = $${i} RETURNING *`,
       values
     );
     if (typeof carrier === "string" && carrier !== "Local Delivery Driver") {
