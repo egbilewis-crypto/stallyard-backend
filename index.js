@@ -9313,6 +9313,161 @@ function newDeliveryAccessCredentials() {
   return { accessToken, accessTokenHash, activationCode };
 }
 
+const driverActivationRateLimit = rateLimit({
+  scope: "driver-delivery-activation",
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  message: "Too many activation attempts — wait 15 minutes and try again.",
+});
+
+function deliveryAccessHash(accessToken) {
+  return crypto.createHash("sha256").update(String(accessToken || "")).digest("hex");
+}
+
+function publicDriverAssignmentPayload(row) {
+  let deliveryAddress = row.shipping_address || {};
+  if (typeof deliveryAddress === "string") {
+    try {
+      deliveryAddress = JSON.parse(deliveryAddress);
+    } catch {
+      deliveryAddress = {};
+    }
+  }
+  return {
+    id: row.id,
+    orderItemId: row.order_item_id,
+    orderId: row.order_id,
+    orderNumber: `STY-${String(row.order_id).padStart(6, "0")}`,
+    driverName: row.driver_name,
+    deliveryFee: Number(row.delivery_fee || 0),
+    paymentMethod: row.payment_method,
+    pickupAt: row.pickup_at,
+    deliveryDueAt: row.delivery_due_at,
+    packageDescription: row.package_description || "",
+    itemTitle: row.item_title || "",
+    status: row.status,
+    fulfillmentStatus: row.fulfillment_status,
+    accessExpiresAt: row.access_expires_at,
+    deliveryAddress,
+  };
+}
+
+async function findDriverAssignmentByAccessToken(accessToken) {
+  if (!/^[A-Za-z0-9_-]{30,120}$/.test(String(accessToken || ""))) return null;
+  const result = await pool.query(
+    `SELECT da.*, oi.title AS item_title, oi.fulfillment_status, oi.carrier,
+            o.shipping_address, o.payment_status
+     FROM delivery_assignments da
+     JOIN order_items oi ON oi.id=da.order_item_id
+     JOIN orders o ON o.id=da.order_id
+     WHERE da.access_token_hash=$1
+     LIMIT 1`,
+    [deliveryAccessHash(accessToken)]
+  );
+  return result.rows[0] || null;
+}
+
+function driverSessionFromRequest(req) {
+  const authorization = String(req.headers.authorization || "");
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  if (!match || !JWT_SECRET) return null;
+  try {
+    const decoded = jwt.verify(match[1], JWT_SECRET);
+    return decoded?.scope === "delivery_driver" ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+function driverAssignmentUnavailable(row) {
+  if (!row) return { status: 404, error: "This delivery link is invalid. Ask the seller for a new link." };
+  if (row.status === "revoked" || row.revoked_at) return { status: 410, error: "The seller revoked this delivery link." };
+  if (new Date(row.access_expires_at).getTime() <= Date.now()) return { status: 410, error: "This delivery link has expired. Ask the seller for a new link." };
+  if (["cancelled", "returned"].includes(row.fulfillment_status) || row.payment_status === "refunded") {
+    return { status: 410, error: "This delivery is no longer active." };
+  }
+  return null;
+}
+
+app.post("/driver-deliveries/:accessToken/activate", driverActivationRateLimit, async (req, res) => {
+  try {
+    const assignment = await findDriverAssignmentByAccessToken(req.params.accessToken);
+    const unavailable = driverAssignmentUnavailable(assignment);
+    if (unavailable) return res.status(unavailable.status).json({ error: unavailable.error });
+
+    const activationCode = String(req.body?.activationCode || "").replace(/\D/g, "");
+    if (!/^\d{6}$/.test(activationCode)) {
+      return res.status(400).json({ error: "Enter the six-digit activation code sent by the seller." });
+    }
+    if (!assignment.activation_code_hash) {
+      return res.status(409).json({ error: "This activation code was already used. Reopen the original browser tab or ask the seller for a new link and code." });
+    }
+    const codeMatches = await bcrypt.compare(activationCode, assignment.activation_code_hash);
+    if (!codeMatches) return res.status(401).json({ error: "That activation code does not match." });
+
+    const consumed = await pool.query(
+      `UPDATE delivery_assignments
+       SET activation_code_hash=NULL, updated_at=NOW()
+       WHERE id=$1 AND activation_code_hash=$2 AND status <> 'revoked'
+       RETURNING id`,
+      [assignment.id, assignment.activation_code_hash]
+    );
+    if (!consumed.rows.length) {
+      return res.status(409).json({ error: "This activation code was already used. Ask the seller for a new link and code." });
+    }
+
+    const expiresInSeconds = Math.max(
+      60,
+      Math.floor((new Date(assignment.access_expires_at).getTime() - Date.now()) / 1000)
+    );
+    const sessionToken = jwt.sign(
+      {
+        scope: "delivery_driver",
+        deliveryAssignmentId: Number(assignment.id),
+        driverAccessHash: deliveryAccessHash(req.params.accessToken),
+      },
+      JWT_SECRET,
+      { expiresIn: expiresInSeconds }
+    );
+
+    try {
+      await pool.query(
+        `INSERT INTO order_item_status_events(order_item_id,event_type,label,details)
+         VALUES ($1,'local_driver_access_activated','Local driver opened delivery access',$2)`,
+        [assignment.order_item_id, JSON.stringify({ assignmentId: assignment.id })]
+      );
+    } catch (historyError) {
+      console.error("Driver access activated, but its status event could not be recorded:", historyError?.message || historyError);
+    }
+
+    res.json({ sessionToken, assignment: publicDriverAssignmentPayload(assignment) });
+  } catch (err) {
+    sendInternalError(res, err, "activate local driver delivery access");
+  }
+});
+
+app.get("/driver-deliveries/:accessToken", async (req, res) => {
+  try {
+    const session = driverSessionFromRequest(req);
+    if (!session) return res.status(401).json({ error: "Driver access has expired. Ask the seller for a new link and code." });
+
+    const accessHash = deliveryAccessHash(req.params.accessToken);
+    if (session.driverAccessHash !== accessHash) {
+      return res.status(403).json({ error: "This driver session does not belong to this delivery link." });
+    }
+    const assignment = await findDriverAssignmentByAccessToken(req.params.accessToken);
+    const unavailable = driverAssignmentUnavailable(assignment);
+    if (unavailable) return res.status(unavailable.status).json({ error: unavailable.error });
+    if (Number(session.deliveryAssignmentId) !== Number(assignment.id)) {
+      return res.status(403).json({ error: "This driver session does not belong to this delivery." });
+    }
+
+    res.json({ assignment: publicDriverAssignmentPayload(assignment) });
+  } catch (err) {
+    sendInternalError(res, err, "load local driver delivery access");
+  }
+});
+
 app.get("/delivery-assignments/mine", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     const result = await pool.query(
