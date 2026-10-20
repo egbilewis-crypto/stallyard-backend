@@ -3041,6 +3041,49 @@ const SCHEMA_MIGRATIONS = [
     `CREATE INDEX IF NOT EXISTS idx_delivery_assignments_seller ON delivery_assignments(seller_id, created_at DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_delivery_assignments_status ON delivery_assignments(status, access_expires_at)`,
   ] },
+  { version: 82, name: "repair-local-delivery-driver-schema", statements: [
+    `CREATE TABLE IF NOT EXISTS delivery_assignments (
+       id BIGSERIAL PRIMARY KEY,
+       order_item_id INTEGER NOT NULL UNIQUE REFERENCES order_items(id) ON DELETE CASCADE,
+       order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+       seller_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+       driver_name TEXT NOT NULL,
+       driver_phone_encrypted TEXT NOT NULL,
+       delivery_fee NUMERIC(12,2) NOT NULL DEFAULT 0,
+       payment_method TEXT NOT NULL DEFAULT 'cash',
+       pickup_at TIMESTAMP,
+       delivery_due_at TIMESTAMP,
+       package_description TEXT NOT NULL DEFAULT '',
+       status TEXT NOT NULL DEFAULT 'assigned',
+       access_token_hash TEXT,
+       activation_code_hash TEXT,
+       access_expires_at TIMESTAMP NOT NULL,
+       revoked_at TIMESTAMP,
+       is_preview BOOLEAN NOT NULL DEFAULT FALSE,
+       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+     )`,
+    `ALTER TABLE delivery_assignments
+       ADD COLUMN IF NOT EXISTS driver_name TEXT,
+       ADD COLUMN IF NOT EXISTS driver_phone_encrypted TEXT,
+       ADD COLUMN IF NOT EXISTS delivery_fee NUMERIC(12,2) DEFAULT 0,
+       ADD COLUMN IF NOT EXISTS payment_method TEXT DEFAULT 'cash',
+       ADD COLUMN IF NOT EXISTS pickup_at TIMESTAMP,
+       ADD COLUMN IF NOT EXISTS delivery_due_at TIMESTAMP,
+       ADD COLUMN IF NOT EXISTS package_description TEXT DEFAULT '',
+       ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'assigned',
+       ADD COLUMN IF NOT EXISTS access_token_hash TEXT,
+       ADD COLUMN IF NOT EXISTS activation_code_hash TEXT,
+       ADD COLUMN IF NOT EXISTS access_expires_at TIMESTAMP,
+       ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMP,
+       ADD COLUMN IF NOT EXISTS is_preview BOOLEAN DEFAULT FALSE,
+       ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW(),
+       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_assignments_order_item_unique ON delivery_assignments(order_item_id)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_assignments_access_token_unique ON delivery_assignments(access_token_hash) WHERE access_token_hash IS NOT NULL`,
+    `CREATE INDEX IF NOT EXISTS idx_delivery_assignments_seller ON delivery_assignments(seller_id, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_delivery_assignments_status ON delivery_assignments(status, access_expires_at)`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -9375,11 +9418,18 @@ app.post("/order-items/:id/delivery-assignment", authenticate, rejectAdminMarket
       ]
     );
 
-    await pool.query(
-      `INSERT INTO order_item_status_events(order_item_id,event_type,label,details)
-       VALUES ($1,'local_driver_assigned','Local Delivery Driver assigned',$2)`,
-      [item.id, JSON.stringify({ driverName, deliveryFee, paymentMethod, accessExpiresAt })]
-    );
+    // A status-history write must never prevent the seller from receiving the
+    // one-time driver link and activation code after the assignment itself was
+    // saved successfully.
+    try {
+      await pool.query(
+        `INSERT INTO order_item_status_events(order_item_id,event_type,label,details)
+         VALUES ($1,'local_driver_assigned','Local Delivery Driver assigned',$2)`,
+        [item.id, JSON.stringify({ driverName, deliveryFee, paymentMethod, accessExpiresAt })]
+      );
+    } catch (historyError) {
+      console.error("Local driver assignment saved, but its status event could not be recorded:", historyError?.message || historyError);
+    }
     res.status(201).json({
       assignment: sellerDeliveryAssignmentPayload(assignment.rows[0]),
       accessPath: `/driver/delivery/${accessToken}`,
