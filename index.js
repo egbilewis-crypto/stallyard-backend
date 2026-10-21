@@ -3092,6 +3092,33 @@ const SCHEMA_MIGRATIONS = [
        ADD COLUMN IF NOT EXISTS arrived_at TIMESTAMP,
        ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMP`,
   ] },
+  { version: 84, name: "local-driver-payment-and-reports", statements: [
+    `ALTER TABLE delivery_assignments
+       ADD COLUMN IF NOT EXISTS driver_bank_name_encrypted TEXT,
+       ADD COLUMN IF NOT EXISTS driver_account_name_encrypted TEXT,
+       ADD COLUMN IF NOT EXISTS driver_account_number_encrypted TEXT,
+       ADD COLUMN IF NOT EXISTS payment_status TEXT NOT NULL DEFAULT 'pending',
+       ADD COLUMN IF NOT EXISTS seller_marked_paid_at TIMESTAMP,
+       ADD COLUMN IF NOT EXISTS seller_payment_reference TEXT,
+       ADD COLUMN IF NOT EXISTS driver_confirmed_paid_at TIMESTAMP`,
+    `CREATE TABLE IF NOT EXISTS local_delivery_reports (
+       id BIGSERIAL PRIMARY KEY,
+       delivery_assignment_id BIGINT NOT NULL REFERENCES delivery_assignments(id) ON DELETE CASCADE,
+       order_item_id INTEGER NOT NULL REFERENCES order_items(id) ON DELETE CASCADE,
+       order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+       seller_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+       category TEXT NOT NULL,
+       details TEXT NOT NULL DEFAULT '',
+       status TEXT NOT NULL DEFAULT 'open',
+       is_preview BOOLEAN NOT NULL DEFAULT FALSE,
+       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_local_delivery_reports_status
+       ON local_delivery_reports(status, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_local_delivery_reports_seller
+       ON local_delivery_reports(seller_id, created_at DESC)`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -9288,6 +9315,18 @@ function sellerDeliveryAssignmentPayload(row) {
   } catch {
     driverPhone = "";
   }
+  let driverBankName = "";
+  let driverAccountName = "";
+  let driverAccountNumber = "";
+  try {
+    driverBankName = decryptFieldSafe(row.driver_bank_name_encrypted) || "";
+    driverAccountName = decryptFieldSafe(row.driver_account_name_encrypted) || "";
+    driverAccountNumber = decryptFieldSafe(row.driver_account_number_encrypted) || "";
+  } catch {
+    driverBankName = "";
+    driverAccountName = "";
+    driverAccountNumber = "";
+  }
   return {
     id: row.id,
     orderItemId: row.order_item_id,
@@ -9296,6 +9335,15 @@ function sellerDeliveryAssignmentPayload(row) {
     driverPhone,
     deliveryFee: Number(row.delivery_fee || 0),
     paymentMethod: row.payment_method,
+    paymentStatus: row.payment_status || "pending",
+    sellerMarkedPaidAt: row.seller_marked_paid_at,
+    sellerPaymentReference: row.seller_payment_reference || "",
+    driverConfirmedPaidAt: row.driver_confirmed_paid_at,
+    driverBankName,
+    driverAccountName,
+    driverAccountNumber,
+    hasDriverBankDetails: Boolean(driverBankName && driverAccountName && driverAccountNumber),
+    openReportCount: Number(row.open_report_count || 0),
     pickupAt: row.pickup_at,
     deliveryDueAt: row.delivery_due_at,
     packageDescription: row.package_description || "",
@@ -9349,6 +9397,15 @@ function publicDriverAssignmentPayload(row) {
     driverName: row.driver_name,
     deliveryFee: Number(row.delivery_fee || 0),
     paymentMethod: row.payment_method,
+    paymentStatus: row.payment_status || "pending",
+    sellerMarkedPaidAt: row.seller_marked_paid_at,
+    sellerPaymentReference: row.seller_payment_reference || "",
+    driverConfirmedPaidAt: row.driver_confirmed_paid_at,
+    hasDriverBankDetails: Boolean(
+      row.driver_bank_name_encrypted &&
+      row.driver_account_name_encrypted &&
+      row.driver_account_number_encrypted
+    ),
     pickupAt: row.pickup_at,
     deliveryDueAt: row.delivery_due_at,
     packageDescription: row.package_description || "",
@@ -9371,7 +9428,7 @@ async function findDriverAssignmentByAccessToken(accessToken) {
   const result = await pool.query(
     `SELECT da.*, oi.title AS item_title, oi.fulfillment_status, oi.carrier,
             oi.proof_of_delivery_url,
-            o.shipping_address, o.payment_status
+            o.shipping_address, o.payment_status AS order_payment_status
      FROM delivery_assignments da
      JOIN order_items oi ON oi.id=da.order_item_id
      JOIN orders o ON o.id=da.order_id
@@ -9398,7 +9455,7 @@ function driverAssignmentUnavailable(row) {
   if (!row) return { status: 404, error: "This delivery link is invalid. Ask the seller for a new link." };
   if (row.status === "revoked" || row.revoked_at) return { status: 410, error: "The seller revoked this delivery link." };
   if (new Date(row.access_expires_at).getTime() <= Date.now()) return { status: 410, error: "This delivery link has expired. Ask the seller for a new link." };
-  if (["cancelled", "returned"].includes(row.fulfillment_status) || row.payment_status === "refunded") {
+  if (["cancelled", "returned"].includes(row.fulfillment_status) || row.order_payment_status === "refunded") {
     return { status: 410, error: "This delivery is no longer active." };
   }
   return null;
@@ -9520,7 +9577,7 @@ app.patch("/driver-deliveries/:accessToken/status", async (req, res) => {
     await client.query("BEGIN");
     const locked = await client.query(
       `SELECT da.*, oi.title AS item_title, oi.fulfillment_status, oi.carrier,
-              oi.proof_of_delivery_url, o.shipping_address, o.payment_status
+              oi.proof_of_delivery_url, o.shipping_address, o.payment_status AS order_payment_status
        FROM delivery_assignments da
        JOIN order_items oi ON oi.id=da.order_item_id
        JOIN orders o ON o.id=da.order_id
@@ -9622,7 +9679,7 @@ app.patch("/driver-deliveries/:accessToken/status", async (req, res) => {
 
     const refreshed = await client.query(
       `SELECT da.*, oi.title AS item_title, oi.fulfillment_status, oi.carrier,
-              oi.proof_of_delivery_url, o.shipping_address, o.payment_status
+              oi.proof_of_delivery_url, o.shipping_address, o.payment_status AS order_payment_status
        FROM delivery_assignments da
        JOIN order_items oi ON oi.id=da.order_item_id
        JOIN orders o ON o.id=da.order_id
@@ -9639,15 +9696,211 @@ app.patch("/driver-deliveries/:accessToken/status", async (req, res) => {
   }
 });
 
+app.patch("/driver-deliveries/:accessToken/payment-details", async (req, res) => {
+  try {
+    const session = driverSessionFromRequest(req);
+    if (!session) return res.status(401).json({ error: "Driver access has expired. Ask the seller for a new link and code." });
+    const accessHash = deliveryAccessHash(req.params.accessToken);
+    if (session.driverAccessHash !== accessHash) {
+      return res.status(403).json({ error: "This driver session does not belong to this delivery link." });
+    }
+    const assignment = await findDriverAssignmentByAccessToken(req.params.accessToken);
+    const unavailable = driverAssignmentUnavailable(assignment);
+    if (unavailable) return res.status(unavailable.status).json({ error: unavailable.error });
+    if (Number(session.deliveryAssignmentId) !== Number(assignment.id)) {
+      return res.status(403).json({ error: "This driver session does not belong to this delivery." });
+    }
+    if (assignment.payment_method !== "bank_transfer") {
+      return res.status(409).json({ error: "Bank details are only needed when the agreed payment method is bank transfer." });
+    }
+    if (assignment.seller_marked_paid_at) {
+      return res.status(409).json({ error: "Bank details cannot be changed after the seller marks the driver fee paid." });
+    }
+
+    const bankName = String(req.body?.bankName || "").trim();
+    const accountName = String(req.body?.accountName || "").trim();
+    const accountNumber = String(req.body?.accountNumber || "").replace(/\D/g, "");
+    if (bankName.length < 2 || bankName.length > 100) return res.status(400).json({ error: "Enter the bank name." });
+    if (accountName.length < 2 || accountName.length > 120) return res.status(400).json({ error: "Enter the name on the bank account." });
+    if (!/^\d{10}$/.test(accountNumber)) return res.status(400).json({ error: "Enter a valid 10-digit Nigerian bank account number." });
+
+    const result = await pool.query(
+      `UPDATE delivery_assignments
+       SET driver_bank_name_encrypted=$1,driver_account_name_encrypted=$2,
+           driver_account_number_encrypted=$3,updated_at=NOW()
+       WHERE id=$4 RETURNING *`,
+      [encryptField(bankName), encryptField(accountName), encryptField(accountNumber), assignment.id]
+    );
+    await pool.query(
+      `INSERT INTO order_item_status_events(order_item_id,event_type,label,details)
+       VALUES ($1,'local_driver_payment_details','Local driver added bank-transfer details',$2)`,
+      [assignment.order_item_id, JSON.stringify({ assignmentId: assignment.id })]
+    ).catch(() => {});
+    res.json({ assignment: publicDriverAssignmentPayload({ ...assignment, ...result.rows[0] }) });
+  } catch (err) {
+    sendInternalError(res, err, "save local driver bank details");
+  }
+});
+
+app.post("/driver-deliveries/:accessToken/confirm-payment", async (req, res) => {
+  try {
+    const session = driverSessionFromRequest(req);
+    if (!session) return res.status(401).json({ error: "Driver access has expired. Ask the seller for a new link and code." });
+    const accessHash = deliveryAccessHash(req.params.accessToken);
+    if (session.driverAccessHash !== accessHash) {
+      return res.status(403).json({ error: "This driver session does not belong to this delivery link." });
+    }
+    const assignment = await findDriverAssignmentByAccessToken(req.params.accessToken);
+    const unavailable = driverAssignmentUnavailable(assignment);
+    if (unavailable) return res.status(unavailable.status).json({ error: unavailable.error });
+    if (Number(session.deliveryAssignmentId) !== Number(assignment.id)) {
+      return res.status(403).json({ error: "This driver session does not belong to this delivery." });
+    }
+    if (assignment.status !== "delivered") {
+      return res.status(409).json({ error: "Complete the delivery before confirming the driver fee." });
+    }
+    if (!assignment.seller_marked_paid_at) {
+      return res.status(409).json({ error: "The seller has not marked the driver fee as paid yet." });
+    }
+    const result = await pool.query(
+      `UPDATE delivery_assignments
+       SET payment_status='confirmed',driver_confirmed_paid_at=COALESCE(driver_confirmed_paid_at,NOW()),updated_at=NOW()
+       WHERE id=$1 RETURNING *`,
+      [assignment.id]
+    );
+    await pool.query(
+      `INSERT INTO order_item_status_events(order_item_id,event_type,label,details)
+       VALUES ($1,'local_driver_payment_confirmed','Local driver confirmed delivery-fee payment',$2)`,
+      [assignment.order_item_id, JSON.stringify({ assignmentId: assignment.id })]
+    ).catch(() => {});
+    res.json({ assignment: publicDriverAssignmentPayload({ ...assignment, ...result.rows[0] }) });
+  } catch (err) {
+    sendInternalError(res, err, "confirm local driver payment");
+  }
+});
+
+const LOCAL_DRIVER_REPORT_CATEGORIES = new Set([
+  "non_payment",
+  "unsafe_request",
+  "harassment",
+  "incorrect_package",
+  "other",
+]);
+
+app.post("/driver-deliveries/:accessToken/report-seller", async (req, res) => {
+  try {
+    const session = driverSessionFromRequest(req);
+    if (!session) return res.status(401).json({ error: "Driver access has expired. Ask the seller for a new link and code." });
+    const accessHash = deliveryAccessHash(req.params.accessToken);
+    if (session.driverAccessHash !== accessHash) {
+      return res.status(403).json({ error: "This driver session does not belong to this delivery link." });
+    }
+    const assignment = await findDriverAssignmentByAccessToken(req.params.accessToken);
+    const unavailable = driverAssignmentUnavailable(assignment);
+    if (unavailable) return res.status(unavailable.status).json({ error: unavailable.error });
+    if (Number(session.deliveryAssignmentId) !== Number(assignment.id)) {
+      return res.status(403).json({ error: "This driver session does not belong to this delivery." });
+    }
+    const category = String(req.body?.category || "").trim();
+    const details = String(req.body?.details || "").trim();
+    if (!LOCAL_DRIVER_REPORT_CATEGORIES.has(category)) return res.status(400).json({ error: "Select a valid report reason." });
+    if (details.length < 10 || details.length > 1000) return res.status(400).json({ error: "Describe what happened in 10 to 1,000 characters." });
+    if (category === "non_payment" && assignment.payment_status === "confirmed") {
+      return res.status(409).json({ error: "This driver fee was already confirmed as paid." });
+    }
+    const existing = await pool.query(
+      `SELECT id FROM local_delivery_reports
+       WHERE delivery_assignment_id=$1 AND status IN ('open','in_review') LIMIT 1`,
+      [assignment.id]
+    );
+    if (existing.rows.length) return res.status(409).json({ error: "A report for this delivery is already being reviewed." });
+    const report = await pool.query(
+      `INSERT INTO local_delivery_reports(
+         delivery_assignment_id,order_item_id,order_id,seller_id,category,details,is_preview
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id,status,created_at`,
+      [assignment.id, assignment.order_item_id, assignment.order_id, assignment.seller_id, category, details, !!assignment.is_preview]
+    );
+    await pool.query(
+      `INSERT INTO notifications(user_id,type,message)
+       SELECT id,'local_driver_report_received',$1 FROM users
+       WHERE is_admin=true AND admin_role IN ('super_admin','customer_support','order_dispute')`,
+      [`Local driver report #${report.rows[0].id} for order STY-${String(assignment.order_id).padStart(6, "0")} requires review.`]
+    ).catch(() => {});
+    await pool.query(
+      `INSERT INTO order_item_status_events(order_item_id,event_type,label,details)
+       VALUES ($1,'local_driver_report','Local driver submitted a seller report',$2)`,
+      [assignment.order_item_id, JSON.stringify({ assignmentId: assignment.id, reportId: report.rows[0].id, category })]
+    ).catch(() => {});
+    res.status(201).json({ report: report.rows[0] });
+  } catch (err) {
+    sendInternalError(res, err, "report seller from local driver portal");
+  }
+});
+
 app.get("/delivery-assignments/mine", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT * FROM delivery_assignments WHERE seller_id=$1 ORDER BY created_at DESC`,
+      `SELECT da.*,
+              (SELECT COUNT(*)::int FROM local_delivery_reports ldr
+               WHERE ldr.delivery_assignment_id=da.id AND ldr.status IN ('open','in_review')) AS open_report_count
+       FROM delivery_assignments da WHERE da.seller_id=$1 ORDER BY da.created_at DESC`,
       [req.user.id]
     );
     res.json({ assignments: result.rows.map(sellerDeliveryAssignmentPayload) });
   } catch (err) {
     sendInternalError(res, err, "load seller delivery assignments");
+  }
+});
+
+app.post("/delivery-assignments/:id/mark-paid", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const locked = await client.query(
+      `SELECT * FROM delivery_assignments WHERE id=$1 AND seller_id=$2 FOR UPDATE`,
+      [req.params.id, req.user.id]
+    );
+    if (!locked.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Driver assignment not found." });
+    }
+    const assignment = locked.rows[0];
+    if (assignment.status !== "delivered") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "The driver must complete delivery before you mark the driver fee paid." });
+    }
+    if (assignment.payment_method === "bank_transfer" && !(
+      assignment.driver_bank_name_encrypted &&
+      assignment.driver_account_name_encrypted &&
+      assignment.driver_account_number_encrypted
+    )) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Wait for the driver to add bank-transfer details." });
+    }
+    const reference = String(req.body?.reference || "").trim();
+    if (reference.length > 100) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Payment reference must be 100 characters or fewer." });
+    }
+    const result = await client.query(
+      `UPDATE delivery_assignments
+       SET payment_status=CASE WHEN payment_status='confirmed' THEN payment_status ELSE 'seller_marked_paid' END,
+           seller_marked_paid_at=COALESCE(seller_marked_paid_at,NOW()),seller_payment_reference=$1,updated_at=NOW()
+       WHERE id=$2 RETURNING *`,
+      [reference, assignment.id]
+    );
+    await client.query(
+      `INSERT INTO order_item_status_events(order_item_id,event_type,label,details)
+       VALUES ($1,'local_driver_fee_marked_paid','Seller marked the local-driver fee paid',$2)`,
+      [assignment.order_item_id, JSON.stringify({ assignmentId: assignment.id, method: assignment.payment_method })]
+    );
+    await client.query("COMMIT");
+    res.json({ assignment: sellerDeliveryAssignmentPayload(result.rows[0]) });
+  } catch (err) {
+    try { await client.query("ROLLBACK"); } catch {}
+    sendInternalError(res, err, "mark local driver fee paid");
+  } finally {
+    client.release();
   }
 });
 
@@ -9723,6 +9976,13 @@ app.post("/order-items/:id/delivery-assignment", authenticate, rejectAdminMarket
          access_token_hash=EXCLUDED.access_token_hash,
          activation_code_hash=EXCLUDED.activation_code_hash,
          access_expires_at=EXCLUDED.access_expires_at,
+         driver_bank_name_encrypted=NULL,
+         driver_account_name_encrypted=NULL,
+         driver_account_number_encrypted=NULL,
+         payment_status='pending',
+         seller_marked_paid_at=NULL,
+         seller_payment_reference=NULL,
+         driver_confirmed_paid_at=NULL,
          revoked_at=NULL,
          updated_at=NOW()
        RETURNING *`,
