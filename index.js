@@ -3084,6 +3084,14 @@ const SCHEMA_MIGRATIONS = [
     `CREATE INDEX IF NOT EXISTS idx_delivery_assignments_seller ON delivery_assignments(seller_id, created_at DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_delivery_assignments_status ON delivery_assignments(status, access_expires_at)`,
   ] },
+  { version: 83, name: "local-delivery-driver-workflow", statements: [
+    `ALTER TABLE delivery_assignments
+       ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMP,
+       ADD COLUMN IF NOT EXISTS picked_up_at TIMESTAMP,
+       ADD COLUMN IF NOT EXISTS started_at TIMESTAMP,
+       ADD COLUMN IF NOT EXISTS arrived_at TIMESTAMP,
+       ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMP`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -9347,6 +9355,12 @@ function publicDriverAssignmentPayload(row) {
     itemTitle: row.item_title || "",
     status: row.status,
     fulfillmentStatus: row.fulfillment_status,
+    proofOfDeliveryUrl: row.proof_of_delivery_url || "",
+    acceptedAt: row.accepted_at,
+    pickedUpAt: row.picked_up_at,
+    startedAt: row.started_at,
+    arrivedAt: row.arrived_at,
+    deliveredAt: row.delivered_at,
     accessExpiresAt: row.access_expires_at,
     deliveryAddress,
   };
@@ -9356,6 +9370,7 @@ async function findDriverAssignmentByAccessToken(accessToken) {
   if (!/^[A-Za-z0-9_-]{30,120}$/.test(String(accessToken || ""))) return null;
   const result = await pool.query(
     `SELECT da.*, oi.title AS item_title, oi.fulfillment_status, oi.carrier,
+            oi.proof_of_delivery_url,
             o.shipping_address, o.payment_status
      FROM delivery_assignments da
      JOIN order_items oi ON oi.id=da.order_item_id
@@ -9465,6 +9480,162 @@ app.get("/driver-deliveries/:accessToken", async (req, res) => {
     res.json({ assignment: publicDriverAssignmentPayload(assignment) });
   } catch (err) {
     sendInternalError(res, err, "load local driver delivery access");
+  }
+});
+
+const LOCAL_DRIVER_ACTIONS = new Set(["accept", "pickup", "start", "arrived", "proof", "delivered"]);
+const LOCAL_DRIVER_REQUIRED_STATUS = {
+  accept: "assigned",
+  pickup: "accepted",
+  start: "picked_up",
+  arrived: "on_the_way",
+  proof: "arrived",
+  delivered: "arrived",
+};
+
+function validDriverProof(value) {
+  const proof = String(value || "").trim();
+  if (!/^data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/=\s]+$/i.test(proof)) return "";
+  // The portal compresses captures before upload. Keep a hard server limit so a
+  // delivery-only link cannot be used to fill the database with large payloads.
+  return proof.length <= 3_500_000 ? proof : "";
+}
+
+app.patch("/driver-deliveries/:accessToken/status", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const session = driverSessionFromRequest(req);
+    if (!session) {
+      return res.status(401).json({ error: "Driver access has expired. Ask the seller for a new link and code." });
+    }
+    const accessHash = deliveryAccessHash(req.params.accessToken);
+    if (session.driverAccessHash !== accessHash) {
+      return res.status(403).json({ error: "This driver session does not belong to this delivery link." });
+    }
+    const action = String(req.body?.action || "");
+    if (!LOCAL_DRIVER_ACTIONS.has(action)) {
+      return res.status(400).json({ error: "Select a valid delivery step." });
+    }
+
+    await client.query("BEGIN");
+    const locked = await client.query(
+      `SELECT da.*, oi.title AS item_title, oi.fulfillment_status, oi.carrier,
+              oi.proof_of_delivery_url, o.shipping_address, o.payment_status
+       FROM delivery_assignments da
+       JOIN order_items oi ON oi.id=da.order_item_id
+       JOIN orders o ON o.id=da.order_id
+       WHERE da.access_token_hash=$1
+       FOR UPDATE OF da, oi, o`,
+      [accessHash]
+    );
+    const assignment = locked.rows[0] || null;
+    const unavailable = driverAssignmentUnavailable(assignment);
+    if (unavailable) {
+      await client.query("ROLLBACK");
+      return res.status(unavailable.status).json({ error: unavailable.error });
+    }
+    if (Number(session.deliveryAssignmentId) !== Number(assignment.id)) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "This driver session does not belong to this delivery." });
+    }
+    if (assignment.carrier !== "Local Delivery Driver") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "The seller changed the delivery method. Ask the seller for assistance." });
+    }
+    const requiredStatus = LOCAL_DRIVER_REQUIRED_STATUS[action];
+    if (assignment.status !== requiredStatus) {
+      await client.query("ROLLBACK");
+      const current = String(assignment.status || "assigned").replace(/_/g, " ");
+      return res.status(409).json({ error: `Complete each step in order. Current status: ${current}.` });
+    }
+
+    let nextStatus = assignment.status;
+    let timestampColumn = null;
+    let eventLabel = "";
+    let nextFulfillmentStatus = null;
+    let proof = "";
+    if (action === "accept") {
+      nextStatus = "accepted";
+      timestampColumn = "accepted_at";
+      eventLabel = "Local driver accepted the delivery";
+      if (assignment.fulfillment_status === "new") nextFulfillmentStatus = "preparing";
+    } else if (action === "pickup") {
+      nextStatus = "picked_up";
+      timestampColumn = "picked_up_at";
+      eventLabel = "Local driver confirmed package pickup";
+    } else if (action === "start") {
+      nextStatus = "on_the_way";
+      timestampColumn = "started_at";
+      eventLabel = "Local driver started delivery";
+      nextFulfillmentStatus = "shipped";
+    } else if (action === "arrived") {
+      nextStatus = "arrived";
+      timestampColumn = "arrived_at";
+      eventLabel = "Local driver arrived at the delivery destination";
+    } else if (action === "proof") {
+      proof = validDriverProof(req.body?.proofOfDelivery);
+      if (!proof) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "Take a current delivery-proof photo with the live camera." });
+      }
+      eventLabel = "Local driver captured delivery proof";
+    } else {
+      if (!assignment.proof_of_delivery_url) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "Take the required live delivery-proof photo first." });
+      }
+      nextStatus = "delivered";
+      timestampColumn = "delivered_at";
+      eventLabel = "Local driver completed delivery";
+      nextFulfillmentStatus = "delivered";
+    }
+
+    if (proof) {
+      await client.query(
+        `UPDATE order_items SET proof_of_delivery_url=$1 WHERE id=$2`,
+        [proof, assignment.order_item_id]
+      );
+    } else {
+      await client.query(
+        `UPDATE delivery_assignments
+         SET status=$1, ${timestampColumn}=COALESCE(${timestampColumn},NOW()), updated_at=NOW()
+         WHERE id=$2`,
+        [nextStatus, assignment.id]
+      );
+      if (nextFulfillmentStatus) {
+        await client.query(
+          `UPDATE order_items
+           SET fulfillment_status=$1,
+               shipped_at=CASE WHEN $1='shipped' THEN COALESCE(shipped_at,NOW()) ELSE shipped_at END,
+               live_location_enabled=CASE WHEN $1='delivered' THEN FALSE ELSE live_location_enabled END,
+               live_location_expires_at=CASE WHEN $1='delivered' THEN NULL ELSE live_location_expires_at END
+           WHERE id=$2`,
+          [nextFulfillmentStatus, assignment.order_item_id]
+        );
+      }
+    }
+    await client.query(
+      `INSERT INTO order_item_status_events(order_item_id,event_type,label,details)
+       VALUES ($1,$2,$3,$4)`,
+      [assignment.order_item_id, `local_driver_${action}`, eventLabel, JSON.stringify({ assignmentId: assignment.id })]
+    );
+
+    const refreshed = await client.query(
+      `SELECT da.*, oi.title AS item_title, oi.fulfillment_status, oi.carrier,
+              oi.proof_of_delivery_url, o.shipping_address, o.payment_status
+       FROM delivery_assignments da
+       JOIN order_items oi ON oi.id=da.order_item_id
+       JOIN orders o ON o.id=da.order_id
+       WHERE da.id=$1`,
+      [assignment.id]
+    );
+    await client.query("COMMIT");
+    res.json({ assignment: publicDriverAssignmentPayload(refreshed.rows[0]) });
+  } catch (err) {
+    try { await client.query("ROLLBACK"); } catch {}
+    sendInternalError(res, err, "update local driver delivery status");
+  } finally {
+    client.release();
   }
 });
 
