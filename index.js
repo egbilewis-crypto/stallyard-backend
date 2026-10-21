@@ -3119,6 +3119,14 @@ const SCHEMA_MIGRATIONS = [
     `CREATE INDEX IF NOT EXISTS idx_local_delivery_reports_seller
        ON local_delivery_reports(seller_id, created_at DESC)`,
   ] },
+  { version: 85, name: "local-driver-admin-review", statements: [
+    `ALTER TABLE local_delivery_reports
+       ADD COLUMN IF NOT EXISTS admin_note TEXT,
+       ADD COLUMN IF NOT EXISTS reviewed_by INTEGER REFERENCES users(id),
+       ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP`,
+    `CREATE INDEX IF NOT EXISTS idx_delivery_assignments_admin_queue
+       ON delivery_assignments(status, payment_status, updated_at DESC)`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -9901,6 +9909,159 @@ app.post("/delivery-assignments/:id/mark-paid", authenticate, rejectAdminMarketp
     sendInternalError(res, err, "mark local driver fee paid");
   } finally {
     client.release();
+  }
+});
+
+function adminLocalDeliveryPayload(row) {
+  let driverPhone = "";
+  let bankName = "";
+  let accountName = "";
+  let accountNumber = "";
+  try {
+    driverPhone = decryptFieldSafe(row.driver_phone_encrypted) || "";
+    bankName = decryptFieldSafe(row.driver_bank_name_encrypted) || "";
+    accountName = decryptFieldSafe(row.driver_account_name_encrypted) || "";
+    accountNumber = decryptFieldSafe(row.driver_account_number_encrypted) || "";
+  } catch {
+    driverPhone = "";
+    bankName = "";
+    accountName = "";
+    accountNumber = "";
+  }
+  return {
+    id: row.id,
+    orderItemId: row.order_item_id,
+    orderId: row.order_id,
+    orderNumber: `STY-${String(row.order_id).padStart(6, "0")}`,
+    sellerId: row.seller_id,
+    sellerUsername: row.seller_username || "",
+    sellerDisplayName: row.seller_display_name || "",
+    buyerUsername: row.buyer_username || "",
+    buyerDisplayName: row.buyer_display_name || "",
+    driverName: row.driver_name,
+    driverPhone,
+    itemTitle: row.item_title || "",
+    packageDescription: row.package_description || "",
+    deliveryFee: Number(row.delivery_fee || 0),
+    paymentMethod: row.payment_method,
+    paymentStatus: row.payment_status || "pending",
+    paymentReference: row.seller_payment_reference || "",
+    bankName,
+    accountName,
+    accountNumberLast4: accountNumber ? accountNumber.slice(-4) : "",
+    status: row.status,
+    fulfillmentStatus: row.fulfillment_status,
+    proofOfDeliveryUrl: row.proof_of_delivery_url || "",
+    acceptedAt: row.accepted_at,
+    pickedUpAt: row.picked_up_at,
+    startedAt: row.started_at,
+    arrivedAt: row.arrived_at,
+    deliveredAt: row.delivered_at,
+    sellerMarkedPaidAt: row.seller_marked_paid_at,
+    driverConfirmedPaidAt: row.driver_confirmed_paid_at,
+    accessExpiresAt: row.access_expires_at,
+    revokedAt: row.revoked_at,
+    openReportCount: Number(row.open_report_count || 0),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+app.get("/admin/local-deliveries", authenticate, requirePermission("seller_report_review"), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT da.*,oi.title AS item_title,oi.fulfillment_status,oi.proof_of_delivery_url,
+              seller.username AS seller_username,seller.display_name AS seller_display_name,
+              buyer.username AS buyer_username,buyer.display_name AS buyer_display_name,
+              (SELECT COUNT(*)::int FROM local_delivery_reports ldr
+               WHERE ldr.delivery_assignment_id=da.id AND ldr.status IN ('open','in_review')) AS open_report_count
+       FROM delivery_assignments da
+       JOIN order_items oi ON oi.id=da.order_item_id
+       JOIN orders o ON o.id=da.order_id
+       JOIN users seller ON seller.id=da.seller_id
+       JOIN users buyer ON buyer.id=o.buyer_id
+       WHERE da.is_preview=false AND COALESCE(o.is_preview,false)=false
+       ORDER BY CASE WHEN da.status NOT IN ('delivered','revoked') THEN 0 ELSE 1 END,
+                da.updated_at DESC
+       LIMIT 200`
+    );
+    res.json({ deliveries: result.rows.map(adminLocalDeliveryPayload) });
+  } catch (err) {
+    sendInternalError(res, err, "load admin local deliveries");
+  }
+});
+
+app.get("/admin/local-driver-reports", authenticate, requirePermission("seller_report_review"), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT ldr.*,da.driver_name,da.delivery_fee,da.payment_method,da.payment_status,
+              da.status AS delivery_status,oi.title AS item_title,oi.proof_of_delivery_url,
+              seller.username AS seller_username,seller.display_name AS seller_display_name,
+              reviewer.username AS reviewer_username
+       FROM local_delivery_reports ldr
+       JOIN delivery_assignments da ON da.id=ldr.delivery_assignment_id
+       JOIN order_items oi ON oi.id=ldr.order_item_id
+       JOIN users seller ON seller.id=ldr.seller_id
+       LEFT JOIN users reviewer ON reviewer.id=ldr.reviewed_by
+       WHERE ldr.is_preview=false
+       ORDER BY CASE ldr.status WHEN 'open' THEN 0 WHEN 'in_review' THEN 1 ELSE 2 END,
+                ldr.created_at DESC
+       LIMIT 200`
+    );
+    res.json({ reports: result.rows });
+  } catch (err) {
+    sendInternalError(res, err, "load local driver reports");
+  }
+});
+
+app.patch("/admin/local-driver-reports/:id", authenticate, requirePermission("seller_report_review"), async (req, res) => {
+  try {
+    const status = String(req.body?.status || "");
+    const adminNote = String(req.body?.adminNote || "").trim().slice(0, 2000);
+    if (!["in_review", "resolved", "dismissed"].includes(status)) {
+      return res.status(400).json({ error: "Select a valid report status." });
+    }
+    const result = await pool.query(
+      `UPDATE local_delivery_reports
+       SET status=$1,admin_note=$2,reviewed_by=$3,updated_at=NOW(),
+           resolved_at=CASE WHEN $1 IN ('resolved','dismissed') THEN NOW() ELSE NULL END
+       WHERE id=$4 AND is_preview=false RETURNING *`,
+      [status, adminNote || null, req.user.id, req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: "Driver report not found." });
+    logAdminAction(req.user.id, "local_driver_report_updated", `Local driver report #${req.params.id} marked ${status}`);
+    res.json({ report: result.rows[0] });
+  } catch (err) {
+    sendInternalError(res, err, "update local driver report");
+  }
+});
+
+app.post("/admin/local-deliveries/:id/revoke", authenticate, requirePermission("seller_report_review"), async (req, res) => {
+  try {
+    const reason = String(req.body?.reason || "").trim();
+    if (reason.length < 5 || reason.length > 500) {
+      return res.status(400).json({ error: "Enter a reason between 5 and 500 characters." });
+    }
+    const result = await pool.query(
+      `UPDATE delivery_assignments
+       SET status='revoked',access_token_hash=NULL,activation_code_hash=NULL,
+           revoked_at=COALESCE(revoked_at,NOW()),updated_at=NOW()
+       WHERE id=$1 AND is_preview=false AND status IN ('assigned','accepted','picked_up','on_the_way','arrived')
+       RETURNING *`,
+      [req.params.id]
+    );
+    if (!result.rows.length) {
+      return res.status(409).json({ error: "This delivery access is already closed or cannot be revoked." });
+    }
+    await pool.query(
+      `INSERT INTO order_item_status_events(order_item_id,event_type,label,details)
+       VALUES ($1,'local_driver_access_admin_revoked','Admin revoked local-driver access',$2)`,
+      [result.rows[0].order_item_id, JSON.stringify({ assignmentId: result.rows[0].id, reason })]
+    ).catch(() => {});
+    logAdminAction(req.user.id, "local_driver_access_revoked", `Revoked local delivery #${req.params.id}: ${reason}`);
+    res.json({ assignment: sellerDeliveryAssignmentPayload(result.rows[0]) });
+  } catch (err) {
+    sendInternalError(res, err, "revoke local driver access as admin");
   }
 });
 
