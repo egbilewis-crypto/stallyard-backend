@@ -3159,6 +3159,10 @@ const SCHEMA_MIGRATIONS = [
     `CREATE INDEX IF NOT EXISTS idx_local_driver_payout_records_seller
        ON local_driver_payout_records(seller_id, created_at DESC)`,
   ] },
+  { version: 87, name: "local-driver-id-document-photo", statements: [
+    `ALTER TABLE delivery_assignments
+       ADD COLUMN IF NOT EXISTS driver_id_document_url TEXT`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -6045,6 +6049,29 @@ async function fetchPrivateVerificationObject(path) {
   return Buffer.from(await response.arrayBuffer());
 }
 
+async function createPrivateVerificationSignedUrl(path, expiresIn = 600) {
+  if (!path) return "";
+  // Keep previously deployed Base64 records readable while new evidence is
+  // stored as private Supabase objects.
+  if (String(path).startsWith("data:image/")) return path;
+  const { url, key } = verificationStorageConfig();
+  if (!url || !key) throw new Error("Private identity storage isn't configured");
+  const encodedPath = String(path).split("/").map(encodeURIComponent).join("/");
+  const endpoint = `${url}/storage/v1/object/sign/${encodeURIComponent(VERIFICATION_BUCKET)}/${encodedPath}`;
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ expiresIn }),
+  });
+  if (!response.ok) throw new Error(`Private verification link could not be created (${response.status})`);
+  const data = await response.json();
+  const signedPath = data.signedURL || data.signedUrl || "";
+  if (!signedPath) throw new Error("Private verification link was not returned");
+  if (signedPath.startsWith("http")) return signedPath;
+  if (signedPath.startsWith("/storage/v1/")) return `${url}${signedPath}`;
+  return `${url}/storage/v1${signedPath.startsWith("/") ? "" : "/"}${signedPath}`;
+}
+
 async function deletePrivateVerificationObject(path) {
   if (!path) return;
   const { url, key } = verificationStorageConfig();
@@ -6056,6 +6083,40 @@ async function deletePrivateVerificationObject(path) {
     body: JSON.stringify({ prefixes: [path] }),
   });
   if (!response.ok && response.status !== 404) console.error("Private verification cleanup failed:", response.status);
+}
+
+async function migrateLegacyDriverIdentityMedia() {
+  const result = await pool.query(
+    `SELECT id,driver_identity_selfie_url,driver_id_document_url
+     FROM delivery_assignments
+     WHERE driver_identity_selfie_url LIKE 'data:image/%'
+        OR driver_id_document_url LIKE 'data:image/%'
+     ORDER BY id ASC`
+  );
+  for (const assignment of result.rows) {
+    for (const media of [
+      { column: "driver_identity_selfie_url", value: assignment.driver_identity_selfie_url, label: "Legacy driver selfie", suffix: "selfie" },
+      { column: "driver_id_document_url", value: assignment.driver_id_document_url, label: "Legacy driver ID", suffix: "id" },
+    ]) {
+      if (!String(media.value || "").startsWith("data:image/")) continue;
+      let uploadedPath = "";
+      try {
+        const parsed = parseVerificationJpeg(media.value, media.label);
+        uploadedPath = `local-driver/assignment-${assignment.id}/migrated-${Date.now()}-${crypto.randomBytes(5).toString("hex")}-${media.suffix}-${parsed.sha256.slice(0, 12)}.jpg`;
+        await uploadPrivateVerificationObject(uploadedPath, parsed.buffer);
+        const updated = await pool.query(
+          `UPDATE delivery_assignments SET ${media.column}=$1,updated_at=NOW()
+           WHERE id=$2 AND ${media.column}=$3`,
+          [uploadedPath, assignment.id, media.value]
+        );
+        if (!updated.rowCount) await deletePrivateVerificationObject(uploadedPath);
+      } catch (migrationError) {
+        if (uploadedPath) await deletePrivateVerificationObject(uploadedPath).catch(() => {});
+        console.error(`Legacy local-driver ${media.suffix} migration failed for assignment #${assignment.id}:`, migrationError?.message || migrationError);
+      }
+    }
+  }
+  if (result.rows.length) console.log(`Checked ${result.rows.length} legacy local-driver identity record(s) for private-storage migration.`);
 }
 
 function identityDigest(value) {
@@ -9420,7 +9481,7 @@ function deliveryAccessHash(accessToken) {
   return crypto.createHash("sha256").update(String(accessToken || "")).digest("hex");
 }
 
-function publicDriverAssignmentPayload(row) {
+async function publicDriverAssignmentPayload(row) {
   let deliveryAddress = row.shipping_address || {};
   if (typeof deliveryAddress === "string") {
     try {
@@ -9439,6 +9500,10 @@ function publicDriverAssignmentPayload(row) {
     driverLegalName = "";
     driverIdLast4 = "";
   }
+  const [driverIdentitySelfieUrl, driverIdDocumentUrl] = await Promise.all([
+    createPrivateVerificationSignedUrl(row.driver_identity_selfie_url).catch(() => ""),
+    createPrivateVerificationSignedUrl(row.driver_id_document_url).catch(() => ""),
+  ]);
   return {
     id: row.id,
     orderItemId: row.order_item_id,
@@ -9448,7 +9513,8 @@ function publicDriverAssignmentPayload(row) {
     driverLegalName,
     driverIdType: row.driver_id_type || "",
     driverIdLast4,
-    driverIdentitySelfieUrl: row.driver_identity_selfie_url || "",
+    driverIdentitySelfieUrl,
+    driverIdDocumentUrl,
     driverIdentityStatus: row.driver_identity_status || "not_submitted",
     driverIdentitySubmittedAt: row.driver_identity_submitted_at,
     driverIdentityReviewedAt: row.driver_identity_reviewed_at,
@@ -9457,7 +9523,8 @@ function publicDriverAssignmentPayload(row) {
       row.driver_legal_name_encrypted &&
       row.driver_id_type &&
       row.driver_id_number_encrypted &&
-      row.driver_identity_selfie_url
+      row.driver_identity_selfie_url &&
+      row.driver_id_document_url
     ),
     deliveryFee: Number(row.delivery_fee || 0),
     paymentMethod: row.payment_method,
@@ -9576,7 +9643,7 @@ app.post("/driver-deliveries/:accessToken/activate", driverActivationRateLimit, 
       console.error("Driver access activated, but its status event could not be recorded:", historyError?.message || historyError);
     }
 
-    res.json({ sessionToken, assignment: publicDriverAssignmentPayload(assignment) });
+    res.json({ sessionToken, assignment: await publicDriverAssignmentPayload(assignment) });
   } catch (err) {
     sendInternalError(res, err, "activate local driver delivery access");
   }
@@ -9598,7 +9665,7 @@ app.get("/driver-deliveries/:accessToken", async (req, res) => {
       return res.status(403).json({ error: "This driver session does not belong to this delivery." });
     }
 
-    res.json({ assignment: publicDriverAssignmentPayload(assignment) });
+    res.json({ assignment: await publicDriverAssignmentPayload(assignment) });
   } catch (err) {
     sendInternalError(res, err, "load local driver delivery access");
   }
@@ -9648,7 +9715,14 @@ app.patch("/driver-deliveries/:accessToken/identity", async (req, res) => {
     const legalName = String(req.body?.legalName || "").trim().replace(/\s+/g, " ");
     const idType = String(req.body?.idType || "").trim();
     const idNumber = String(req.body?.idNumber || "").trim().toUpperCase();
-    const liveSelfie = validDriverProof(req.body?.liveSelfie);
+    let liveSelfie;
+    let idDocumentPhoto;
+    try {
+      liveSelfie = parseVerificationJpeg(req.body?.liveSelfie, "Live driver selfie");
+      idDocumentPhoto = parseVerificationJpeg(req.body?.idDocumentPhoto, "Driver ID document");
+    } catch (imageError) {
+      return res.status(imageError.statusCode || 400).json({ error: imageError.message });
+    }
     if (legalName.length < 3 || legalName.length > 120) {
       return res.status(400).json({ error: "Enter your full legal name as it appears on your ID." });
     }
@@ -9658,26 +9732,44 @@ app.patch("/driver-deliveries/:accessToken/identity", async (req, res) => {
     if (!/^[A-Z0-9][A-Z0-9\-/ ]{3,29}$/.test(idNumber)) {
       return res.status(400).json({ error: "Enter a valid ID number containing 4 to 30 letters or numbers." });
     }
-    if (!liveSelfie) {
-      return res.status(400).json({ error: "Take a current selfie with the live camera. Gallery pictures are not accepted." });
+    await ensurePrivateVerificationBucket();
+    const evidenceRoot = `local-driver/assignment-${assignment.id}/${Date.now()}-${crypto.randomBytes(6).toString("hex")}`;
+    const selfiePath = `${evidenceRoot}-selfie-${liveSelfie.sha256.slice(0, 12)}.jpg`;
+    const idDocumentPath = `${evidenceRoot}-id-${idDocumentPhoto.sha256.slice(0, 12)}.jpg`;
+    const uploadedPaths = [];
+    let result;
+    try {
+      await uploadPrivateVerificationObject(selfiePath, liveSelfie.buffer);
+      uploadedPaths.push(selfiePath);
+      await uploadPrivateVerificationObject(idDocumentPath, idDocumentPhoto.buffer);
+      uploadedPaths.push(idDocumentPath);
+      result = await pool.query(
+        `UPDATE delivery_assignments
+         SET driver_legal_name_encrypted=$1,driver_id_type=$2,driver_id_number_encrypted=$3,
+             driver_identity_selfie_url=$4,driver_id_document_url=$5,driver_identity_status='pending',
+             driver_identity_submitted_at=NOW(),driver_identity_reviewed_at=NULL,
+             driver_identity_reviewed_by=NULL,driver_identity_admin_note=NULL,updated_at=NOW()
+         WHERE id=$6 RETURNING *`,
+        [encryptField(legalName), idType, encryptField(idNumber), selfiePath, idDocumentPath, assignment.id]
+      );
+    } catch (storageError) {
+      await Promise.all(uploadedPaths.map((path) => deletePrivateVerificationObject(path))).catch(() => {});
+      throw storageError;
     }
-
-    const result = await pool.query(
-      `UPDATE delivery_assignments
-       SET driver_legal_name_encrypted=$1,driver_id_type=$2,driver_id_number_encrypted=$3,
-           driver_identity_selfie_url=$4,driver_identity_status='pending',
-           driver_identity_submitted_at=NOW(),driver_identity_reviewed_at=NULL,
-           driver_identity_reviewed_by=NULL,driver_identity_admin_note=NULL,updated_at=NOW()
-       WHERE id=$5 RETURNING *`,
-      [encryptField(legalName), idType, encryptField(idNumber), liveSelfie, assignment.id]
-    );
+    // A resubmission replaces the active evidence. Remove the superseded
+    // private objects only after the new database record has been committed.
+    await Promise.all([
+      assignment.driver_identity_selfie_url,
+      assignment.driver_id_document_url,
+    ].filter((path) => path && !String(path).startsWith("data:image/")).map((path) => deletePrivateVerificationObject(path))).catch(() => {});
     await pool.query(
       `INSERT INTO order_item_status_events(order_item_id,event_type,label,details)
        VALUES ($1,'local_driver_identity_submitted','Local driver submitted identity evidence',$2)`,
       [assignment.order_item_id, JSON.stringify({ assignmentId: assignment.id, idType })]
     ).catch(() => {});
-    res.json({ assignment: publicDriverAssignmentPayload({ ...assignment, ...result.rows[0] }) });
+    res.json({ assignment: await publicDriverAssignmentPayload({ ...assignment, ...result.rows[0] }) });
   } catch (err) {
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
     sendInternalError(res, err, "save local driver identity");
   }
 });
@@ -9728,7 +9820,8 @@ app.patch("/driver-deliveries/:accessToken/status", async (req, res) => {
       assignment.driver_legal_name_encrypted &&
       assignment.driver_id_type &&
       assignment.driver_id_number_encrypted &&
-      assignment.driver_identity_selfie_url
+      assignment.driver_identity_selfie_url &&
+      assignment.driver_id_document_url
     )) {
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "Submit your identity details and take the required live selfie before accepting this delivery." });
@@ -9821,7 +9914,7 @@ app.patch("/driver-deliveries/:accessToken/status", async (req, res) => {
       [assignment.id]
     );
     await client.query("COMMIT");
-    res.json({ assignment: publicDriverAssignmentPayload(refreshed.rows[0]) });
+    res.json({ assignment: await publicDriverAssignmentPayload(refreshed.rows[0]) });
   } catch (err) {
     try { await client.query("ROLLBACK"); } catch {}
     sendInternalError(res, err, "update local driver delivery status");
@@ -9870,7 +9963,7 @@ app.patch("/driver-deliveries/:accessToken/payment-details", async (req, res) =>
        VALUES ($1,'local_driver_payment_details','Local driver added bank-transfer details',$2)`,
       [assignment.order_item_id, JSON.stringify({ assignmentId: assignment.id })]
     ).catch(() => {});
-    res.json({ assignment: publicDriverAssignmentPayload({ ...assignment, ...result.rows[0] }) });
+    res.json({ assignment: await publicDriverAssignmentPayload({ ...assignment, ...result.rows[0] }) });
   } catch (err) {
     sendInternalError(res, err, "save local driver bank details");
   }
@@ -9921,7 +10014,7 @@ app.post("/driver-deliveries/:accessToken/confirm-payment", async (req, res) => 
        VALUES ($1,'local_driver_payment_confirmed','Local driver confirmed delivery-fee payment',$2)`,
       [assignment.order_item_id, JSON.stringify({ assignmentId: assignment.id })]
     ).catch(() => {});
-    res.json({ assignment: publicDriverAssignmentPayload({ ...assignment, ...result.rows[0] }) });
+    res.json({ assignment: await publicDriverAssignmentPayload({ ...assignment, ...result.rows[0] }) });
   } catch (err) {
     sendInternalError(res, err, "confirm local driver payment");
   }
@@ -10066,7 +10159,7 @@ app.post("/delivery-assignments/:id/mark-paid", authenticate, rejectAdminMarketp
   }
 });
 
-function adminLocalDeliveryPayload(row) {
+async function adminLocalDeliveryPayload(row) {
   let driverPhone = "";
   let bankName = "";
   let accountName = "";
@@ -10088,6 +10181,10 @@ function adminLocalDeliveryPayload(row) {
     driverLegalName = "";
     driverIdNumber = "";
   }
+  const [driverIdentitySelfieUrl, driverIdDocumentUrl] = await Promise.all([
+    createPrivateVerificationSignedUrl(row.driver_identity_selfie_url).catch(() => ""),
+    createPrivateVerificationSignedUrl(row.driver_id_document_url).catch(() => ""),
+  ]);
   return {
     id: row.id,
     orderItemId: row.order_item_id,
@@ -10103,7 +10200,8 @@ function adminLocalDeliveryPayload(row) {
     driverLegalName,
     driverIdType: row.driver_id_type || "",
     driverIdLast4: driverIdNumber ? driverIdNumber.slice(-4) : "",
-    driverIdentitySelfieUrl: row.driver_identity_selfie_url || "",
+    driverIdentitySelfieUrl,
+    driverIdDocumentUrl,
     driverIdentityStatus: row.driver_identity_status || "not_submitted",
     driverIdentitySubmittedAt: row.driver_identity_submitted_at,
     driverIdentityReviewedAt: row.driver_identity_reviewed_at,
@@ -10112,7 +10210,8 @@ function adminLocalDeliveryPayload(row) {
       row.driver_legal_name_encrypted &&
       row.driver_id_type &&
       row.driver_id_number_encrypted &&
-      row.driver_identity_selfie_url
+      row.driver_identity_selfie_url &&
+      row.driver_id_document_url
     ),
     itemTitle: row.item_title || "",
     packageDescription: row.package_description || "",
@@ -10167,7 +10266,7 @@ app.get("/admin/local-deliveries", authenticate, requirePermission("seller_repor
                 da.updated_at DESC
        LIMIT 200`
     );
-    res.json({ deliveries: result.rows.map(adminLocalDeliveryPayload) });
+    res.json({ deliveries: await Promise.all(result.rows.map(adminLocalDeliveryPayload)) });
   } catch (err) {
     sendInternalError(res, err, "load admin local deliveries");
   }
@@ -10353,6 +10452,11 @@ app.post("/order-items/:id/delivery-assignment", authenticate, rejectAdminMarket
     const { accessToken, accessTokenHash, activationCode } = newDeliveryAccessCredentials();
     const activationCodeHash = await bcrypt.hash(activationCode, 10);
     const accessExpiresAt = deliveryAssignmentExpiry(deliveryDueAt?.toISOString());
+    const priorIdentity = await pool.query(
+      `SELECT driver_identity_selfie_url,driver_id_document_url
+       FROM delivery_assignments WHERE order_item_id=$1`,
+      [item.id]
+    );
     const assignment = await pool.query(
       `INSERT INTO delivery_assignments (
          order_item_id,order_id,seller_id,driver_name,driver_phone_encrypted,delivery_fee,
@@ -10378,6 +10482,7 @@ app.post("/order-items/:id/delivery-assignment", authenticate, rejectAdminMarket
          driver_id_type=NULL,
          driver_id_number_encrypted=NULL,
          driver_identity_selfie_url=NULL,
+         driver_id_document_url=NULL,
          driver_identity_status='not_submitted',
          driver_identity_submitted_at=NULL,
          driver_identity_reviewed_at=NULL,
@@ -10407,6 +10512,11 @@ app.post("/order-items/:id/delivery-assignment", authenticate, rejectAdminMarket
         !!item.is_preview,
       ]
     );
+
+    await Promise.all([
+      priorIdentity.rows[0]?.driver_identity_selfie_url,
+      priorIdentity.rows[0]?.driver_id_document_url,
+    ].filter((path) => path && !String(path).startsWith("data:image/")).map((path) => deletePrivateVerificationObject(path))).catch(() => {});
 
     await pool.query(
       `INSERT INTO local_driver_payout_records(
@@ -14112,6 +14222,7 @@ async function startServer() {
   try {
     await applyPendingMigrations();
     await ensurePrivateVerificationBucket();
+    await migrateLegacyDriverIdentityMedia();
     await protectLegacySellerReports();
     await encryptLegacyTotpSecrets();
     await ensurePreviewAccounts();
