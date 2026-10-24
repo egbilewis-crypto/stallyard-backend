@@ -9864,6 +9864,8 @@ app.get("/driver/profile", authenticate, rejectAdminMarketplaceUse, async (req, 
 
 app.patch("/driver/profile", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
+    const currentResult = await pool.query("SELECT * FROM driver_profiles WHERE user_id=$1", [req.user.id]);
+    const currentProfile = currentResult.rows[0] || null;
     const legalName = String(req.body?.legalName || "").trim().replace(/\s+/g, " ");
     const phone = normalizeNigerianPhone(req.body?.phone);
     const state = String(req.body?.state || "").trim().slice(0, 80);
@@ -9875,10 +9877,24 @@ app.patch("/driver/profile", authenticate, rejectAdminMarketplaceUse, async (req
     const accountName = String(req.body?.accountName || "").trim().slice(0, 120);
     const accountNumber = String(req.body?.accountNumber || "").replace(/\D/g, "").slice(0, 10);
     const isAvailable = req.body?.isAvailable !== false;
+    const allowedVehicleTypes = new Set(["motorcycle","car","van","truck","bicycle","on_foot"]);
+    if (!allowedVehicleTypes.has(vehicleType)) return res.status(400).json({ error: "Select an accepted delivery vehicle type." });
+    if (currentProfile && ["approved","suspended"].includes(currentProfile.verification_status)) {
+      const result = await pool.query(
+        `UPDATE driver_profiles SET vehicle_type=$1,vehicle_description=$2,
+           license_plate_encrypted=$3,is_available=$4,updated_at=NOW()
+         WHERE user_id=$5 RETURNING *`,
+        [vehicleType,vehicleDescription,licensePlate ? encryptField(licensePlate) : null,isAvailable,req.user.id]
+      );
+      return res.json({
+        profile: await registeredDriverProfilePayload(result.rows[0], true),
+        lockedFields: true,
+        message: "Vehicle and availability updated. Approved identity, contact, service-area, and payment details remain locked.",
+      });
+    }
     if (legalName.length < 3) return res.status(400).json({ error: "Enter your full legal name." });
     if (!phone) return res.status(400).json({ error: "Enter a valid Nigerian phone number." });
     if (!state || !city) return res.status(400).json({ error: "Select your service state and city." });
-    if (!vehicleType) return res.status(400).json({ error: "Select your delivery vehicle type." });
     if ((bankName || accountName || accountNumber) && (!bankName || !accountName || accountNumber.length !== 10)) {
       return res.status(400).json({ error: "Complete all bank fields using a 10-digit account number, or leave all bank fields blank." });
     }
