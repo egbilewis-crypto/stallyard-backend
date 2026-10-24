@@ -3127,6 +3127,38 @@ const SCHEMA_MIGRATIONS = [
     `CREATE INDEX IF NOT EXISTS idx_delivery_assignments_admin_queue
        ON delivery_assignments(status, payment_status, updated_at DESC)`,
   ] },
+  { version: 86, name: "local-driver-identity-and-payout-records", statements: [
+    `ALTER TABLE delivery_assignments
+       ADD COLUMN IF NOT EXISTS driver_legal_name_encrypted TEXT,
+       ADD COLUMN IF NOT EXISTS driver_id_type TEXT,
+       ADD COLUMN IF NOT EXISTS driver_id_number_encrypted TEXT,
+       ADD COLUMN IF NOT EXISTS driver_identity_selfie_url TEXT,
+       ADD COLUMN IF NOT EXISTS driver_identity_status TEXT NOT NULL DEFAULT 'not_submitted',
+       ADD COLUMN IF NOT EXISTS driver_identity_submitted_at TIMESTAMP,
+       ADD COLUMN IF NOT EXISTS driver_identity_reviewed_at TIMESTAMP,
+       ADD COLUMN IF NOT EXISTS driver_identity_reviewed_by INTEGER REFERENCES users(id),
+       ADD COLUMN IF NOT EXISTS driver_identity_admin_note TEXT`,
+    `CREATE TABLE IF NOT EXISTS local_driver_payout_records (
+       id BIGSERIAL PRIMARY KEY,
+       delivery_assignment_id BIGINT NOT NULL UNIQUE REFERENCES delivery_assignments(id) ON DELETE CASCADE,
+       order_item_id INTEGER NOT NULL REFERENCES order_items(id) ON DELETE CASCADE,
+       order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+       seller_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+       amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+       payment_method TEXT NOT NULL,
+       status TEXT NOT NULL DEFAULT 'pending',
+       payment_reference TEXT,
+       seller_marked_paid_at TIMESTAMP,
+       driver_confirmed_paid_at TIMESTAMP,
+       is_preview BOOLEAN NOT NULL DEFAULT FALSE,
+       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_local_driver_payout_records_status
+       ON local_driver_payout_records(status, updated_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_local_driver_payout_records_seller
+       ON local_driver_payout_records(seller_id, created_at DESC)`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -9397,12 +9429,36 @@ function publicDriverAssignmentPayload(row) {
       deliveryAddress = {};
     }
   }
+  let driverLegalName = "";
+  let driverIdLast4 = "";
+  try {
+    driverLegalName = decryptFieldSafe(row.driver_legal_name_encrypted) || "";
+    const driverIdNumber = decryptFieldSafe(row.driver_id_number_encrypted) || "";
+    driverIdLast4 = driverIdNumber ? driverIdNumber.slice(-4) : "";
+  } catch {
+    driverLegalName = "";
+    driverIdLast4 = "";
+  }
   return {
     id: row.id,
     orderItemId: row.order_item_id,
     orderId: row.order_id,
     orderNumber: `STY-${String(row.order_id).padStart(6, "0")}`,
     driverName: row.driver_name,
+    driverLegalName,
+    driverIdType: row.driver_id_type || "",
+    driverIdLast4,
+    driverIdentitySelfieUrl: row.driver_identity_selfie_url || "",
+    driverIdentityStatus: row.driver_identity_status || "not_submitted",
+    driverIdentitySubmittedAt: row.driver_identity_submitted_at,
+    driverIdentityReviewedAt: row.driver_identity_reviewed_at,
+    driverIdentityAdminNote: row.driver_identity_admin_note || "",
+    identitySubmitted: Boolean(
+      row.driver_legal_name_encrypted &&
+      row.driver_id_type &&
+      row.driver_id_number_encrypted &&
+      row.driver_identity_selfie_url
+    ),
     deliveryFee: Number(row.delivery_fee || 0),
     paymentMethod: row.payment_method,
     paymentStatus: row.payment_status || "pending",
@@ -9566,6 +9622,66 @@ function validDriverProof(value) {
   return proof.length <= 3_500_000 ? proof : "";
 }
 
+const LOCAL_DRIVER_ID_TYPES = new Set(["nin", "drivers_license", "passport", "pvc"]);
+
+app.patch("/driver-deliveries/:accessToken/identity", async (req, res) => {
+  try {
+    const session = driverSessionFromRequest(req);
+    if (!session) return res.status(401).json({ error: "Driver access has expired. Ask the seller for a new link and code." });
+    const accessHash = deliveryAccessHash(req.params.accessToken);
+    if (session.driverAccessHash !== accessHash) {
+      return res.status(403).json({ error: "This driver session does not belong to this delivery link." });
+    }
+    const assignment = await findDriverAssignmentByAccessToken(req.params.accessToken);
+    const unavailable = driverAssignmentUnavailable(assignment);
+    if (unavailable) return res.status(unavailable.status).json({ error: unavailable.error });
+    if (Number(session.deliveryAssignmentId) !== Number(assignment.id)) {
+      return res.status(403).json({ error: "This driver session does not belong to this delivery." });
+    }
+    if (assignment.status !== "assigned") {
+      return res.status(409).json({ error: "Driver identity can only be submitted before accepting the delivery." });
+    }
+    if (assignment.driver_identity_status === "approved") {
+      return res.status(409).json({ error: "This driver identity was already approved." });
+    }
+
+    const legalName = String(req.body?.legalName || "").trim().replace(/\s+/g, " ");
+    const idType = String(req.body?.idType || "").trim();
+    const idNumber = String(req.body?.idNumber || "").trim().toUpperCase();
+    const liveSelfie = validDriverProof(req.body?.liveSelfie);
+    if (legalName.length < 3 || legalName.length > 120) {
+      return res.status(400).json({ error: "Enter your full legal name as it appears on your ID." });
+    }
+    if (!LOCAL_DRIVER_ID_TYPES.has(idType)) {
+      return res.status(400).json({ error: "Select an accepted Nigerian identity document." });
+    }
+    if (!/^[A-Z0-9][A-Z0-9\-/ ]{3,29}$/.test(idNumber)) {
+      return res.status(400).json({ error: "Enter a valid ID number containing 4 to 30 letters or numbers." });
+    }
+    if (!liveSelfie) {
+      return res.status(400).json({ error: "Take a current selfie with the live camera. Gallery pictures are not accepted." });
+    }
+
+    const result = await pool.query(
+      `UPDATE delivery_assignments
+       SET driver_legal_name_encrypted=$1,driver_id_type=$2,driver_id_number_encrypted=$3,
+           driver_identity_selfie_url=$4,driver_identity_status='pending',
+           driver_identity_submitted_at=NOW(),driver_identity_reviewed_at=NULL,
+           driver_identity_reviewed_by=NULL,driver_identity_admin_note=NULL,updated_at=NOW()
+       WHERE id=$5 RETURNING *`,
+      [encryptField(legalName), idType, encryptField(idNumber), liveSelfie, assignment.id]
+    );
+    await pool.query(
+      `INSERT INTO order_item_status_events(order_item_id,event_type,label,details)
+       VALUES ($1,'local_driver_identity_submitted','Local driver submitted identity evidence',$2)`,
+      [assignment.order_item_id, JSON.stringify({ assignmentId: assignment.id, idType })]
+    ).catch(() => {});
+    res.json({ assignment: publicDriverAssignmentPayload({ ...assignment, ...result.rows[0] }) });
+  } catch (err) {
+    sendInternalError(res, err, "save local driver identity");
+  }
+});
+
 app.patch("/driver-deliveries/:accessToken/status", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -9606,6 +9722,16 @@ app.patch("/driver-deliveries/:accessToken/status", async (req, res) => {
     if (assignment.carrier !== "Local Delivery Driver") {
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "The seller changed the delivery method. Ask the seller for assistance." });
+    }
+    if (action === "accept" && !(
+      ["pending", "approved"].includes(assignment.driver_identity_status) &&
+      assignment.driver_legal_name_encrypted &&
+      assignment.driver_id_type &&
+      assignment.driver_id_number_encrypted &&
+      assignment.driver_identity_selfie_url
+    )) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Submit your identity details and take the required live selfie before accepting this delivery." });
     }
     const requiredStatus = LOCAL_DRIVER_REQUIRED_STATUS[action];
     if (assignment.status !== requiredStatus) {
@@ -9777,6 +9903,20 @@ app.post("/driver-deliveries/:accessToken/confirm-payment", async (req, res) => 
       [assignment.id]
     );
     await pool.query(
+      `INSERT INTO local_driver_payout_records(
+         delivery_assignment_id,order_item_id,order_id,seller_id,amount,payment_method,status,
+         payment_reference,seller_marked_paid_at,driver_confirmed_paid_at,is_preview,updated_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,'confirmed',$7,$8,NOW(),$9,NOW())
+       ON CONFLICT (delivery_assignment_id) DO UPDATE SET
+         amount=EXCLUDED.amount,payment_method=EXCLUDED.payment_method,status='confirmed',
+         payment_reference=EXCLUDED.payment_reference,
+         seller_marked_paid_at=COALESCE(local_driver_payout_records.seller_marked_paid_at,EXCLUDED.seller_marked_paid_at),
+         driver_confirmed_paid_at=COALESCE(local_driver_payout_records.driver_confirmed_paid_at,NOW()),updated_at=NOW()`,
+      [assignment.id, assignment.order_item_id, assignment.order_id, assignment.seller_id,
+       assignment.delivery_fee, assignment.payment_method, assignment.seller_payment_reference || null,
+       assignment.seller_marked_paid_at, !!assignment.is_preview]
+    );
+    await pool.query(
       `INSERT INTO order_item_status_events(order_item_id,event_type,label,details)
        VALUES ($1,'local_driver_payment_confirmed','Local driver confirmed delivery-fee payment',$2)`,
       [assignment.order_item_id, JSON.stringify({ assignmentId: assignment.id })]
@@ -9898,6 +10038,20 @@ app.post("/delivery-assignments/:id/mark-paid", authenticate, rejectAdminMarketp
       [reference, assignment.id]
     );
     await client.query(
+      `INSERT INTO local_driver_payout_records(
+         delivery_assignment_id,order_item_id,order_id,seller_id,amount,payment_method,status,
+         payment_reference,seller_marked_paid_at,driver_confirmed_paid_at,is_preview,updated_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,'seller_marked_paid',$7,NOW(),$8,$9,NOW())
+       ON CONFLICT (delivery_assignment_id) DO UPDATE SET
+         amount=EXCLUDED.amount,payment_method=EXCLUDED.payment_method,
+         status=CASE WHEN local_driver_payout_records.status='confirmed' THEN 'confirmed' ELSE 'seller_marked_paid' END,
+         payment_reference=EXCLUDED.payment_reference,
+         seller_marked_paid_at=COALESCE(local_driver_payout_records.seller_marked_paid_at,NOW()),updated_at=NOW()`,
+      [assignment.id, assignment.order_item_id, assignment.order_id, assignment.seller_id,
+       assignment.delivery_fee, assignment.payment_method, reference || null,
+       assignment.driver_confirmed_paid_at, !!assignment.is_preview]
+    );
+    await client.query(
       `INSERT INTO order_item_status_events(order_item_id,event_type,label,details)
        VALUES ($1,'local_driver_fee_marked_paid','Seller marked the local-driver fee paid',$2)`,
       [assignment.order_item_id, JSON.stringify({ assignmentId: assignment.id, method: assignment.payment_method })]
@@ -9917,16 +10071,22 @@ function adminLocalDeliveryPayload(row) {
   let bankName = "";
   let accountName = "";
   let accountNumber = "";
+  let driverLegalName = "";
+  let driverIdNumber = "";
   try {
     driverPhone = decryptFieldSafe(row.driver_phone_encrypted) || "";
     bankName = decryptFieldSafe(row.driver_bank_name_encrypted) || "";
     accountName = decryptFieldSafe(row.driver_account_name_encrypted) || "";
     accountNumber = decryptFieldSafe(row.driver_account_number_encrypted) || "";
+    driverLegalName = decryptFieldSafe(row.driver_legal_name_encrypted) || "";
+    driverIdNumber = decryptFieldSafe(row.driver_id_number_encrypted) || "";
   } catch {
     driverPhone = "";
     bankName = "";
     accountName = "";
     accountNumber = "";
+    driverLegalName = "";
+    driverIdNumber = "";
   }
   return {
     id: row.id,
@@ -9940,12 +10100,27 @@ function adminLocalDeliveryPayload(row) {
     buyerDisplayName: row.buyer_display_name || "",
     driverName: row.driver_name,
     driverPhone,
+    driverLegalName,
+    driverIdType: row.driver_id_type || "",
+    driverIdLast4: driverIdNumber ? driverIdNumber.slice(-4) : "",
+    driverIdentitySelfieUrl: row.driver_identity_selfie_url || "",
+    driverIdentityStatus: row.driver_identity_status || "not_submitted",
+    driverIdentitySubmittedAt: row.driver_identity_submitted_at,
+    driverIdentityReviewedAt: row.driver_identity_reviewed_at,
+    driverIdentityAdminNote: row.driver_identity_admin_note || "",
+    identitySubmitted: Boolean(
+      row.driver_legal_name_encrypted &&
+      row.driver_id_type &&
+      row.driver_id_number_encrypted &&
+      row.driver_identity_selfie_url
+    ),
     itemTitle: row.item_title || "",
     packageDescription: row.package_description || "",
     deliveryFee: Number(row.delivery_fee || 0),
     paymentMethod: row.payment_method,
     paymentStatus: row.payment_status || "pending",
     paymentReference: row.seller_payment_reference || "",
+    sellerPaymentReference: row.seller_payment_reference || "",
     bankName,
     accountName,
     accountNumberLast4: accountNumber ? accountNumber.slice(-4) : "",
@@ -9959,6 +10134,10 @@ function adminLocalDeliveryPayload(row) {
     deliveredAt: row.delivered_at,
     sellerMarkedPaidAt: row.seller_marked_paid_at,
     driverConfirmedPaidAt: row.driver_confirmed_paid_at,
+    payoutRecordId: row.payout_record_id || null,
+    payoutRecordStatus: row.payout_record_status || row.payment_status || "pending",
+    payoutRecordCreatedAt: row.payout_record_created_at || null,
+    payoutRecordUpdatedAt: row.payout_record_updated_at || null,
     accessExpiresAt: row.access_expires_at,
     revokedAt: row.revoked_at,
     openReportCount: Number(row.open_report_count || 0),
@@ -9973,6 +10152,8 @@ app.get("/admin/local-deliveries", authenticate, requirePermission("seller_repor
       `SELECT da.*,oi.title AS item_title,oi.fulfillment_status,oi.proof_of_delivery_url,
               seller.username AS seller_username,seller.display_name AS seller_display_name,
               buyer.username AS buyer_username,buyer.display_name AS buyer_display_name,
+              ldp.id AS payout_record_id,ldp.status AS payout_record_status,
+              ldp.created_at AS payout_record_created_at,ldp.updated_at AS payout_record_updated_at,
               (SELECT COUNT(*)::int FROM local_delivery_reports ldr
                WHERE ldr.delivery_assignment_id=da.id AND ldr.status IN ('open','in_review')) AS open_report_count
        FROM delivery_assignments da
@@ -9980,6 +10161,7 @@ app.get("/admin/local-deliveries", authenticate, requirePermission("seller_repor
        JOIN orders o ON o.id=da.order_id
        JOIN users seller ON seller.id=da.seller_id
        JOIN users buyer ON buyer.id=o.buyer_id
+       LEFT JOIN local_driver_payout_records ldp ON ldp.delivery_assignment_id=da.id
        WHERE da.is_preview=false AND COALESCE(o.is_preview,false)=false
        ORDER BY CASE WHEN da.status NOT IN ('delivered','revoked') THEN 0 ELSE 1 END,
                 da.updated_at DESC
@@ -9988,6 +10170,58 @@ app.get("/admin/local-deliveries", authenticate, requirePermission("seller_repor
     res.json({ deliveries: result.rows.map(adminLocalDeliveryPayload) });
   } catch (err) {
     sendInternalError(res, err, "load admin local deliveries");
+  }
+});
+
+app.patch("/admin/local-deliveries/:id/identity", authenticate, requirePermission("seller_report_review"), async (req, res) => {
+  try {
+    const status = String(req.body?.status || "").trim();
+    const adminNote = String(req.body?.adminNote || "").trim().slice(0, 1000);
+    if (!["approved", "rejected"].includes(status)) {
+      return res.status(400).json({ error: "Select approved or rejected." });
+    }
+    if (status === "rejected" && adminNote.length < 5) {
+      return res.status(400).json({ error: "Explain why the driver identity was rejected." });
+    }
+    const result = await pool.query(
+      `UPDATE delivery_assignments
+       SET driver_identity_status=$1,driver_identity_admin_note=$2,
+           driver_identity_reviewed_at=NOW(),driver_identity_reviewed_by=$3,updated_at=NOW()
+       WHERE id=$4 AND is_preview=false
+         AND driver_identity_status IN ('pending','approved','rejected')
+       RETURNING id,order_item_id,order_id,seller_id,driver_identity_status,
+                 driver_identity_admin_note,driver_identity_reviewed_at`,
+      [status, adminNote || null, req.user.id, req.params.id]
+    );
+    if (!result.rows.length) {
+      return res.status(404).json({ error: "Submitted driver identity was not found." });
+    }
+    const row = result.rows[0];
+    await pool.query(
+      `INSERT INTO order_item_status_events(order_item_id,event_type,label,details)
+       VALUES ($1,$2,$3,$4)`,
+      [row.order_item_id, `local_driver_identity_${status}`,
+       `Local driver identity ${status}`,
+       JSON.stringify({ assignmentId: row.id, adminNote: adminNote || null })]
+    ).catch(() => {});
+    await createNotification(
+      row.seller_id,
+      `local_driver_identity_${status}`,
+      status === "approved"
+        ? `The driver identity for order STY-${String(row.order_id).padStart(6, "0")} was approved.`
+        : `The driver identity for order STY-${String(row.order_id).padStart(6, "0")} was rejected. Review the delivery assignment before continuing.`
+    );
+    logAdminAction(req.user.id, `local_driver_identity_${status}`, `Marked local driver identity for assignment #${row.id} ${status}`);
+    res.json({
+      identity: {
+        assignmentId: row.id,
+        status: row.driver_identity_status,
+        adminNote: row.driver_identity_admin_note || "",
+        reviewedAt: row.driver_identity_reviewed_at,
+      },
+    });
+  } catch (err) {
+    sendInternalError(res, err, "review local driver identity");
   }
 });
 
@@ -10140,6 +10374,15 @@ app.post("/order-items/:id/delivery-assignment", authenticate, rejectAdminMarket
          driver_bank_name_encrypted=NULL,
          driver_account_name_encrypted=NULL,
          driver_account_number_encrypted=NULL,
+         driver_legal_name_encrypted=NULL,
+         driver_id_type=NULL,
+         driver_id_number_encrypted=NULL,
+         driver_identity_selfie_url=NULL,
+         driver_identity_status='not_submitted',
+         driver_identity_submitted_at=NULL,
+         driver_identity_reviewed_at=NULL,
+         driver_identity_reviewed_by=NULL,
+         driver_identity_admin_note=NULL,
          payment_status='pending',
          seller_marked_paid_at=NULL,
          seller_payment_reference=NULL,
@@ -10164,6 +10407,21 @@ app.post("/order-items/:id/delivery-assignment", authenticate, rejectAdminMarket
         !!item.is_preview,
       ]
     );
+
+    await pool.query(
+      `INSERT INTO local_driver_payout_records(
+         delivery_assignment_id,order_item_id,order_id,seller_id,amount,payment_method,status,is_preview,updated_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,NOW())
+       ON CONFLICT (delivery_assignment_id) DO UPDATE SET
+         order_item_id=EXCLUDED.order_item_id,order_id=EXCLUDED.order_id,seller_id=EXCLUDED.seller_id,
+         amount=EXCLUDED.amount,payment_method=EXCLUDED.payment_method,status='pending',
+         payment_reference=NULL,seller_marked_paid_at=NULL,driver_confirmed_paid_at=NULL,
+         is_preview=EXCLUDED.is_preview,updated_at=NOW()`,
+      [assignment.rows[0].id, item.id, item.order_id, req.user.id,
+       deliveryFee.toFixed(2), paymentMethod, !!item.is_preview]
+    ).catch((payoutRecordError) => {
+      console.error("Local driver assignment saved, but payout record could not be initialized:", payoutRecordError?.message || payoutRecordError);
+    });
 
     // A status-history write must never prevent the seller from receiving the
     // one-time driver link and activation code after the assignment itself was
