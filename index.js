@@ -3236,6 +3236,11 @@ const SCHEMA_MIGRATIONS = [
        ADD COLUMN IF NOT EXISTS driver_user_id INTEGER REFERENCES users(id),
        ADD COLUMN IF NOT EXISTS local_delivery_job_id BIGINT REFERENCES local_delivery_jobs(id)`,
   ] },
+  { version: 89, name: "registered-driver-lga", statements: [
+    `ALTER TABLE driver_profiles ADD COLUMN IF NOT EXISTS lga TEXT NOT NULL DEFAULT ''`,
+    `CREATE INDEX IF NOT EXISTS idx_driver_profiles_service_area
+       ON driver_profiles(state,lga,city,is_available,verification_status)`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -9799,6 +9804,7 @@ async function registeredDriverProfilePayload(row, includeEvidence = false) {
     legalName,
     phone,
     state: row.state || "",
+    lga: row.lga || "",
     city: row.city || "",
     vehicleType: row.vehicle_type || "",
     vehicleDescription: row.vehicle_description || "",
@@ -9869,6 +9875,7 @@ app.patch("/driver/profile", authenticate, rejectAdminMarketplaceUse, async (req
     const legalName = String(req.body?.legalName || "").trim().replace(/\s+/g, " ");
     const phone = normalizeNigerianPhone(req.body?.phone);
     const state = String(req.body?.state || "").trim().slice(0, 80);
+    const lga = String(req.body?.lga || "").trim().slice(0, 120);
     const city = String(req.body?.city || "").trim().slice(0, 80);
     const vehicleType = String(req.body?.vehicleType || "").trim().slice(0, 50);
     const vehicleDescription = String(req.body?.vehicleDescription || "").trim().slice(0, 200);
@@ -9880,33 +9887,41 @@ app.patch("/driver/profile", authenticate, rejectAdminMarketplaceUse, async (req
     const allowedVehicleTypes = new Set(["motorcycle","car","van","truck","bicycle","on_foot"]);
     if (!allowedVehicleTypes.has(vehicleType)) return res.status(400).json({ error: "Select an accepted delivery vehicle type." });
     if (currentProfile && ["approved","suspended"].includes(currentProfile.verification_status)) {
+      const needsLegacyLga = !String(currentProfile.lga || "").trim();
+      if (needsLegacyLga && !lga) {
+        return res.status(400).json({ error: "Select your Local Government Area once to complete your service area." });
+      }
       const result = await pool.query(
         `UPDATE driver_profiles SET vehicle_type=$1,vehicle_description=$2,
-           license_plate_encrypted=$3,is_available=$4,updated_at=NOW()
-         WHERE user_id=$5 RETURNING *`,
-        [vehicleType,vehicleDescription,licensePlate ? encryptField(licensePlate) : null,isAvailable,req.user.id]
+           license_plate_encrypted=$3,
+           lga=CASE WHEN COALESCE(lga,'')='' THEN $4 ELSE lga END,
+           is_available=$5,updated_at=NOW()
+         WHERE user_id=$6 RETURNING *`,
+        [vehicleType,vehicleDescription,licensePlate ? encryptField(licensePlate) : null,lga,isAvailable,req.user.id]
       );
       return res.json({
         profile: await registeredDriverProfilePayload(result.rows[0], true),
         lockedFields: true,
-        message: "Vehicle and availability updated. Approved identity, contact, service-area, and payment details remain locked.",
+        message: needsLegacyLga
+          ? "LGA saved. Your approved service area is now locked."
+          : "Vehicle and availability updated. Approved identity, contact, service-area, and payment details remain locked.",
       });
     }
     if (legalName.length < 3) return res.status(400).json({ error: "Enter your full legal name." });
     if (!phone) return res.status(400).json({ error: "Enter a valid Nigerian phone number." });
-    if (!state || !city) return res.status(400).json({ error: "Select your service state and city." });
+    if (!state || !lga || !city) return res.status(400).json({ error: "Select your service state and LGA, then enter your city or town." });
     if ((bankName || accountName || accountNumber) && (!bankName || !accountName || accountNumber.length !== 10)) {
       return res.status(400).json({ error: "Complete all bank fields using a 10-digit account number, or leave all bank fields blank." });
     }
     const result = await pool.query(
       `INSERT INTO driver_profiles(
-         user_id,legal_name_encrypted,phone_encrypted,state,city,vehicle_type,
+         user_id,legal_name_encrypted,phone_encrypted,state,lga,city,vehicle_type,
          vehicle_description,license_plate_encrypted,bank_name_encrypted,
          account_name_encrypted,account_number_encrypted,is_available,is_preview,updated_at
-       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
+       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW())
        ON CONFLICT(user_id) DO UPDATE SET
          legal_name_encrypted=EXCLUDED.legal_name_encrypted,phone_encrypted=EXCLUDED.phone_encrypted,
-         state=EXCLUDED.state,city=EXCLUDED.city,vehicle_type=EXCLUDED.vehicle_type,
+         state=EXCLUDED.state,lga=EXCLUDED.lga,city=EXCLUDED.city,vehicle_type=EXCLUDED.vehicle_type,
          vehicle_description=EXCLUDED.vehicle_description,
          license_plate_encrypted=COALESCE(EXCLUDED.license_plate_encrypted,driver_profiles.license_plate_encrypted),
          bank_name_encrypted=COALESCE(EXCLUDED.bank_name_encrypted,driver_profiles.bank_name_encrypted),
@@ -9914,7 +9929,7 @@ app.patch("/driver/profile", authenticate, rejectAdminMarketplaceUse, async (req
          account_number_encrypted=COALESCE(EXCLUDED.account_number_encrypted,driver_profiles.account_number_encrypted),
          is_available=EXCLUDED.is_available,updated_at=NOW()
        RETURNING *`,
-      [req.user.id, encryptField(legalName), encryptField(phone), state, city, vehicleType,
+      [req.user.id, encryptField(legalName), encryptField(phone), state, lga, city, vehicleType,
        vehicleDescription, licensePlate ? encryptField(licensePlate) : null,
        bankName ? encryptField(bankName) : null, accountName ? encryptField(accountName) : null,
        accountNumber ? encryptField(accountNumber) : null, isAvailable, !!req.user.isPreview]
