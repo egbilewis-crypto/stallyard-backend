@@ -3165,6 +3165,77 @@ const SCHEMA_MIGRATIONS = [
     `ALTER TABLE delivery_assignments
        ADD COLUMN IF NOT EXISTS driver_id_document_url TEXT`,
   ] },
+  { version: 88, name: "registered-driver-marketplace", statements: [
+    `CREATE TABLE IF NOT EXISTS driver_profiles (
+       id BIGSERIAL PRIMARY KEY,
+       user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+       legal_name_encrypted TEXT,
+       phone_encrypted TEXT,
+       state TEXT NOT NULL DEFAULT '',
+       city TEXT NOT NULL DEFAULT '',
+       vehicle_type TEXT NOT NULL DEFAULT '',
+       vehicle_description TEXT NOT NULL DEFAULT '',
+       license_plate_encrypted TEXT,
+       id_type TEXT,
+       id_number_encrypted TEXT,
+       identity_selfie_path TEXT,
+       id_document_path TEXT,
+       verification_status TEXT NOT NULL DEFAULT 'draft',
+       verification_submitted_at TIMESTAMP,
+       verification_reviewed_at TIMESTAMP,
+       verification_reviewed_by INTEGER REFERENCES users(id),
+       verification_admin_note TEXT,
+       bank_name_encrypted TEXT,
+       account_name_encrypted TEXT,
+       account_number_encrypted TEXT,
+       completed_deliveries INTEGER NOT NULL DEFAULT 0,
+       average_rating NUMERIC(3,2) NOT NULL DEFAULT 0,
+       is_available BOOLEAN NOT NULL DEFAULT TRUE,
+       is_preview BOOLEAN NOT NULL DEFAULT FALSE,
+       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_driver_profiles_marketplace
+       ON driver_profiles(verification_status,is_available,state,city,updated_at DESC)`,
+    `CREATE TABLE IF NOT EXISTS local_delivery_jobs (
+       id BIGSERIAL PRIMARY KEY,
+       order_item_id INTEGER NOT NULL UNIQUE REFERENCES order_items(id) ON DELETE CASCADE,
+       order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+       seller_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+       pickup_address TEXT NOT NULL,
+       pickup_city TEXT NOT NULL,
+       pickup_state TEXT NOT NULL,
+       delivery_city TEXT NOT NULL DEFAULT '',
+       delivery_state TEXT NOT NULL DEFAULT '',
+       delivery_fee NUMERIC(12,2) NOT NULL,
+       payment_method TEXT NOT NULL,
+       pickup_at TIMESTAMP,
+       delivery_due_at TIMESTAMP,
+       package_description TEXT NOT NULL DEFAULT '',
+       status TEXT NOT NULL DEFAULT 'open',
+       selected_driver_user_id INTEGER REFERENCES users(id),
+       delivery_assignment_id BIGINT REFERENCES delivery_assignments(id),
+       is_preview BOOLEAN NOT NULL DEFAULT FALSE,
+       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_local_delivery_jobs_board
+       ON local_delivery_jobs(status,pickup_state,pickup_city,created_at DESC)`,
+    `CREATE TABLE IF NOT EXISTS local_delivery_job_requests (
+       id BIGSERIAL PRIMARY KEY,
+       job_id BIGINT NOT NULL REFERENCES local_delivery_jobs(id) ON DELETE CASCADE,
+       driver_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+       status TEXT NOT NULL DEFAULT 'requested',
+       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+       updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+       UNIQUE(job_id,driver_user_id)
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_local_delivery_job_requests_driver
+       ON local_delivery_job_requests(driver_user_id,status,updated_at DESC)`,
+    `ALTER TABLE delivery_assignments
+       ADD COLUMN IF NOT EXISTS driver_user_id INTEGER REFERENCES users(id),
+       ADD COLUMN IF NOT EXISTS local_delivery_job_id BIGINT REFERENCES local_delivery_jobs(id)`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -9539,6 +9610,9 @@ async function publicDriverAssignmentPayload(row) {
       row.driver_account_name_encrypted &&
       row.driver_account_number_encrypted
     ),
+    pickupAddress: row.pickup_address || "",
+    pickupCity: row.pickup_city || "",
+    pickupState: row.pickup_state || "",
     pickupAt: row.pickup_at,
     deliveryDueAt: row.delivery_due_at,
     packageDescription: row.package_description || "",
@@ -9561,10 +9635,12 @@ async function findDriverAssignmentByAccessToken(accessToken) {
   const result = await pool.query(
     `SELECT da.*, oi.title AS item_title, oi.fulfillment_status, oi.carrier,
             oi.proof_of_delivery_url,
-            o.shipping_address, o.payment_status AS order_payment_status
+            o.shipping_address, o.payment_status AS order_payment_status,
+            j.pickup_address,j.pickup_city,j.pickup_state
      FROM delivery_assignments da
      JOIN order_items oi ON oi.id=da.order_item_id
      JOIN orders o ON o.id=da.order_id
+     LEFT JOIN local_delivery_jobs j ON j.id=da.local_delivery_job_id
      WHERE da.access_token_hash=$1
      LIMIT 1`,
     [deliveryAccessHash(accessToken)]
@@ -9692,6 +9768,278 @@ function validDriverProof(value) {
 }
 
 const LOCAL_DRIVER_ID_TYPES = new Set(["nin", "drivers_license", "passport", "pvc"]);
+
+async function registeredDriverProfilePayload(row, includeEvidence = false) {
+  if (!row) return null;
+  let legalName = "";
+  let phone = "";
+  let idNumber = "";
+  let bankName = "";
+  let accountName = "";
+  let accountNumber = "";
+  let licensePlate = "";
+  try {
+    legalName = decryptFieldSafe(row.legal_name_encrypted) || "";
+    phone = decryptFieldSafe(row.phone_encrypted) || "";
+    idNumber = decryptFieldSafe(row.id_number_encrypted) || "";
+    bankName = decryptFieldSafe(row.bank_name_encrypted) || "";
+    accountName = decryptFieldSafe(row.account_name_encrypted) || "";
+    accountNumber = decryptFieldSafe(row.account_number_encrypted) || "";
+    licensePlate = decryptFieldSafe(row.license_plate_encrypted) || "";
+  } catch {}
+  const evidence = includeEvidence ? await Promise.all([
+    createPrivateVerificationSignedUrl(row.identity_selfie_path).catch(() => ""),
+    createPrivateVerificationSignedUrl(row.id_document_path).catch(() => ""),
+  ]) : ["", ""];
+  return {
+    id: row.id,
+    userId: row.user_id,
+    username: row.username || "",
+    displayName: row.display_name || "",
+    legalName,
+    phone,
+    state: row.state || "",
+    city: row.city || "",
+    vehicleType: row.vehicle_type || "",
+    vehicleDescription: row.vehicle_description || "",
+    licensePlate,
+    idType: row.id_type || "",
+    idLast4: idNumber ? idNumber.slice(-4) : "",
+    verificationStatus: row.verification_status || "draft",
+    verificationSubmittedAt: row.verification_submitted_at,
+    verificationReviewedAt: row.verification_reviewed_at,
+    verificationAdminNote: row.verification_admin_note || "",
+    identitySelfieUrl: evidence[0],
+    idDocumentUrl: evidence[1],
+    bankName,
+    accountName,
+    accountNumberLast4: accountNumber ? accountNumber.slice(-4) : "",
+    hasBankDetails: Boolean(bankName && accountName && accountNumber),
+    completedDeliveries: Number(row.completed_deliveries || 0),
+    averageRating: Number(row.average_rating || 0),
+    isAvailable: row.is_available !== false,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function registeredDriverJobPayload(row, includePrivate = false) {
+  return {
+    id: row.id,
+    orderItemId: row.order_item_id,
+    orderId: row.order_id,
+    orderNumber: `STY-${String(row.order_id).padStart(6, "0")}`,
+    itemTitle: row.item_title || "",
+    sellerUsername: row.seller_username || "",
+    pickupAddress: includePrivate ? row.pickup_address : "",
+    pickupCity: row.pickup_city,
+    pickupState: row.pickup_state,
+    deliveryCity: row.delivery_city,
+    deliveryState: row.delivery_state,
+    deliveryFee: Number(row.delivery_fee || 0),
+    paymentMethod: row.payment_method,
+    pickupAt: row.pickup_at,
+    deliveryDueAt: row.delivery_due_at,
+    packageDescription: row.package_description || row.item_title || "",
+    status: row.status,
+    selectedDriverUserId: row.selected_driver_user_id,
+    deliveryAssignmentId: row.delivery_assignment_id,
+    requestStatus: row.request_status || "",
+    requestCount: Number(row.request_count || 0),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+app.get("/driver/profile", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT dp.*,u.username,u.display_name FROM driver_profiles dp
+       JOIN users u ON u.id=dp.user_id WHERE dp.user_id=$1`,
+      [req.user.id]
+    );
+    res.json({ profile: result.rows.length ? await registeredDriverProfilePayload(result.rows[0], true) : null });
+  } catch (err) { sendInternalError(res, err, "load registered driver profile"); }
+});
+
+app.patch("/driver/profile", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  try {
+    const legalName = String(req.body?.legalName || "").trim().replace(/\s+/g, " ");
+    const phone = normalizeNigerianPhone(req.body?.phone);
+    const state = String(req.body?.state || "").trim().slice(0, 80);
+    const city = String(req.body?.city || "").trim().slice(0, 80);
+    const vehicleType = String(req.body?.vehicleType || "").trim().slice(0, 50);
+    const vehicleDescription = String(req.body?.vehicleDescription || "").trim().slice(0, 200);
+    const licensePlate = String(req.body?.licensePlate || "").trim().toUpperCase().slice(0, 30);
+    const bankName = String(req.body?.bankName || "").trim().slice(0, 100);
+    const accountName = String(req.body?.accountName || "").trim().slice(0, 120);
+    const accountNumber = String(req.body?.accountNumber || "").replace(/\D/g, "").slice(0, 10);
+    const isAvailable = req.body?.isAvailable !== false;
+    if (legalName.length < 3) return res.status(400).json({ error: "Enter your full legal name." });
+    if (!phone) return res.status(400).json({ error: "Enter a valid Nigerian phone number." });
+    if (!state || !city) return res.status(400).json({ error: "Select your service state and city." });
+    if (!vehicleType) return res.status(400).json({ error: "Select your delivery vehicle type." });
+    if ((bankName || accountName || accountNumber) && (!bankName || !accountName || accountNumber.length !== 10)) {
+      return res.status(400).json({ error: "Complete all bank fields using a 10-digit account number, or leave all bank fields blank." });
+    }
+    const result = await pool.query(
+      `INSERT INTO driver_profiles(
+         user_id,legal_name_encrypted,phone_encrypted,state,city,vehicle_type,
+         vehicle_description,license_plate_encrypted,bank_name_encrypted,
+         account_name_encrypted,account_number_encrypted,is_available,is_preview,updated_at
+       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
+       ON CONFLICT(user_id) DO UPDATE SET
+         legal_name_encrypted=EXCLUDED.legal_name_encrypted,phone_encrypted=EXCLUDED.phone_encrypted,
+         state=EXCLUDED.state,city=EXCLUDED.city,vehicle_type=EXCLUDED.vehicle_type,
+         vehicle_description=EXCLUDED.vehicle_description,
+         license_plate_encrypted=COALESCE(EXCLUDED.license_plate_encrypted,driver_profiles.license_plate_encrypted),
+         bank_name_encrypted=COALESCE(EXCLUDED.bank_name_encrypted,driver_profiles.bank_name_encrypted),
+         account_name_encrypted=COALESCE(EXCLUDED.account_name_encrypted,driver_profiles.account_name_encrypted),
+         account_number_encrypted=COALESCE(EXCLUDED.account_number_encrypted,driver_profiles.account_number_encrypted),
+         is_available=EXCLUDED.is_available,updated_at=NOW()
+       RETURNING *`,
+      [req.user.id, encryptField(legalName), encryptField(phone), state, city, vehicleType,
+       vehicleDescription, licensePlate ? encryptField(licensePlate) : null,
+       bankName ? encryptField(bankName) : null, accountName ? encryptField(accountName) : null,
+       accountNumber ? encryptField(accountNumber) : null, isAvailable, !!req.user.isPreview]
+    );
+    res.json({ profile: await registeredDriverProfilePayload(result.rows[0], true) });
+  } catch (err) { sendInternalError(res, err, "save registered driver profile"); }
+});
+
+app.post("/driver/profile/identity", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  const uploadedPaths = [];
+  try {
+    const current = await pool.query("SELECT * FROM driver_profiles WHERE user_id=$1", [req.user.id]);
+    if (!current.rows.length) return res.status(409).json({ error: "Save your driver profile before submitting identity." });
+    if (current.rows[0].verification_status === "approved") return res.status(409).json({ error: "Your driver identity is already approved." });
+    const idType = String(req.body?.idType || "").trim();
+    const idNumber = String(req.body?.idNumber || "").trim().toUpperCase();
+    if (!LOCAL_DRIVER_ID_TYPES.has(idType)) return res.status(400).json({ error: "Select an accepted identity document." });
+    if (!/^[A-Z0-9][A-Z0-9\-/ ]{3,29}$/.test(idNumber)) return res.status(400).json({ error: "Enter a valid identity-document number." });
+    let selfie;
+    let document;
+    try {
+      selfie = parseVerificationJpeg(req.body?.liveSelfie, "Live driver selfie");
+      document = parseVerificationJpeg(req.body?.idDocumentPhoto, "Driver ID document");
+    } catch (imageError) {
+      return res.status(imageError.statusCode || 400).json({ error: imageError.message });
+    }
+    await ensurePrivateVerificationBucket();
+    const root = `registered-driver/user-${req.user.id}/${Date.now()}-${crypto.randomBytes(6).toString("hex")}`;
+    const selfiePath = `${root}-selfie-${selfie.sha256.slice(0, 12)}.jpg`;
+    const documentPath = `${root}-id-${document.sha256.slice(0, 12)}.jpg`;
+    await uploadPrivateVerificationObject(selfiePath, selfie.buffer); uploadedPaths.push(selfiePath);
+    await uploadPrivateVerificationObject(documentPath, document.buffer); uploadedPaths.push(documentPath);
+    const result = await pool.query(
+      `UPDATE driver_profiles SET id_type=$1,id_number_encrypted=$2,identity_selfie_path=$3,
+         id_document_path=$4,verification_status='pending',verification_submitted_at=NOW(),
+         verification_reviewed_at=NULL,verification_reviewed_by=NULL,verification_admin_note=NULL,updated_at=NOW()
+       WHERE user_id=$5 RETURNING *`,
+      [idType, encryptField(idNumber), selfiePath, documentPath, req.user.id]
+    );
+    await Promise.all([current.rows[0].identity_selfie_path,current.rows[0].id_document_path]
+      .filter((path) => path && !String(path).startsWith("data:image/"))
+      .map((path) => deletePrivateVerificationObject(path))).catch(() => {});
+    res.json({ profile: await registeredDriverProfilePayload(result.rows[0], true) });
+  } catch (err) {
+    await Promise.all(uploadedPaths.map((path) => deletePrivateVerificationObject(path))).catch(() => {});
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
+    sendInternalError(res, err, "submit registered driver identity");
+  }
+});
+
+app.get("/driver/jobs", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  try {
+    const profile = await pool.query("SELECT * FROM driver_profiles WHERE user_id=$1", [req.user.id]);
+    if (!profile.rows.length) return res.status(409).json({ error: "Create your driver profile first." });
+    const result = await pool.query(
+      `SELECT j.*,oi.title AS item_title,seller.username AS seller_username,r.status AS request_status
+       FROM local_delivery_jobs j
+       JOIN order_items oi ON oi.id=j.order_item_id
+       JOIN users seller ON seller.id=j.seller_id
+       LEFT JOIN local_delivery_job_requests r ON r.job_id=j.id AND r.driver_user_id=$1
+       WHERE j.status='open' AND j.is_preview=$2
+         AND (LOWER(j.pickup_state)=LOWER($3) OR $3='')
+       ORDER BY CASE WHEN LOWER(j.pickup_city)=LOWER($4) THEN 0 ELSE 1 END,j.created_at DESC
+       LIMIT 100`,
+      [req.user.id, !!req.user.isPreview, profile.rows[0].state || "", profile.rows[0].city || ""]
+    );
+    res.json({ jobs: result.rows.map((row) => registeredDriverJobPayload(row, false)) });
+  } catch (err) { sendInternalError(res, err, "load driver job board"); }
+});
+
+app.post("/driver/jobs/:id/request", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  try {
+    const profile = await pool.query("SELECT verification_status,is_available FROM driver_profiles WHERE user_id=$1", [req.user.id]);
+    if (!profile.rows.length || profile.rows[0].verification_status !== "approved") {
+      return res.status(403).json({ error: "Your driver identity must be approved before requesting jobs." });
+    }
+    if (!profile.rows[0].is_available) return res.status(409).json({ error: "Set your driver profile to available before requesting jobs." });
+    const result = await pool.query(
+      `INSERT INTO local_delivery_job_requests(job_id,driver_user_id,status)
+       SELECT id,$1,'requested' FROM local_delivery_jobs
+       WHERE id=$2 AND status='open' AND is_preview=$3
+       ON CONFLICT(job_id,driver_user_id) DO UPDATE SET status='requested',updated_at=NOW()
+       RETURNING *`,
+      [req.user.id, req.params.id, !!req.user.isPreview]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: "This delivery job is no longer available." });
+    res.status(201).json({ request: result.rows[0] });
+  } catch (err) { sendInternalError(res, err, "request local delivery job"); }
+});
+
+app.get("/driver/dashboard", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  try {
+    const [profileResult,requestResult,assignmentResult] = await Promise.all([
+      pool.query(`SELECT dp.*,u.username,u.display_name FROM driver_profiles dp JOIN users u ON u.id=dp.user_id WHERE dp.user_id=$1`, [req.user.id]),
+      pool.query(`SELECT r.*,j.pickup_city,j.pickup_state,j.delivery_city,j.delivery_state,j.delivery_fee,j.payment_method,j.status AS job_status,oi.title AS item_title
+                  FROM local_delivery_job_requests r JOIN local_delivery_jobs j ON j.id=r.job_id JOIN order_items oi ON oi.id=j.order_item_id
+                  WHERE r.driver_user_id=$1 ORDER BY r.updated_at DESC LIMIT 100`, [req.user.id]),
+      pool.query(`SELECT da.*,oi.title AS item_title,oi.fulfillment_status,oi.proof_of_delivery_url,
+                         j.pickup_address,j.pickup_city,j.pickup_state,j.delivery_city,j.delivery_state
+                  FROM delivery_assignments da JOIN order_items oi ON oi.id=da.order_item_id
+                  LEFT JOIN local_delivery_jobs j ON j.id=da.local_delivery_job_id
+                  WHERE da.driver_user_id=$1 ORDER BY da.updated_at DESC LIMIT 100`, [req.user.id]),
+    ]);
+    const profile = profileResult.rows.length ? await registeredDriverProfilePayload(profileResult.rows[0], true) : null;
+    const requests = requestResult.rows.map((row) => ({
+      id: row.id, jobId: row.job_id, status: row.status, jobStatus: row.job_status,
+      pickupCity: row.pickup_city, pickupState: row.pickup_state,
+      deliveryCity: row.delivery_city, deliveryState: row.delivery_state,
+      deliveryFee: Number(row.delivery_fee || 0), paymentMethod: row.payment_method,
+      itemTitle: row.item_title, updatedAt: row.updated_at,
+    }));
+    const assignments = assignmentResult.rows.map((row) => ({
+      id: row.id, orderId: row.order_id, orderNumber: `STY-${String(row.order_id).padStart(6,"0")}`,
+      itemTitle: row.item_title, status: row.status, deliveryFee: Number(row.delivery_fee || 0),
+      paymentMethod: row.payment_method, paymentStatus: row.payment_status,
+      pickupAddress: row.pickup_address || "", pickupCity: row.pickup_city || "", pickupState: row.pickup_state || "",
+      deliveryCity: row.delivery_city || "", deliveryState: row.delivery_state || "",
+      deliveredAt: row.delivered_at, driverConfirmedPaidAt: row.driver_confirmed_paid_at,
+    }));
+    res.json({ profile, requests, assignments });
+  } catch (err) { sendInternalError(res, err, "load registered driver dashboard"); }
+});
+
+app.post("/driver/assignments/:id/access", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  try {
+    const { accessToken, accessTokenHash } = newDeliveryAccessCredentials();
+    const result = await pool.query(
+      `UPDATE delivery_assignments SET access_token_hash=$1,activation_code_hash=NULL,
+         access_expires_at=GREATEST(access_expires_at,NOW() + INTERVAL '24 hours'),updated_at=NOW()
+       WHERE id=$2 AND driver_user_id=$3 AND status NOT IN ('revoked','cancelled','returned')
+       RETURNING id,access_expires_at`,
+      [accessTokenHash, req.params.id, req.user.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: "Driver assignment not found or no longer active." });
+    const expiresInSeconds = Math.max(60, Math.floor((new Date(result.rows[0].access_expires_at).getTime() - Date.now()) / 1000));
+    const sessionToken = jwt.sign({
+      scope: "delivery_driver", deliveryAssignmentId: Number(result.rows[0].id), driverAccessHash: accessTokenHash,
+    }, JWT_SECRET, { expiresIn: expiresInSeconds });
+    res.json({ accessPath: `/driver/delivery/${accessToken}`, sessionToken });
+  } catch (err) { sendInternalError(res, err, "open registered driver assignment"); }
+});
 
 app.patch("/driver-deliveries/:accessToken/identity", async (req, res) => {
   try {
@@ -9905,13 +10253,24 @@ app.patch("/driver-deliveries/:accessToken/status", async (req, res) => {
        VALUES ($1,$2,$3,$4)`,
       [assignment.order_item_id, `local_driver_${action}`, eventLabel, JSON.stringify({ assignmentId: assignment.id })]
     );
+    if (action === "delivered" && assignment.driver_user_id) {
+      await client.query(
+        "UPDATE driver_profiles SET completed_deliveries=completed_deliveries+1,updated_at=NOW() WHERE user_id=$1",
+        [assignment.driver_user_id]
+      );
+      if (assignment.local_delivery_job_id) {
+        await client.query("UPDATE local_delivery_jobs SET status='completed',updated_at=NOW() WHERE id=$1", [assignment.local_delivery_job_id]);
+      }
+    }
 
     const refreshed = await client.query(
       `SELECT da.*, oi.title AS item_title, oi.fulfillment_status, oi.carrier,
-              oi.proof_of_delivery_url, o.shipping_address, o.payment_status AS order_payment_status
+              oi.proof_of_delivery_url, o.shipping_address, o.payment_status AS order_payment_status,
+              j.pickup_address,j.pickup_city,j.pickup_state
        FROM delivery_assignments da
        JOIN order_items oi ON oi.id=da.order_item_id
        JOIN orders o ON o.id=da.order_id
+       LEFT JOIN local_delivery_jobs j ON j.id=da.local_delivery_job_id
        WHERE da.id=$1`,
       [assignment.id]
     );
@@ -10078,6 +10437,215 @@ app.post("/driver-deliveries/:accessToken/report-seller", async (req, res) => {
   } catch (err) {
     sendInternalError(res, err, "report seller from local driver portal");
   }
+});
+
+app.get("/seller/local-delivery-jobs/eligible-items", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT oi.id,oi.order_id,oi.title,oi.fulfillment_status,oi.carrier,o.shipping_address,o.created_at
+       FROM order_items oi JOIN orders o ON o.id=oi.order_id
+       WHERE oi.seller_id=$1 AND oi.carrier='Local Delivery Driver'
+         AND oi.fulfillment_status NOT IN ('delivered','cancelled','returned')
+         AND o.payment_status<>'refunded'
+       ORDER BY o.created_at DESC LIMIT 100`,
+      [req.user.id]
+    );
+    res.json({ items: result.rows.map((row) => ({
+      id: row.id, orderId: row.order_id, orderNumber: `STY-${String(row.order_id).padStart(6,"0")}`,
+      title: row.title, fulfillmentStatus: row.fulfillment_status, shippingAddress: row.shipping_address || {}, createdAt: row.created_at,
+    })) });
+  } catch (err) { sendInternalError(res, err, "load seller local-delivery job items"); }
+});
+
+app.get("/seller/local-delivery-jobs", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  try {
+    const jobsResult = await pool.query(
+      `SELECT j.*,oi.title AS item_title,
+              (SELECT COUNT(*)::int FROM local_delivery_job_requests r WHERE r.job_id=j.id AND r.status='requested') AS request_count
+       FROM local_delivery_jobs j JOIN order_items oi ON oi.id=j.order_item_id
+       WHERE j.seller_id=$1 ORDER BY j.updated_at DESC LIMIT 100`,
+      [req.user.id]
+    );
+    const jobIds = jobsResult.rows.map((row) => row.id);
+    let requestRows = [];
+    if (jobIds.length) {
+      const requests = await pool.query(
+        `SELECT r.*,dp.state,dp.city,dp.vehicle_type,dp.vehicle_description,dp.completed_deliveries,
+                dp.average_rating,dp.verification_status,u.username,u.display_name
+         FROM local_delivery_job_requests r
+         JOIN local_delivery_jobs j ON j.id=r.job_id
+         JOIN driver_profiles dp ON dp.user_id=r.driver_user_id
+         JOIN users u ON u.id=r.driver_user_id
+         WHERE j.seller_id=$1 AND r.job_id=ANY($2::bigint[])
+         ORDER BY r.created_at ASC`,
+        [req.user.id, jobIds]
+      );
+      requestRows = requests.rows;
+    }
+    const byJob = new Map();
+    for (const row of requestRows) {
+      const list = byJob.get(String(row.job_id)) || [];
+      list.push({
+        id: row.id, driverUserId: row.driver_user_id, status: row.status,
+        username: row.username, displayName: row.display_name || row.username,
+        state: row.state, city: row.city, vehicleType: row.vehicle_type,
+        vehicleDescription: row.vehicle_description, completedDeliveries: Number(row.completed_deliveries || 0),
+        averageRating: Number(row.average_rating || 0), verificationStatus: row.verification_status,
+        createdAt: row.created_at,
+      });
+      byJob.set(String(row.job_id), list);
+    }
+    res.json({ jobs: jobsResult.rows.map((row) => ({ ...registeredDriverJobPayload(row, true), requests: byJob.get(String(row.id)) || [] })) });
+  } catch (err) { sendInternalError(res, err, "load seller local-delivery jobs"); }
+});
+
+app.post("/seller/local-delivery-jobs", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  try {
+    const orderItemId = Number(req.body?.orderItemId);
+    const pickupAddress = String(req.body?.pickupAddress || "").trim().slice(0, 300);
+    const pickupCity = String(req.body?.pickupCity || "").trim().slice(0, 80);
+    const pickupState = String(req.body?.pickupState || "").trim().slice(0, 80);
+    const deliveryFee = Number(req.body?.deliveryFee);
+    const paymentMethod = String(req.body?.paymentMethod || "cash");
+    const pickupAt = req.body?.pickupAt ? new Date(req.body.pickupAt) : null;
+    const deliveryDueAt = req.body?.deliveryDueAt ? new Date(req.body.deliveryDueAt) : null;
+    const packageDescription = String(req.body?.packageDescription || "").trim().slice(0, 500);
+    if (!Number.isInteger(orderItemId)) return res.status(400).json({ error: "Select an order item." });
+    if (pickupAddress.length < 8 || !pickupCity || !pickupState) return res.status(400).json({ error: "Enter the complete pickup address, city, and state." });
+    if (!Number.isFinite(deliveryFee) || deliveryFee <= 0 || deliveryFee > 10000000) return res.status(400).json({ error: "Enter a valid driver fee." });
+    if (!new Set(["cash","bank_transfer"]).has(paymentMethod)) return res.status(400).json({ error: "Select cash or bank transfer." });
+    if ((pickupAt && Number.isNaN(pickupAt.getTime())) || (deliveryDueAt && Number.isNaN(deliveryDueAt.getTime()))) return res.status(400).json({ error: "Enter valid pickup and delivery dates." });
+    if (pickupAt && deliveryDueAt && deliveryDueAt <= pickupAt) return res.status(400).json({ error: "Delivery time must be later than pickup time." });
+    const itemResult = await pool.query(
+      `SELECT oi.*,o.shipping_address,o.payment_status FROM order_items oi JOIN orders o ON o.id=oi.order_id
+       WHERE oi.id=$1 AND oi.seller_id=$2`,
+      [orderItemId, req.user.id]
+    );
+    if (!itemResult.rows.length) return res.status(404).json({ error: "Seller order item not found." });
+    const item = itemResult.rows[0];
+    if (item.carrier !== "Local Delivery Driver") return res.status(409).json({ error: "Select Local Delivery Driver for this order first." });
+    if (["delivered","cancelled","returned"].includes(item.fulfillment_status) || item.payment_status === "refunded") return res.status(409).json({ error: "This order cannot be posted for delivery." });
+    const activeAssignment = await pool.query("SELECT status FROM delivery_assignments WHERE order_item_id=$1", [orderItemId]);
+    if (activeAssignment.rows.length && !["assigned","revoked"].includes(activeAssignment.rows[0].status)) return res.status(409).json({ error: "A driver has already started this delivery." });
+    let address = item.shipping_address || {};
+    if (typeof address === "string") { try { address = JSON.parse(address); } catch { address = {}; } }
+    const deliveryCity = String(address.city || "").slice(0,80);
+    const deliveryState = String(address.state || "").slice(0,80);
+    const result = await pool.query(
+      `INSERT INTO local_delivery_jobs(order_item_id,order_id,seller_id,pickup_address,pickup_city,pickup_state,
+         delivery_city,delivery_state,delivery_fee,payment_method,pickup_at,delivery_due_at,package_description,status,is_preview,updated_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'open',$14,NOW())
+       ON CONFLICT(order_item_id) DO UPDATE SET pickup_address=EXCLUDED.pickup_address,pickup_city=EXCLUDED.pickup_city,
+         pickup_state=EXCLUDED.pickup_state,delivery_city=EXCLUDED.delivery_city,delivery_state=EXCLUDED.delivery_state,
+         delivery_fee=EXCLUDED.delivery_fee,payment_method=EXCLUDED.payment_method,pickup_at=EXCLUDED.pickup_at,
+         delivery_due_at=EXCLUDED.delivery_due_at,package_description=EXCLUDED.package_description,status='open',
+         selected_driver_user_id=NULL,delivery_assignment_id=NULL,updated_at=NOW()
+       RETURNING *`,
+      [item.id,item.order_id,req.user.id,pickupAddress,pickupCity,pickupState,deliveryCity,deliveryState,
+       deliveryFee.toFixed(2),paymentMethod,pickupAt,deliveryDueAt,packageDescription || item.title,!!item.is_preview]
+    );
+    res.status(201).json({ job: registeredDriverJobPayload({ ...result.rows[0], item_title: item.title }, true) });
+  } catch (err) { sendInternalError(res, err, "post local-delivery marketplace job"); }
+});
+
+app.post("/seller/local-delivery-jobs/:jobId/requests/:requestId/select", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const selected = await client.query(
+      `SELECT j.*,j.id AS job_id,r.id AS request_id,r.driver_user_id,dp.*,dp.id AS driver_profile_id,u.username,u.display_name,oi.title AS item_title,oi.fulfillment_status,oi.carrier
+       FROM local_delivery_jobs j
+       JOIN local_delivery_job_requests r ON r.job_id=j.id
+       JOIN driver_profiles dp ON dp.user_id=r.driver_user_id
+       JOIN users u ON u.id=r.driver_user_id
+       JOIN order_items oi ON oi.id=j.order_item_id
+       WHERE j.id=$1 AND r.id=$2 AND j.seller_id=$3 FOR UPDATE OF j,r,dp,oi`,
+      [req.params.jobId,req.params.requestId,req.user.id]
+    );
+    if (!selected.rows.length) { await client.query("ROLLBACK"); return res.status(404).json({ error: "Driver request not found." }); }
+    const row = selected.rows[0];
+    if (row.status !== "open" || row.verification_status !== "approved" || row.carrier !== "Local Delivery Driver") {
+      await client.query("ROLLBACK"); return res.status(409).json({ error: "This job or driver is no longer available." });
+    }
+    const existing = await client.query("SELECT * FROM delivery_assignments WHERE order_item_id=$1 FOR UPDATE", [row.order_item_id]);
+    if (existing.rows.length && !["assigned","revoked"].includes(existing.rows[0].status)) {
+      await client.query("ROLLBACK"); return res.status(409).json({ error: "A delivery is already in progress for this order." });
+    }
+    const { accessTokenHash } = newDeliveryAccessCredentials();
+    const expiry = deliveryAssignmentExpiry(row.delivery_due_at);
+    const driverName = decryptFieldSafe(row.legal_name_encrypted) || row.display_name || row.username;
+    const assignment = await client.query(
+      `INSERT INTO delivery_assignments(order_item_id,order_id,seller_id,driver_name,driver_phone_encrypted,delivery_fee,
+         payment_method,pickup_at,delivery_due_at,package_description,status,access_token_hash,activation_code_hash,
+         access_expires_at,revoked_at,is_preview,driver_user_id,local_delivery_job_id,
+         driver_legal_name_encrypted,driver_id_type,driver_id_number_encrypted,driver_identity_selfie_url,
+         driver_id_document_url,driver_identity_status,driver_identity_submitted_at,driver_identity_reviewed_at,
+         driver_bank_name_encrypted,driver_account_name_encrypted,driver_account_number_encrypted,updated_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'assigned',$11,NULL,$12,NULL,$13,$14,$15,$16,$17,$18,$19,$20,'approved',$21,$22,$23,$24,$25,NOW())
+       ON CONFLICT(order_item_id) DO UPDATE SET driver_name=EXCLUDED.driver_name,driver_phone_encrypted=EXCLUDED.driver_phone_encrypted,
+         delivery_fee=EXCLUDED.delivery_fee,payment_method=EXCLUDED.payment_method,pickup_at=EXCLUDED.pickup_at,
+         delivery_due_at=EXCLUDED.delivery_due_at,package_description=EXCLUDED.package_description,status='assigned',
+         access_token_hash=EXCLUDED.access_token_hash,activation_code_hash=NULL,access_expires_at=EXCLUDED.access_expires_at,
+         revoked_at=NULL,driver_user_id=EXCLUDED.driver_user_id,local_delivery_job_id=EXCLUDED.local_delivery_job_id,
+         driver_legal_name_encrypted=EXCLUDED.driver_legal_name_encrypted,driver_id_type=EXCLUDED.driver_id_type,
+         driver_id_number_encrypted=EXCLUDED.driver_id_number_encrypted,driver_identity_selfie_url=EXCLUDED.driver_identity_selfie_url,
+         driver_id_document_url=EXCLUDED.driver_id_document_url,driver_identity_status='approved',
+         driver_identity_submitted_at=EXCLUDED.driver_identity_submitted_at,driver_identity_reviewed_at=EXCLUDED.driver_identity_reviewed_at,
+         driver_bank_name_encrypted=EXCLUDED.driver_bank_name_encrypted,driver_account_name_encrypted=EXCLUDED.driver_account_name_encrypted,
+         driver_account_number_encrypted=EXCLUDED.driver_account_number_encrypted,payment_status='pending',
+         seller_marked_paid_at=NULL,seller_payment_reference=NULL,driver_confirmed_paid_at=NULL,updated_at=NOW()
+       RETURNING *`,
+      [row.order_item_id,row.order_id,req.user.id,driverName,row.phone_encrypted,row.delivery_fee,row.payment_method,
+       row.pickup_at,row.delivery_due_at,row.package_description,row.access_token_hash || accessTokenHash,expiry,!!row.is_preview,
+       row.driver_user_id,row.job_id,row.legal_name_encrypted,row.id_type,row.id_number_encrypted,row.identity_selfie_path,
+       row.id_document_path,row.verification_submitted_at,row.verification_reviewed_at,
+       row.bank_name_encrypted,row.account_name_encrypted,row.account_number_encrypted]
+    );
+    await client.query("UPDATE local_delivery_jobs SET status='assigned',selected_driver_user_id=$1,delivery_assignment_id=$2,updated_at=NOW() WHERE id=$3", [row.driver_user_id,assignment.rows[0].id,row.job_id]);
+    await client.query("UPDATE local_delivery_job_requests SET status=CASE WHEN id=$1 THEN 'selected' ELSE 'declined' END,updated_at=NOW() WHERE job_id=$2", [row.request_id,row.job_id]);
+    await client.query(
+      `INSERT INTO local_driver_payout_records(delivery_assignment_id,order_item_id,order_id,seller_id,amount,payment_method,status,is_preview,updated_at)
+       VALUES($1,$2,$3,$4,$5,$6,'pending',$7,NOW())
+       ON CONFLICT(delivery_assignment_id) DO UPDATE SET amount=EXCLUDED.amount,payment_method=EXCLUDED.payment_method,
+         status='pending',payment_reference=NULL,seller_marked_paid_at=NULL,driver_confirmed_paid_at=NULL,updated_at=NOW()`,
+      [assignment.rows[0].id,row.order_item_id,row.order_id,req.user.id,row.delivery_fee,row.payment_method,!!row.is_preview]
+    );
+    await client.query("COMMIT");
+    await createNotification(row.driver_user_id,"driver_job_selected",`You were selected for delivery ${`STY-${String(row.order_id).padStart(6,"0")}`}. Open your Driver Dashboard.`);
+    res.json({ assignment: sellerDeliveryAssignmentPayload(assignment.rows[0]) });
+  } catch (err) {
+    try { await client.query("ROLLBACK"); } catch {}
+    sendInternalError(res, err, "select registered local driver");
+  } finally { client.release(); }
+});
+
+app.get("/admin/driver-profiles", authenticate, requirePermission("seller_report_review"), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT dp.*,u.username,u.display_name FROM driver_profiles dp JOIN users u ON u.id=dp.user_id
+       WHERE dp.is_preview=false ORDER BY CASE dp.verification_status WHEN 'pending' THEN 0 ELSE 1 END,dp.updated_at DESC LIMIT 300`
+    );
+    res.json({ profiles: await Promise.all(result.rows.map((row) => registeredDriverProfilePayload(row, true))) });
+  } catch (err) { sendInternalError(res, err, "load registered driver profiles"); }
+});
+
+app.patch("/admin/driver-profiles/:id/verification", authenticate, requirePermission("seller_report_review"), async (req, res) => {
+  try {
+    const status = String(req.body?.status || "");
+    const adminNote = String(req.body?.adminNote || "").trim().slice(0,1000);
+    if (!["approved","rejected","suspended"].includes(status)) return res.status(400).json({ error: "Select an allowed driver decision." });
+    if (["rejected","suspended"].includes(status) && adminNote.length < 5) return res.status(400).json({ error: "Enter the reason for this decision." });
+    const result = await pool.query(
+      `UPDATE driver_profiles SET verification_status=$1,verification_admin_note=$2,
+         verification_reviewed_at=NOW(),verification_reviewed_by=$3,updated_at=NOW()
+       WHERE id=$4 AND verification_status IN ('pending','approved','rejected','suspended') RETURNING *`,
+      [status,adminNote || null,req.user.id,req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: "Driver profile not found." });
+    await createNotification(result.rows[0].user_id,"driver_verification",`Your Stallyard driver verification is ${status}.${adminNote ? ` ${adminNote}` : ""}`);
+    logAdminAction(req.user.id,`driver_profile_${status}`,`Driver profile #${req.params.id} ${status}`);
+    res.json({ profile: await registeredDriverProfilePayload(result.rows[0], true) });
+  } catch (err) { sendInternalError(res, err, "review registered driver profile"); }
 });
 
 app.get("/delivery-assignments/mine", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
