@@ -10525,6 +10525,10 @@ app.post("/seller/local-delivery-jobs", authenticate, rejectAdminMarketplaceUse,
     const item = itemResult.rows[0];
     if (item.carrier !== "Local Delivery Driver") return res.status(409).json({ error: "Select Local Delivery Driver for this order first." });
     if (["delivered","cancelled","returned"].includes(item.fulfillment_status) || item.payment_status === "refunded") return res.status(409).json({ error: "This order cannot be posted for delivery." });
+    const existingJob = await pool.query("SELECT id,status FROM local_delivery_jobs WHERE order_item_id=$1 AND seller_id=$2", [orderItemId, req.user.id]);
+    if (existingJob.rows.length && existingJob.rows[0].status !== "open") {
+      return res.status(409).json({ error: "This delivery job is locked because a driver has already been selected. Cancel the assignment before posting a replacement." });
+    }
     const activeAssignment = await pool.query("SELECT status FROM delivery_assignments WHERE order_item_id=$1", [orderItemId]);
     if (activeAssignment.rows.length && !["assigned","revoked"].includes(activeAssignment.rows[0].status)) return res.status(409).json({ error: "A driver has already started this delivery." });
     let address = item.shipping_address || {};
@@ -10544,6 +10548,14 @@ app.post("/seller/local-delivery-jobs", authenticate, rejectAdminMarketplaceUse,
       [item.id,item.order_id,req.user.id,pickupAddress,pickupCity,pickupState,deliveryCity,deliveryState,
        deliveryFee.toFixed(2),paymentMethod,pickupAt,deliveryDueAt,packageDescription || item.title,!!item.is_preview]
     );
+    if (existingJob.rows.length) {
+      await pool.query(
+        `INSERT INTO notifications(user_id,type,message)
+         SELECT driver_user_id,'driver_job_updated',$1 FROM local_delivery_job_requests
+         WHERE job_id=$2 AND status='requested'`,
+        [`The seller updated delivery job STY-${String(item.order_id).padStart(6,"0")}. Review the new fee and pickup details before accepting.`, existingJob.rows[0].id]
+      ).catch(() => {});
+    }
     res.status(201).json({ job: registeredDriverJobPayload({ ...result.rows[0], item_title: item.title }, true) });
   } catch (err) { sendInternalError(res, err, "post local-delivery marketplace job"); }
 });
