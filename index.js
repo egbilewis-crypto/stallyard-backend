@@ -1,3 +1,5 @@
+// Stage 5 Supabase identity-media build: stores driver selfie and ID evidence
+// in private object storage and returns only short-lived signed viewing links.
 const express = require("express");
 const { Pool } = require("pg");
 const bcrypt = require("bcrypt");
