@@ -3241,6 +3241,9 @@ const SCHEMA_MIGRATIONS = [
     `CREATE INDEX IF NOT EXISTS idx_driver_profiles_service_area
        ON driver_profiles(state,lga,city,is_available,verification_status)`,
   ] },
+  { version: 90, name: "member-lga-of-residence", statements: [
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS lga_of_residence TEXT NOT NULL DEFAULT ''`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -3343,7 +3346,7 @@ app.post("/signup", authRateLimit, async (req, res) => {
          is_email_verified, profile_complete, onboarding_intent
        )
        VALUES ($1, $2, $3, $4, $5, $6, true, false, $7)
-       RETURNING id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, office_location,
+       RETURNING id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, lga_of_residence, office_location,
          country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type,
          id_country, license_number, license_photos, id_verification_exempt,
          is_email_verified, profile_complete, onboarding_intent, onboarding_completed_at, created_at, token_version`,
@@ -3364,7 +3367,7 @@ app.post("/signup", authRateLimit, async (req, res) => {
 app.patch("/profile/complete", authenticate, async (req, res) => {
   try {
     const {
-      firstName, lastName, otherName, dateOfBirth, gender, nationality, stateOfResidence, phone, country,
+      firstName, lastName, otherName, dateOfBirth, gender, nationality, stateOfResidence, lgaOfResidence, phone, country,
     } = req.body;
 
     if (!String(firstName || "").trim() || !String(lastName || "").trim()) {
@@ -3395,6 +3398,8 @@ app.patch("/profile/complete", authenticate, async (req, res) => {
     if (!normalizedNationality) return res.status(400).json({ error: "Enter your nationality" });
     const normalizedState = String(stateOfResidence || "").trim();
     if (!normalizedState) return res.status(400).json({ error: "Select your state of residence" });
+    const normalizedLga = String(lgaOfResidence || "").trim();
+    if (!normalizedLga) return res.status(400).json({ error: "Select your Local Government Area" });
 
     const existing = await pool.query("SELECT date_of_birth, profile_complete FROM users WHERE id=$1", [req.user.id]);
     if (!existing.rows.length) return res.status(404).json({ error: "User not found" });
@@ -3411,19 +3416,20 @@ app.patch("/profile/complete", authenticate, async (req, res) => {
          gender = COALESCE($5, gender),
          nationality = COALESCE($6, nationality),
          state_of_residence = COALESCE($7, state_of_residence),
-         phone = $8,
+         lga_of_residence = $8,
+         phone = $9,
          country = 'Nigeria',
          account_type = 'personal',
          profile_complete = true,
          onboarding_completed_at = COALESCE(onboarding_completed_at, NOW())
-       WHERE id = $9
-       RETURNING id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, office_location,
+       WHERE id = $10
+       RETURNING id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, lga_of_residence, office_location,
          country, is_admin, is_approved, is_verified, is_suspended, account_type, id_type,
          id_country, license_number, license_photos, id_verification_exempt,
          is_email_verified, is_phone_verified, profile_complete, onboarding_intent, onboarding_completed_at, created_at`,
       [
         String(firstName).trim(), String(lastName).trim(), otherName?.trim() || null, dateOfBirth,
-        normalizedGender, normalizedNationality, normalizedState, normalizedPhone, req.user.id,
+        normalizedGender, normalizedNationality, normalizedState, normalizedLga, normalizedPhone, req.user.id,
       ]
     );
     if (!result.rows.length) return res.status(404).json({ error: "User not found" });
@@ -3964,7 +3970,7 @@ app.post("/profile/apply-to-sell", authenticate, requireNigeriaMarketplaceUser, 
 const USER_PUBLIC_FIELDS = `id, username, display_name, country, account_type, created_at,
   avatar_url, store_bio, store_policies`;
 
-const USER_FULL_FIELDS = `id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, office_location,
+const USER_FULL_FIELDS = `id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, lga_of_residence, office_location,
   country, is_admin, is_approved, is_verified, is_suspended, is_preview, seller_suspended, seller_suspended_reason, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
   bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
@@ -3973,7 +3979,7 @@ const USER_FULL_FIELDS = `id, username, email, phone, display_name, first_name, 
 // Safe staff directory fields for admin roles that do not need seller-verification
 // documents. This intentionally excludes email/phone, ID/license data, document
 // URLs, bank statements, and seller-verification rejection details.
-const USER_ADMIN_SAFE_FIELDS = `id, username, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, office_location,
+const USER_ADMIN_SAFE_FIELDS = `id, username, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, lga_of_residence, office_location,
   country, is_admin, is_approved, is_verified, is_suspended, is_preview, account_type, verification_status, created_at,
   avatar_url, store_bio, store_policies, two_factor_enabled, is_email_verified, is_phone_verified, admin_role`;
 
@@ -4037,7 +4043,7 @@ app.get("/users", async (req, res) => {
   }
 });
 
-const USER_RETURNING_FIELDS = `id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, office_location,
+const USER_RETURNING_FIELDS = `id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, lga_of_residence, office_location,
   country, is_admin, is_approved, is_verified, is_suspended, is_preview, seller_suspended, seller_suspended_reason, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
   bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
@@ -4952,7 +4958,7 @@ app.post("/admin/login", authRateLimit, async (req, res) => {
 // Keep session restoration deliberately small. This endpoint is called on page
 // load, so it must never return seller verification documents, bank data,
 // government-ID details, or other private profile records.
-const SESSION_USER_FIELDS = `id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence,
+const SESSION_USER_FIELDS = `id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, lga_of_residence,
   country, is_admin, is_approved, is_verified, is_suspended, is_preview, seller_suspended, seller_suspended_reason, account_type,
   has_applied_to_sell, verification_status, avatar_url, store_bio, store_policies,
   two_factor_enabled, is_email_verified, is_phone_verified, token_version, admin_role,
