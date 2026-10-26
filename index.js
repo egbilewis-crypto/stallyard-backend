@@ -1125,19 +1125,62 @@ async function checkPhoneNumber(phone) {
   }
 }
 
-const TERMII_PIN_TTL_MS = 10 * 60 * 1000;
+const PHONE_OTP_TTL_MS = 10 * 60 * 1000;
 
 const PHONE_VERIFIED_TTL_MS = 30 * 60 * 1000;
 
+async function getActiveSmsProvider() {
+  try {
+    const result = await pool.query("SELECT sms_provider FROM site_settings WHERE id = 1");
+    return result.rows[0]?.sms_provider === "sendchamp" ? "sendchamp" : "termii";
+  } catch {
+    // Safe during the first deployment before migration 91 has completed.
+    return "termii";
+  }
+}
+
 app.post("/phone-verify/send", smsSendIpRateLimit, smsSendPhoneRateLimit, async (req, res) => {
   try {
-    const { phone } = req.body;
-    if (!phone) return res.status(400).json({ error: "Missing phone number" });
-    if (!process.env.TERMII_API_KEY) {
-      return res.status(500).json({ error: "SMS verification isn't configured yet" });
+    const rawPhone = String(req.body?.phone || "").trim();
+    if (!rawPhone) return res.status(400).json({ error: "Missing phone number" });
+    const normalizedPhone = normalizeNigerianPhone(rawPhone);
+    if (!normalizedPhone) return res.status(400).json({ error: "Enter a valid Nigerian phone number" });
+    const to = normalizedPhone.slice(1);
+    const provider = await getActiveSmsProvider();
+
+    if (provider === "sendchamp") {
+      if (!process.env.SENDCHAMP_API_KEY) {
+        return res.status(503).json({ error: "Sendchamp is selected but its API key is not configured" });
+      }
+      const sendchampRes = await fetch("https://api.sendchamp.com/api/v1/verification/create", {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.SENDCHAMP_API_KEY}`,
+        },
+        body: JSON.stringify({
+          channel: "sms",
+          sender: process.env.SENDCHAMP_SENDER_ID || "Sendchamp",
+          token_type: "numeric",
+          token_length: 6,
+          expiration_time: 10,
+          customer_mobile_number: to,
+          meta_data: { service: "Stallyard" },
+        }),
+      });
+      const data = await sendchampRes.json().catch(() => ({}));
+      const reference = data.verification_reference || data.reference || data.data?.verification_reference || data.data?.reference;
+      if (!sendchampRes.ok || !reference) {
+        return res.status(400).json({ error: data.message || data.error || "Couldn't send that code through Sendchamp" });
+      }
+      await setSecurityState("phone-otp", rawPhone, { provider: "sendchamp", reference }, PHONE_OTP_TTL_MS);
+      return res.json({ success: true });
     }
 
-    const to = phone.replace(/[^0-9]/g, "");
+    if (!process.env.TERMII_API_KEY) {
+      return res.status(503).json({ error: "Termii is selected but its API key is not configured" });
+    }
     const termiiRes = await fetch("https://api.ng.termii.com/api/sms/otp/send", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1159,7 +1202,7 @@ app.post("/phone-verify/send", smsSendIpRateLimit, smsSendPhoneRateLimit, async 
     if (!termiiRes.ok || !data.pinId) {
       return res.status(400).json({ error: data.message || "Couldn't send that code — check the phone number and try again" });
     }
-    await setSecurityState("phone-otp", phone, { pinId: data.pinId }, TERMII_PIN_TTL_MS);
+    await setSecurityState("phone-otp", rawPhone, { provider: "termii", pinId: data.pinId }, PHONE_OTP_TTL_MS);
     res.json({ success: true });
   } catch (err) {
     sendInternalError(res, err);
@@ -1168,15 +1211,45 @@ app.post("/phone-verify/send", smsSendIpRateLimit, smsSendPhoneRateLimit, async 
 
 app.post("/phone-verify/check", smsCheckRateLimit, async (req, res) => {
   try {
-    const { phone, code } = req.body;
+    const phone = String(req.body?.phone || "").trim();
+    const code = String(req.body?.code || "").trim();
     if (!phone || !code) return res.status(400).json({ error: "Missing phone number or code" });
-    if (!process.env.TERMII_API_KEY) {
-      return res.status(500).json({ error: "SMS verification isn't configured yet" });
-    }
 
     const stored = await getSecurityState("phone-otp", phone);
     if (!stored) {
       return res.status(400).json({ error: "That code has expired — request a new one" });
+    }
+
+    if (stored.provider === "sendchamp") {
+      if (!process.env.SENDCHAMP_API_KEY) {
+        return res.status(503).json({ error: "Sendchamp verification is not configured" });
+      }
+      const sendchampRes = await fetch("https://api.sendchamp.com/api/v1/verification/confirm", {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.SENDCHAMP_API_KEY}`,
+        },
+        body: JSON.stringify({
+          verification_code: code,
+          verification_reference: stored.reference,
+        }),
+      });
+      const data = await sendchampRes.json().catch(() => ({}));
+      if (!sendchampRes.ok) {
+        return res.status(400).json({ error: data.message || data.error || "That code doesn't match" });
+      }
+      const verificationStatus = String(data.status || data.data?.status || data.data?.verification_status || "").toLowerCase();
+      const valid = data.success === true || data.verified === true || data.data?.verified === true || ["success", "successful", "verified"].includes(verificationStatus);
+      if (!valid) return res.status(400).json({ error: "That code doesn't match" });
+      await deleteSecurityState("phone-otp", phone);
+      await setSecurityState("phone-verified", phone, { verified: true }, PHONE_VERIFIED_TTL_MS);
+      return res.json({ valid: true });
+    }
+
+    if (!process.env.TERMII_API_KEY) {
+      return res.status(503).json({ error: "Termii verification is not configured" });
     }
 
     const termiiRes = await fetch("https://api.ng.termii.com/api/sms/otp/verify", {
@@ -3243,6 +3316,12 @@ const SCHEMA_MIGRATIONS = [
   ] },
   { version: 90, name: "member-lga-of-residence", statements: [
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS lga_of_residence TEXT NOT NULL DEFAULT ''`,
+  ] },
+  { version: 91, name: "selectable-sms-provider", statements: [
+    `ALTER TABLE site_settings ADD COLUMN IF NOT EXISTS sms_provider TEXT NOT NULL DEFAULT 'termii'`,
+    `UPDATE site_settings SET sms_provider = 'termii' WHERE sms_provider NOT IN ('termii', 'sendchamp') OR sms_provider IS NULL`,
+    `ALTER TABLE site_settings DROP CONSTRAINT IF EXISTS site_settings_sms_provider_check`,
+    `ALTER TABLE site_settings ADD CONSTRAINT site_settings_sms_provider_check CHECK (sms_provider IN ('termii', 'sendchamp'))`,
   ] },
 ];
 
@@ -7989,12 +8068,13 @@ app.delete("/listings/by-owner/:ownerId", authenticate, requirePermission("user_
 
 app.get("/settings", async (req, res) => {
   try {
-    const result = await pool.query("SELECT commission_rate, tax_rate, auth_image FROM site_settings WHERE id = 1");
-    const row = result.rows[0] || { commission_rate: 0.05, tax_rate: 0, auth_image: "" };
+    const result = await pool.query("SELECT commission_rate, tax_rate, auth_image, sms_provider FROM site_settings WHERE id = 1");
+    const row = result.rows[0] || { commission_rate: 0.05, tax_rate: 0, auth_image: "", sms_provider: "termii" };
     res.json({
       commissionRate: Number(row.commission_rate),
       taxRate: Number(row.tax_rate || 0),
       authImage: row.auth_image || "",
+      smsProvider: row.sms_provider === "sendchamp" ? "sendchamp" : "termii",
     });
   } catch (err) {
     sendInternalError(res, err);
@@ -8003,7 +8083,7 @@ app.get("/settings", async (req, res) => {
 
 app.patch("/settings", authenticate, async (req, res) => {
   try {
-    const { commissionRate, taxRate, authImage } = req.body;
+    const { commissionRate, taxRate, authImage, smsProvider } = req.body;
     if (commissionRate !== undefined) {
       if (!hasPermission(req.user, "finance")) {
         return res.status(403).json({ error: "You don't have permission to change the commission rate" });
@@ -8042,11 +8122,30 @@ app.patch("/settings", authenticate, async (req, res) => {
       );
       logAdminAction(req.user.id, "site_branding_changed", "Updated the sign-in/site branding image");
     }
-    const result = await pool.query("SELECT commission_rate, tax_rate, auth_image FROM site_settings WHERE id = 1");
+    if (smsProvider !== undefined) {
+      if (!req.user.isAdmin || (req.user.adminRole && req.user.adminRole !== "super_admin")) {
+        return res.status(403).json({ error: "Only the Super Admin can change the SMS provider" });
+      }
+      const normalizedProvider = String(smsProvider).trim().toLowerCase();
+      if (!["termii", "sendchamp"].includes(normalizedProvider)) {
+        return res.status(400).json({ error: "Select either Termii or Sendchamp" });
+      }
+      const requiredKey = normalizedProvider === "sendchamp" ? process.env.SENDCHAMP_API_KEY : process.env.TERMII_API_KEY;
+      if (!requiredKey) {
+        return res.status(400).json({ error: `${normalizedProvider === "sendchamp" ? "Sendchamp" : "Termii"} cannot be selected until its API key is configured on Railway` });
+      }
+      await pool.query(
+        "INSERT INTO site_settings (id, sms_provider) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET sms_provider = $1",
+        [normalizedProvider]
+      );
+      logAdminAction(req.user.id, "sms_provider_changed", `Changed the phone verification provider to ${normalizedProvider}`);
+    }
+    const result = await pool.query("SELECT commission_rate, tax_rate, auth_image, sms_provider FROM site_settings WHERE id = 1");
     res.json({
       commissionRate: Number(result.rows[0].commission_rate),
       taxRate: Number(result.rows[0].tax_rate || 0),
       authImage: result.rows[0].auth_image || "",
+      smsProvider: result.rows[0].sms_provider === "sendchamp" ? "sendchamp" : "termii",
     });
   } catch (err) {
     sendInternalError(res, err);
@@ -14467,7 +14566,12 @@ app.get("/admin/system-health", authenticate, requirePermission("role_assignment
 
   const termiiConfigured = !!process.env.TERMII_API_KEY;
   add("termii", "Termii", "SMS/phone verification", termiiConfigured ? "configured" : "not_configured",
-    termiiConfigured ? "SMS API key is present. No test SMS is sent by this health check." : "TERMII_API_KEY is missing; SMS verification is unavailable.",
+    termiiConfigured ? "SMS API key is present. No test SMS is sent by this health check." : "TERMII_API_KEY is missing; Termii cannot be selected.",
+    { liveCheck: false });
+
+  const sendchampConfigured = !!process.env.SENDCHAMP_API_KEY;
+  add("sendchamp", "Sendchamp", "SMS/phone verification", sendchampConfigured ? "configured" : "not_configured",
+    sendchampConfigured ? "SMS API key is present. No test SMS is sent by this health check." : "SENDCHAMP_API_KEY is missing; Sendchamp cannot be selected.",
     { liveCheck: false });
 
   const payoutQueue = await timed(() => pool.query(
