@@ -3367,7 +3367,7 @@ app.post("/signup", authRateLimit, async (req, res) => {
 app.patch("/profile/complete", authenticate, async (req, res) => {
   try {
     const {
-      firstName, lastName, otherName, dateOfBirth, gender, nationality, stateOfResidence, lgaOfResidence, phone, country,
+      firstName, lastName, otherName, dateOfBirth, gender, stateOfResidence, lgaOfResidence, phone, country,
     } = req.body;
 
     if (!String(firstName || "").trim() || !String(lastName || "").trim()) {
@@ -3394,8 +3394,7 @@ app.patch("/profile/complete", authenticate, async (req, res) => {
     if (!["male", "female", "prefer_not_to_say"].includes(normalizedGender)) {
       return res.status(400).json({ error: "Select a valid gender" });
     }
-    const normalizedNationality = String(nationality || "").trim();
-    if (!normalizedNationality) return res.status(400).json({ error: "Enter your nationality" });
+    const normalizedNationality = "Nigeria";
     const normalizedState = String(stateOfResidence || "").trim();
     if (!normalizedState) return res.status(400).json({ error: "Select your state of residence" });
     const normalizedLga = String(lgaOfResidence || "").trim();
