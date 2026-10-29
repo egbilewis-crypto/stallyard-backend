@@ -1911,7 +1911,9 @@ app.post("/password-reset/send", authRateLimit, async (req, res) => {
       return res.status(500).json({ error: "Password reset isn't configured yet" });
     }
 
-    const key = username.trim().toLowerCase();
+    const enteredIdentifier = username.trim();
+    const enteredStNumber = method === "stallyard_text" ? normalizeStallyardTextNumber(enteredIdentifier) : null;
+    const key = enteredStNumber || enteredIdentifier.toLowerCase();
     const genericResponse = {
       success: true,
       message: method === "stallyard_text"
@@ -1922,16 +1924,24 @@ app.post("/password-reset/send", authRateLimit, async (req, res) => {
     // Public recovery must never reveal whether a username exists or whether it
     // belongs to an administrator. Admin recovery is handled only through the
     // dedicated Super Admin temporary-password flow.
-    const result = await pool.query(
-      "SELECT id, email, stallyard_text_number, is_admin FROM users WHERE username = $1",
-      [key]
-    );
+    const result = method === "stallyard_text"
+      ? await pool.query(
+          `SELECT id, username, email, stallyard_text_number, is_admin
+           FROM users
+           WHERE username = $1 OR stallyard_text_number = $2
+           LIMIT 1`,
+          [enteredIdentifier.toLowerCase(), enteredStNumber]
+        )
+      : await pool.query(
+          "SELECT id, username, email, stallyard_text_number, is_admin FROM users WHERE username = $1",
+          [enteredIdentifier.toLowerCase()]
+        );
     if (result.rows.length === 0 || result.rows[0].is_admin) {
       await deleteSecurityState("password-reset", key);
       return res.json(genericResponse);
     }
 
-    const { id: userId, email, stallyard_text_number: stNumber } = result.rows[0];
+    const { id: userId, username: accountUsername, email, stallyard_text_number: stNumber } = result.rows[0];
     if ((method === "email" && !email) || (method === "stallyard_text" && !stNumber)) {
       await deleteSecurityState("password-reset", key);
       return res.json(genericResponse);
@@ -1977,7 +1987,7 @@ app.post("/password-reset/send", authRateLimit, async (req, res) => {
       }
     }
 
-    await setSecurityState("password-reset", key, { code, userId }, PASSWORD_RESET_CODE_TTL_MS);
+    await setSecurityState("password-reset", key, { code, userId, username: accountUsername }, PASSWORD_RESET_CODE_TTL_MS);
     const maskedEmail = method === "email" ? email.replace(/^(.{1,2}).*(@.*)$/, (m, a, b) => `${a}***${b}`) : undefined;
     res.json({ ...genericResponse, method, maskedEmail, maskedStNumber: method === "stallyard_text" ? stNumber : undefined });
   } catch (err) {
@@ -1989,7 +1999,8 @@ app.post("/password-reset/verify-code", codeRateLimit, async (req, res) => {
   try {
     const { username, code } = req.body;
     if (!username || !code) return res.status(400).json({ error: "Missing username or code" });
-    const key = username.trim().toLowerCase();
+    const enteredIdentifier = username.trim();
+    const key = normalizeStallyardTextNumber(enteredIdentifier) || enteredIdentifier.toLowerCase();
     const stored = await getSecurityState("password-reset", key);
     if (!stored) {
       await deleteSecurityState("password-reset", key);
@@ -2003,7 +2014,7 @@ app.post("/password-reset/verify-code", codeRateLimit, async (req, res) => {
     // the door if an account was promoted to admin after the code was issued.
     const userResult = await pool.query(
       "SELECT id, is_admin FROM users WHERE id = $1 AND username = $2",
-      [stored.userId, key]
+      [stored.userId, stored.username || enteredIdentifier.toLowerCase()]
     );
     if (userResult.rows.length === 0 || userResult.rows[0].is_admin) {
       await deleteSecurityState("password-reset", key);
