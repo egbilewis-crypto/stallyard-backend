@@ -4287,6 +4287,8 @@ app.patch("/profile/verify-st-number", authenticate, async (req, res) => {
       return res.status(400).json({ error: "Verify the code sent to Stallyard Text first" });
     }
     await deleteSecurityState("st-number-verified", req.user.id);
+    const previous = await pool.query("SELECT stallyard_text_number FROM users WHERE id = $1", [req.user.id]);
+    const previousStNumber = previous.rows[0]?.stallyard_text_number || null;
     try {
       await pool.query(
         "UPDATE users SET stallyard_text_number = $1, is_phone_verified = true WHERE id = $2",
@@ -4297,6 +4299,22 @@ app.patch("/profile/verify-st-number", authenticate, async (req, res) => {
       throw err;
     }
     res.json({ success: true, stNumber });
+    if (previousStNumber && previousStNumber !== stNumber) {
+      sendMarketplaceSecurityAlertSafely(
+        previousStNumber,
+        "Marketplace ST number changed",
+        `Your Stallyard Marketplace account is no longer linked to ${previousStNumber}. It is now linked to ${stNumber}. If you did not make this change, contact Stallyard support immediately.`,
+        "marketplace_st_number_changed"
+      );
+    }
+    sendMarketplaceSecurityAlertSafely(
+      stNumber,
+      previousStNumber && previousStNumber !== stNumber ? "Marketplace ST number changed" : "Marketplace ST number linked",
+      previousStNumber && previousStNumber !== stNumber
+        ? `Your Stallyard Marketplace account is now linked to ${stNumber}. If you did not make this change, contact Stallyard support immediately.`
+        : `Your Stallyard Marketplace account is securely linked to ${stNumber}.`,
+      previousStNumber && previousStNumber !== stNumber ? "marketplace_st_number_changed" : "marketplace_st_number_linked"
+    );
   } catch (err) {
     sendInternalError(res, err);
   }
@@ -4441,6 +4459,14 @@ app.patch("/users/:id/suspend", authenticate, requirePermission("user_management
     await client.query("COMMIT");
     logAdminAction(req.user.id, "user_suspended", `${isSuspended ? "Suspended" : "Unsuspended"} ${result.rows[0].username}`);
     res.json({ user: result.rows[0] });
+    sendMarketplaceSecurityAlertSafely(
+      result.rows[0].stallyard_text_number,
+      isSuspended ? "Marketplace account suspended" : "Marketplace account restored",
+      isSuspended
+        ? "Your Stallyard Marketplace account has been suspended. You cannot sign in or complete Marketplace activity until the account is restored. Contact Stallyard support for assistance."
+        : "Your Stallyard Marketplace account has been restored. You may sign in again. Review your account and contact Stallyard support if you did not expect this change.",
+      isSuspended ? "marketplace_account_suspended" : "marketplace_account_restored"
+    );
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     sendInternalError(res, err);
@@ -7306,6 +7332,12 @@ app.patch("/admin/sellers/:id/reinstate", authenticate, requireSuperAdmin, async
     logAdminAction(req.user.id, "seller_reinstated", `Reinstated selling access for ${result.rows[0].username}`);
     createNotification(req.params.id, "seller_verified", "Your selling access has been reinstated. Review paused listings before publishing them again.");
     res.json({ user:result.rows[0] });
+    sendMarketplaceSecurityAlertSafely(
+      result.rows[0].stallyard_text_number,
+      "Marketplace selling access restored",
+      "Your selling access on Stallyard Marketplace has been restored. Review any paused listings before publishing them again.",
+      "marketplace_selling_restored"
+    );
   } catch (err) { sendInternalError(res, err); }
 });
 
@@ -7863,13 +7895,19 @@ app.patch("/admin/casual-seller-applications/:id/suspend", authenticate, require
     const application = await client.query("SELECT user_id, reference FROM casual_seller_applications WHERE id=$1 FOR UPDATE", [req.params.id]);
     if (!application.rows.length) throw Object.assign(new Error("Application not found"), { statusCode: 404 });
     await client.query("UPDATE casual_seller_applications SET status='suspended', suspended_at=NOW(), decision_reason=$1, updated_at=NOW() WHERE id=$2", [String(req.body?.reason || "Suspended after verification review").slice(0, 500), req.params.id]);
-    await client.query("UPDATE users SET casual_seller_status='suspended', casual_seller_suspended_at=NOW(), seller_suspended=true, seller_suspended_reason=$1 WHERE id=$2", [String(req.body?.reason || "Suspended after verification review").slice(0, 500), application.rows[0].user_id]);
+    const suspendedUser = await client.query("UPDATE users SET casual_seller_status='suspended', casual_seller_suspended_at=NOW(), seller_suspended=true, seller_suspended_reason=$1 WHERE id=$2 RETURNING stallyard_text_number", [String(req.body?.reason || "Suspended after verification review").slice(0, 500), application.rows[0].user_id]);
     await client.query("UPDATE listings SET status='paused' WHERE owner_id=$1 AND status='active'", [application.rows[0].user_id]);
     await cancelOpenCheckoutsForSeller(client, application.rows[0].user_id, "Seller verification was suspended before payment completed");
     await client.query("COMMIT");
     logAdminAction(req.user.id, "casual_seller_suspended", `Suspended casual seller application ${application.rows[0].reference}`);
     createNotification(application.rows[0].user_id, "verification_problem", "Your casual-seller verification was suspended. Your active listings have been paused.");
     res.json({ success: true });
+    sendMarketplaceSecurityAlertSafely(
+      suspendedUser.rows[0]?.stallyard_text_number,
+      "Marketplace selling access suspended",
+      "Your selling access on Stallyard Marketplace has been suspended and your active listings were paused. Contact Stallyard support for assistance.",
+      "marketplace_selling_suspended"
+    );
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
