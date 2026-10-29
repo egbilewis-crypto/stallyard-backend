@@ -1058,6 +1058,48 @@ async function sendStallyardTextVerification(tokens, number, code, systemMessage
   }
 }
 
+function marketplaceDeviceLabel(userAgent) {
+  const ua = String(userAgent || "");
+  const platform = /Android/i.test(ua) ? "Android"
+    : /iPhone|iPad/i.test(ua) ? "iPhone/iPad"
+    : /Windows/i.test(ua) ? "Windows"
+    : /Macintosh|Mac OS/i.test(ua) ? "Mac"
+    : /Linux/i.test(ua) ? "Linux"
+    : "Unknown device";
+  const browser = /Edg\//i.test(ua) ? "Microsoft Edge"
+    : /Chrome\//i.test(ua) ? "Chrome"
+    : /Firefox\//i.test(ua) ? "Firefox"
+    : /Safari\//i.test(ua) ? "Safari"
+    : "Browser";
+  return `${browser} on ${platform}`;
+}
+
+async function sendMarketplaceSecurityAlert(stNumber, title, body, source) {
+  if (!stNumber) return;
+  const profiles = await stallyardTextRest(`profiles?stallyard_number=eq.${encodeURIComponent(stNumber)}&select=id&limit=1`);
+  if (!profiles.length) return;
+  const tokens = await stallyardTextRest(`push_tokens?user_id=eq.${encodeURIComponent(profiles[0].id)}&select=expo_push_token`);
+  const pushTokens = tokens.map((row) => row.expo_push_token).filter(Boolean);
+  const inboxMessages = await stallyardTextRest("system_messages", {
+    method: "POST",
+    body: JSON.stringify({
+      user_id: profiles[0].id,
+      source,
+      title,
+      body,
+    }),
+  });
+  if (pushTokens.length) {
+    await sendStallyardTextVerification(pushTokens, stNumber, "", inboxMessages?.[0]?.id, { title, body });
+  }
+}
+
+function sendMarketplaceSecurityAlertSafely(stNumber, title, body, source) {
+  if (!stNumber) return;
+  sendMarketplaceSecurityAlert(stNumber, title, body, source)
+    .catch((err) => console.error(`Failed to send Stallyard Text security alert (${source}):`, err.message));
+}
+
 // SMS is a paid, abuse-sensitive channel, so protect it twice:
 // 1) per IP, which limits one client from spraying many numbers; and
 // 2) per phone number, which prevents repeatedly charging Stallyard to SMS the same person.
@@ -2050,7 +2092,7 @@ app.post("/password-reset/confirm", authRateLimit, async (req, res) => {
 
     // Public reset tokens can never reset an administrator, even if the account
     // changed roles after the token was issued.
-    const account = await pool.query("SELECT id, is_admin FROM users WHERE id = $1", [decoded.userId]);
+    const account = await pool.query("SELECT id, is_admin, stallyard_text_number FROM users WHERE id = $1", [decoded.userId]);
     if (account.rows.length === 0) return res.status(404).json({ error: "Account not found" });
     if (account.rows[0].is_admin) {
       return res.status(403).json({ error: "This reset session is not valid" });
@@ -2071,6 +2113,12 @@ app.post("/password-reset/confirm", authRateLimit, async (req, res) => {
     // any cookie in this browser as well so the client immediately reflects it.
     clearAuthCookie(res);
     res.json({ success: true });
+    sendMarketplaceSecurityAlertSafely(
+      account.rows[0].stallyard_text_number,
+      "Marketplace password changed",
+      "Your Stallyard Marketplace password was changed. All older sign-in sessions were closed. If you did not make this change, contact Stallyard support immediately.",
+      "marketplace_password_changed"
+    );
   } catch (err) {
     sendInternalError(res, err);
   }
@@ -5373,6 +5421,12 @@ app.post("/login", authRateLimit, async (req, res) => {
       .catch((err) => console.error("Failed to record login history:", err.message));
     setAuthCookie(res, user);
     res.json({ user });
+    sendMarketplaceSecurityAlertSafely(
+      user.stallyard_text_number,
+      "New Marketplace sign-in",
+      `A new sign-in to your Stallyard Marketplace account was completed using ${marketplaceDeviceLabel(userAgent)}. If this was not you, reset your password immediately.`,
+      "marketplace_new_signin"
+    );
   } catch (err) {
     sendInternalError(res, err);
   }
@@ -5459,6 +5513,12 @@ app.post("/login/verify-2fa", authRateLimit, async (req, res) => {
       .catch((err) => console.error("Failed to record login history:", err.message));
     setAuthCookie(res, user);
     res.json({ user });
+    sendMarketplaceSecurityAlertSafely(
+      user.stallyard_text_number,
+      "New Marketplace sign-in",
+      `A new sign-in to your Stallyard Marketplace account was completed using ${marketplaceDeviceLabel(userAgent)}. If this was not you, reset your password immediately.`,
+      "marketplace_new_signin"
+    );
   } catch (err) {
     sendInternalError(res, err);
   }
