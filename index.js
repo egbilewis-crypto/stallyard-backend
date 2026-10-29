@@ -186,6 +186,8 @@ function signToken(user, options = {}) {
 }
 
 const AUTH_COOKIE_NAME = "stallyard_session";
+const TRUSTED_DEVICE_COOKIE_NAME = "stallyard_trusted_device";
+const TRUSTED_DEVICE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
 
 function parseCookies(req) {
   const out = {};
@@ -232,6 +234,46 @@ function clearAuthCookie(res) {
     "Max-Age=0",
   ].filter(Boolean);
   res.setHeader("Set-Cookie", parts.join("; "));
+}
+
+function getTrustedDevice(req) {
+  const token = parseCookies(req)[TRUSTED_DEVICE_COOKIE_NAME] || null;
+  if (!token || !JWT_SECRET) return null;
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    return decoded?.type === "trusted_marketplace_device" ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+function isTrustedMarketplaceDevice(req, user) {
+  const trusted = getTrustedDevice(req);
+  return !!trusted &&
+    Number(trusted.userId) === Number(user.id) &&
+    Number(trusted.tokenVersion || 0) === Number(user.token_version || 0);
+}
+
+function setTrustedDeviceCookie(res, user) {
+  const token = jwt.sign(
+    {
+      type: "trusted_marketplace_device",
+      userId: user.id,
+      tokenVersion: user.token_version || 0,
+    },
+    JWT_SECRET,
+    { expiresIn: TRUSTED_DEVICE_MAX_AGE_SECONDS }
+  );
+  const production = process.env.NODE_ENV === "production";
+  const parts = [
+    `${TRUSTED_DEVICE_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    "Path=/",
+    "HttpOnly",
+    production ? "Secure" : "",
+    "SameSite=Lax",
+    `Max-Age=${TRUSTED_DEVICE_MAX_AGE_SECONDS}`,
+  ].filter(Boolean);
+  res.append("Set-Cookie", parts.join("; "));
 }
 
 function getRequester(req) {
@@ -5406,7 +5448,7 @@ app.post("/login", authRateLimit, async (req, res) => {
       return res.status(403).json({ error: "Login isn't allowed over a VPN, proxy, or Tor connection. Please disable it and try again." });
     }
 
-    if (user.two_factor_enabled) {
+    if (user.two_factor_enabled && !isTrustedMarketplaceDevice(req, user)) {
       if (user.is_admin) {
         if (!user.totp_secret) {
           return res.status(500).json({ error: "Two-factor is on but no authenticator is set up — contact support" });
@@ -5460,7 +5502,7 @@ app.post("/login", authRateLimit, async (req, res) => {
 
 app.post("/login/verify-2fa", authRateLimit, async (req, res) => {
   try {
-    const { userId, code } = req.body;
+    const { userId, code, rememberDevice } = req.body;
     if (!userId || !code) return res.status(400).json({ error: "Missing userId or code" });
 
     const result = await pool.query(
@@ -5538,6 +5580,7 @@ app.post("/login/verify-2fa", authRateLimit, async (req, res) => {
       .query("INSERT INTO login_history (user_id, ip, user_agent) VALUES ($1, $2, $3)", [user.id, ip, userAgent])
       .catch((err) => console.error("Failed to record login history:", err.message));
     setAuthCookie(res, user);
+    if (rememberDevice === true) setTrustedDeviceCookie(res, user);
     res.json({ user });
     sendMarketplaceSecurityAlertSafely(
       user.stallyard_text_number,
