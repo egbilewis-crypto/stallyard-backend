@@ -996,6 +996,60 @@ function normalizeNigerianPhone(phone) {
   return /^234[789]\d{9}$/.test(digits) ? `+${digits}` : null;
 }
 
+function normalizeStallyardTextNumber(value) {
+  const compact = String(value || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const match = compact.match(/^ST(\d{3})(\d{3})(\d{3})$/);
+  return match ? `ST-${match[1]}-${match[2]}-${match[3]}` : null;
+}
+
+function stallyardTextCodeHash(userId, number, code) {
+  return crypto.createHmac("sha256", JWT_SECRET).update(`${userId}:${number}:${code}`).digest("hex");
+}
+
+function safeHashMatches(left, right) {
+  const a = Buffer.from(String(left || ""), "hex");
+  const b = Buffer.from(String(right || ""), "hex");
+  return a.length > 0 && a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+async function stallyardTextRest(path) {
+  const base = String(process.env.STALLYARD_TEXT_SUPABASE_URL || "").replace(/\/$/, "");
+  const serviceKey = process.env.STALLYARD_TEXT_SUPABASE_SERVICE_ROLE_KEY;
+  if (!base || !serviceKey) {
+    const error = new Error("Stallyard Text verification is not configured");
+    error.statusCode = 503;
+    throw error;
+  }
+  const response = await fetch(`${base}/rest/v1/${path}`, {
+    headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` },
+  });
+  if (!response.ok) throw new Error(`Stallyard Text lookup failed (${response.status})`);
+  return response.json();
+}
+
+async function sendStallyardTextVerification(tokens, number, code) {
+  const messages = tokens.map((token) => ({
+    to: token,
+    sound: "default",
+    priority: "high",
+    title: "Stallyard verification code",
+    body: `${code} is your Stallyard verification code. It expires in 10 minutes.`,
+    data: { type: "verification", number },
+    channelId: "messages",
+  }));
+  const response = await fetch("https://exp.host/--/api/v2/push/send", {
+    method: "POST",
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(messages),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload?.errors?.[0]?.message || "Stallyard Text notification failed");
+  const tickets = Array.isArray(payload.data) ? payload.data : [payload.data];
+  if (!tickets.some((ticket) => ticket?.status === "ok")) {
+    throw new Error(tickets.find((ticket) => ticket?.message)?.message || "No Stallyard Text device accepted the notification");
+  }
+}
+
 // SMS is a paid, abuse-sensitive channel, so protect it twice:
 // 1) per IP, which limits one client from spraying many numbers; and
 // 2) per phone number, which prevents repeatedly charging Stallyard to SMS the same person.
@@ -1018,6 +1072,21 @@ const smsCheckRateLimit = rateLimit({
   max: 8,
   message: "Too many verification attempts — wait 15 minutes and request a new code.",
   keyFn: (req) => `${getClientIp(req) || "unknown"}:phone:${normalizePhoneForRateLimit(req.body?.phone) || "missing"}`,
+});
+
+const stNumberSendRateLimit = rateLimit({
+  scope: "st-number-send",
+  windowMs: 15 * 60 * 1000,
+  max: 3,
+  message: "Too many ST verification codes requested — wait 15 minutes and try again.",
+  keyFn: (req) => `user:${req.user?.id || "unknown"}:number:${normalizeStallyardTextNumber(req.body?.stNumber) || "invalid"}`,
+});
+const stNumberCheckRateLimit = rateLimit({
+  scope: "st-number-check",
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  message: "Too many ST verification attempts — wait 15 minutes and request a new code.",
+  keyFn: (req) => `user:${req.user?.id || "unknown"}`,
 });
 
 // Image uploads are authenticated but still cost bandwidth, moderation calls, and
@@ -1271,6 +1340,77 @@ app.post("/phone-verify/check", smsCheckRateLimit, async (req, res) => {
       await setSecurityState("phone-verified", phone, { verified: true }, PHONE_VERIFIED_TTL_MS);
     }
     res.json({ valid });
+  } catch (err) {
+    sendInternalError(res, err);
+  }
+});
+
+app.post("/st-number-verify/send", authenticate, stNumberSendRateLimit, async (req, res) => {
+  try {
+    const stNumber = normalizeStallyardTextNumber(req.body?.stNumber);
+    if (!stNumber) return res.status(400).json({ error: "Enter a valid ST number, for example ST-123-456-789" });
+
+    const linked = await pool.query(
+      "SELECT id FROM users WHERE stallyard_text_number = $1 AND id <> $2 LIMIT 1",
+      [stNumber, req.user.id]
+    );
+    if (linked.rows.length) return res.status(409).json({ error: "That ST number is already linked to another Stallyard account" });
+
+    const profiles = await stallyardTextRest(`profiles?stallyard_number=eq.${encodeURIComponent(stNumber)}&select=id&limit=1`);
+    if (!profiles.length) return res.status(404).json({ error: "That ST number was not found in Stallyard Text" });
+    const tokens = await stallyardTextRest(`push_tokens?user_id=eq.${encodeURIComponent(profiles[0].id)}&select=expo_push_token`);
+    const pushTokens = tokens.map((row) => row.expo_push_token).filter(Boolean);
+    if (!pushTokens.length) {
+      return res.status(409).json({ error: "Open Stallyard Text on that phone and allow notifications, then try again" });
+    }
+
+    const code = String(crypto.randomInt(100000, 1000000));
+    await sendStallyardTextVerification(pushTokens, stNumber, code);
+    await setSecurityState(
+      "st-number-otp",
+      `${req.user.id}:${stNumber}`,
+      {
+        codeHash: stallyardTextCodeHash(req.user.id, stNumber, code),
+        attempts: 0,
+        expiresAt: Date.now() + PHONE_OTP_TTL_MS,
+      },
+      PHONE_OTP_TTL_MS
+    );
+    res.json({ success: true, method: "stallyard_text", expiresInSeconds: PHONE_OTP_TTL_MS / 1000 });
+  } catch (err) {
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
+    sendInternalError(res, err);
+  }
+});
+
+app.post("/st-number-verify/check", authenticate, stNumberCheckRateLimit, async (req, res) => {
+  try {
+    const stNumber = normalizeStallyardTextNumber(req.body?.stNumber);
+    const code = String(req.body?.code || "").trim();
+    if (!stNumber || !/^\d{6}$/.test(code)) {
+      return res.status(400).json({ error: "Enter the ST number and its 6-digit verification code" });
+    }
+    const stateKey = `${req.user.id}:${stNumber}`;
+    const stored = await getSecurityState("st-number-otp", stateKey);
+    if (!stored) return res.status(400).json({ error: "That code has expired — request a new one" });
+    const remainingMs = Number(stored.expiresAt || 0) - Date.now();
+    if (remainingMs <= 0) {
+      await deleteSecurityState("st-number-otp", stateKey);
+      return res.status(400).json({ error: "That code has expired — request a new one" });
+    }
+    const attempts = Number(stored.attempts || 0) + 1;
+    const matches = safeHashMatches(stored.codeHash, stallyardTextCodeHash(req.user.id, stNumber, code));
+    if (!matches) {
+      if (attempts >= 5) {
+        await deleteSecurityState("st-number-otp", stateKey);
+        return res.status(400).json({ error: "Too many incorrect attempts — request a new code" });
+      }
+      await setSecurityState("st-number-otp", stateKey, { ...stored, attempts }, remainingMs);
+      return res.status(400).json({ error: "That code doesn't match" });
+    }
+    await deleteSecurityState("st-number-otp", stateKey);
+    await setSecurityState("st-number-verified", req.user.id, { stNumber }, PHONE_VERIFIED_TTL_MS);
+    res.json({ valid: true, stNumber });
   } catch (err) {
     sendInternalError(res, err);
   }
@@ -3323,6 +3463,14 @@ const SCHEMA_MIGRATIONS = [
     `ALTER TABLE site_settings DROP CONSTRAINT IF EXISTS site_settings_sms_provider_check`,
     `ALTER TABLE site_settings ADD CONSTRAINT site_settings_sms_provider_check CHECK (sms_provider IN ('termii', 'sendchamp'))`,
   ] },
+  { version: 92, name: "stallyard-text-number-verification", statements: [
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS stallyard_text_number TEXT`,
+    `ALTER TABLE users DROP CONSTRAINT IF EXISTS users_stallyard_text_number_check`,
+    `ALTER TABLE users ADD CONSTRAINT users_stallyard_text_number_check
+       CHECK (stallyard_text_number IS NULL OR stallyard_text_number ~ '^ST-[0-9]{3}-[0-9]{3}-[0-9]{3}$')`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS users_stallyard_text_number_unique
+       ON users(stallyard_text_number) WHERE stallyard_text_number IS NOT NULL`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -4025,6 +4173,30 @@ app.patch("/profile/verify-phone", authenticate, async (req, res) => {
   }
 });
 
+app.patch("/profile/verify-st-number", authenticate, async (req, res) => {
+  try {
+    const stNumber = normalizeStallyardTextNumber(req.body?.stNumber);
+    if (!stNumber) return res.status(400).json({ error: "Missing or invalid ST number" });
+    const verified = await getSecurityState("st-number-verified", req.user.id);
+    if (!verified || verified.stNumber !== stNumber) {
+      return res.status(400).json({ error: "Verify the code sent to Stallyard Text first" });
+    }
+    await deleteSecurityState("st-number-verified", req.user.id);
+    try {
+      await pool.query(
+        "UPDATE users SET stallyard_text_number = $1, is_phone_verified = true WHERE id = $2",
+        [stNumber, req.user.id]
+      );
+    } catch (err) {
+      if (err.code === "23505") return res.status(409).json({ error: "That ST number is already linked to another Stallyard account" });
+      throw err;
+    }
+    res.json({ success: true, stNumber });
+  } catch (err) {
+    sendInternalError(res, err);
+  }
+});
+
 app.post("/profile/apply-to-sell", authenticate, requireNigeriaMarketplaceUser, async (req, res) => {
   try {
     const { bankStatementUrl } = req.body;
@@ -4048,7 +4220,7 @@ app.post("/profile/apply-to-sell", authenticate, requireNigeriaMarketplaceUser, 
 const USER_PUBLIC_FIELDS = `id, username, display_name, country, account_type, created_at,
   avatar_url, store_bio, store_policies`;
 
-const USER_FULL_FIELDS = `id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, lga_of_residence, office_location,
+const USER_FULL_FIELDS = `id, username, email, phone, stallyard_text_number, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, lga_of_residence, office_location,
   country, is_admin, is_approved, is_verified, is_suspended, is_preview, seller_suspended, seller_suspended_reason, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
   bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
@@ -4121,7 +4293,7 @@ app.get("/users", async (req, res) => {
   }
 });
 
-const USER_RETURNING_FIELDS = `id, username, email, phone, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, lga_of_residence, office_location,
+const USER_RETURNING_FIELDS = `id, username, email, phone, stallyard_text_number, display_name, first_name, last_name, other_name, date_of_birth, gender, nationality, state_of_residence, lga_of_residence, office_location,
   country, is_admin, is_approved, is_verified, is_suspended, is_preview, seller_suspended, seller_suspended_reason, account_type, id_type, id_country,
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
   bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
