@@ -1012,7 +1012,7 @@ function safeHashMatches(left, right) {
   return a.length > 0 && a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-async function stallyardTextRest(path) {
+async function stallyardTextRest(path, options = {}) {
   const base = String(process.env.STALLYARD_TEXT_SUPABASE_URL || "").replace(/\/$/, "");
   const serviceKey = process.env.STALLYARD_TEXT_SUPABASE_SERVICE_ROLE_KEY;
   if (!base || !serviceKey) {
@@ -1021,20 +1021,26 @@ async function stallyardTextRest(path) {
     throw error;
   }
   const response = await fetch(`${base}/rest/v1/${path}`, {
-    headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` },
+    ...options,
+    headers: {
+      apikey: serviceKey,
+      Authorization: `Bearer ${serviceKey}`,
+      ...(options.body ? { "Content-Type": "application/json", Prefer: "return=representation" } : {}),
+      ...(options.headers || {}),
+    },
   });
   if (!response.ok) throw new Error(`Stallyard Text lookup failed (${response.status})`);
   return response.json();
 }
 
-async function sendStallyardTextVerification(tokens, number, code) {
+async function sendStallyardTextVerification(tokens, number, code, systemMessageId) {
   const messages = tokens.map((token) => ({
     to: token,
     sound: "default",
     priority: "high",
     title: "Stallyard verification code",
     body: `${code} is your Stallyard verification code. It expires in 10 minutes.`,
-    data: { type: "verification", number },
+    data: { type: "verification", number, systemMessageId },
     channelId: "messages",
   }));
   const response = await fetch("https://exp.host/--/api/v2/push/send", {
@@ -1365,7 +1371,19 @@ app.post("/st-number-verify/send", authenticate, stNumberSendRateLimit, async (r
     }
 
     const code = String(crypto.randomInt(100000, 1000000));
-    await sendStallyardTextVerification(pushTokens, stNumber, code);
+    const expiresAt = new Date(Date.now() + PHONE_OTP_TTL_MS).toISOString();
+    const inboxMessages = await stallyardTextRest("system_messages", {
+      method: "POST",
+      body: JSON.stringify({
+        user_id: profiles[0].id,
+        source: "marketplace_verification",
+        title: "Stallyard verification code",
+        body: `${code} is your Stallyard verification code. Do not share it with anyone.`,
+        code,
+        expires_at: expiresAt,
+      }),
+    });
+    await sendStallyardTextVerification(pushTokens, stNumber, code, inboxMessages?.[0]?.id);
     await setSecurityState(
       "st-number-otp",
       `${req.user.id}:${stNumber}`,
