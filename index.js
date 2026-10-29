@@ -1033,13 +1033,15 @@ async function stallyardTextRest(path, options = {}) {
   return response.json();
 }
 
-async function sendStallyardTextVerification(tokens, number, code, systemMessageId) {
+async function sendStallyardTextVerification(tokens, number, code, systemMessageId, options = {}) {
+  const title = options.title || "Stallyard verification code";
+  const body = options.body || `${code} is your Stallyard verification code. It expires in 10 minutes.`;
   const messages = tokens.map((token) => ({
     to: token,
     sound: "default",
     priority: "high",
-    title: "Stallyard verification code",
-    body: `${code} is your Stallyard verification code. It expires in 10 minutes.`,
+    title,
+    body,
     data: { type: "verification", number, systemMessageId },
     channelId: "messages",
   }));
@@ -1903,22 +1905,25 @@ async function deleteSecurityState(namespace, subject, client = pool) {
 app.post("/password-reset/send", authRateLimit, async (req, res) => {
   try {
     const { username } = req.body;
+    const method = req.body?.method === "stallyard_text" ? "stallyard_text" : "email";
     if (!username) return res.status(400).json({ error: "Enter your username" });
-    if (!process.env.RESEND_API_KEY) {
+    if (method === "email" && !process.env.RESEND_API_KEY) {
       return res.status(500).json({ error: "Password reset isn't configured yet" });
     }
 
     const key = username.trim().toLowerCase();
     const genericResponse = {
       success: true,
-      message: "If that account is eligible for public password recovery, a reset code will be sent to its email address.",
+      message: method === "stallyard_text"
+        ? "If that account is eligible and has a verified ST number, a reset code will be sent to Stallyard Text."
+        : "If that account is eligible for public password recovery, a reset code will be sent to its email address.",
     };
 
     // Public recovery must never reveal whether a username exists or whether it
     // belongs to an administrator. Admin recovery is handled only through the
     // dedicated Super Admin temporary-password flow.
     const result = await pool.query(
-      "SELECT id, email, is_admin FROM users WHERE username = $1",
+      "SELECT id, email, stallyard_text_number, is_admin FROM users WHERE username = $1",
       [key]
     );
     if (result.rows.length === 0 || result.rows[0].is_admin) {
@@ -1926,32 +1931,55 @@ app.post("/password-reset/send", authRateLimit, async (req, res) => {
       return res.json(genericResponse);
     }
 
-    const { id: userId, email } = result.rows[0];
-    if (!email) {
+    const { id: userId, email, stallyard_text_number: stNumber } = result.rows[0];
+    if ((method === "email" && !email) || (method === "stallyard_text" && !stNumber)) {
       await deleteSecurityState("password-reset", key);
       return res.json(genericResponse);
     }
 
     const code = generateSecurityCode();
-    const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
-    const resendRes = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
-      body: JSON.stringify({
-        from: fromAddress,
-        to: [email],
-        subject: `Your Stallyard password reset code is ${code}`,
-        html: `<p>Your Stallyard password reset code is <strong>${code}</strong>.</p><p>This code expires in 15 minutes. If you didn't request this, you can ignore this email — your password won't change.</p>`,
-      }),
-    });
-    const data = await resendRes.json();
-    if (!resendRes.ok) {
-      return res.status(400).json({ error: data.message || "Couldn't send that email — try again" });
+    if (method === "stallyard_text") {
+      const profiles = await stallyardTextRest(`profiles?stallyard_number=eq.${encodeURIComponent(stNumber)}&select=id&limit=1`);
+      if (!profiles.length) return res.json(genericResponse);
+      const tokens = await stallyardTextRest(`push_tokens?user_id=eq.${encodeURIComponent(profiles[0].id)}&select=expo_push_token`);
+      const pushTokens = tokens.map((row) => row.expo_push_token).filter(Boolean);
+      if (!pushTokens.length) return res.json(genericResponse);
+      const expiresAt = new Date(Date.now() + PASSWORD_RESET_CODE_TTL_MS).toISOString();
+      const title = "Stallyard password reset code";
+      const body = `${code} is your Stallyard Marketplace password reset code. Do not share it with anyone.`;
+      const inboxMessages = await stallyardTextRest("system_messages", {
+        method: "POST",
+        body: JSON.stringify({
+          user_id: profiles[0].id,
+          source: "marketplace_password_reset",
+          title,
+          body,
+          code,
+          expires_at: expiresAt,
+        }),
+      });
+      await sendStallyardTextVerification(pushTokens, stNumber, code, inboxMessages?.[0]?.id, { title, body });
+    } else {
+      const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
+      const resendRes = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
+        body: JSON.stringify({
+          from: fromAddress,
+          to: [email],
+          subject: `Your Stallyard password reset code is ${code}`,
+          html: `<p>Your Stallyard password reset code is <strong>${code}</strong>.</p><p>This code expires in 15 minutes. If you didn't request this, you can ignore this email — your password won't change.</p>`,
+        }),
+      });
+      const data = await resendRes.json();
+      if (!resendRes.ok) {
+        return res.status(400).json({ error: data.message || "Couldn't send that email — try again" });
+      }
     }
 
     await setSecurityState("password-reset", key, { code, userId }, PASSWORD_RESET_CODE_TTL_MS);
-    const maskedEmail = email.replace(/^(.{1,2}).*(@.*)$/, (m, a, b) => `${a}***${b}`);
-    res.json({ ...genericResponse, maskedEmail });
+    const maskedEmail = method === "email" ? email.replace(/^(.{1,2}).*(@.*)$/, (m, a, b) => `${a}***${b}`) : undefined;
+    res.json({ ...genericResponse, method, maskedEmail, maskedStNumber: method === "stallyard_text" ? stNumber : undefined });
   } catch (err) {
     sendInternalError(res, err);
   }
