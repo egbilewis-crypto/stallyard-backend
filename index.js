@@ -10049,11 +10049,15 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
     if (!isOwnSellerItem) {
       logAdminAction(req.user.id, "order_item_fulfillment_updated", `Updated fulfillment details for order item #${req.params.id}`);
     }
-    if (fulfillmentStatus && fulfillmentStatus !== existing.rows[0].fulfillment_status && ["preparing", "shipped"].includes(fulfillmentStatus)) {
-      const statusText = fulfillmentStatus === "preparing" ? "is being prepared by the seller" : "has been shipped";
+    if (fulfillmentStatus && fulfillmentStatus !== existing.rows[0].fulfillment_status && ["preparing", "shipped", "delivered"].includes(fulfillmentStatus)) {
+      const statusText = fulfillmentStatus === "preparing"
+        ? "is being prepared by the seller"
+        : fulfillmentStatus === "shipped" ? "has been shipped" : "has been marked delivered";
       sendMarketplaceOrderAlertToUserSafely(
         existing.rows[0].buyer_id,
-        fulfillmentStatus === "preparing" ? "Seller is preparing your order" : "Your order has shipped",
+        fulfillmentStatus === "preparing"
+          ? "Seller is preparing your order"
+          : fulfillmentStatus === "shipped" ? "Your order has shipped" : "Your order was delivered",
         `${existing.rows[0].title} in order #${existing.rows[0].order_id} ${statusText}. Open Stallyard Marketplace for details.`,
         `marketplace_order_${fulfillmentStatus}`
       );
@@ -10753,7 +10757,7 @@ app.patch("/driver-deliveries/:accessToken/status", async (req, res) => {
     await client.query("BEGIN");
     const locked = await client.query(
       `SELECT da.*, oi.title AS item_title, oi.fulfillment_status, oi.carrier,
-              oi.proof_of_delivery_url, o.shipping_address, o.payment_status AS order_payment_status
+              oi.proof_of_delivery_url, o.shipping_address, o.buyer_id, o.payment_status AS order_payment_status
        FROM delivery_assignments da
        JOIN order_items oi ON oi.id=da.order_item_id
        JOIN orders o ON o.id=da.order_id
@@ -10885,6 +10889,14 @@ app.patch("/driver-deliveries/:accessToken/status", async (req, res) => {
       [assignment.id]
     );
     await client.query("COMMIT");
+    if (["accept", "start", "delivered"].includes(action)) {
+      const alert = action === "accept"
+        ? { title: "Seller is preparing your order", body: `${assignment.item_title} in order #${assignment.order_id} is being prepared for delivery.`, source: "marketplace_order_preparing" }
+        : action === "start"
+        ? { title: "Your order has shipped", body: `${assignment.item_title} in order #${assignment.order_id} is on the way with the local delivery driver.`, source: "marketplace_order_shipped" }
+        : { title: "Your order was delivered", body: `${assignment.item_title} in order #${assignment.order_id} was marked delivered. Inspect it before sending your private delivery token.`, source: "marketplace_order_delivered" };
+      sendMarketplaceOrderAlertToUserSafely(assignment.buyer_id, alert.title, alert.body, alert.source);
+    }
     res.json({ assignment: await publicDriverAssignmentPayload(refreshed.rows[0]) });
   } catch (err) {
     try { await client.query("ROLLBACK"); } catch {}
@@ -11801,7 +11813,9 @@ app.patch("/order-items/:id/self-delivery", authenticate, async (req, res) => {
   try {
     await client.query("BEGIN");
     const result = await client.query(
-      `SELECT * FROM order_items WHERE id = $1 FOR UPDATE`,
+      `SELECT oi.*, o.buyer_id
+         FROM order_items oi JOIN orders o ON o.id = oi.order_id
+        WHERE oi.id = $1 FOR UPDATE OF oi`,
       [req.params.id]
     );
     if (!result.rows.length) {
@@ -11904,6 +11918,14 @@ app.patch("/order-items/:id/self-delivery", authenticate, async (req, res) => {
       [item.id, `self_delivery_${action}`, eventLabel]
     );
     await client.query("COMMIT");
+    if (["start", "on_my_way", "delivered"].includes(action)) {
+      const alert = action === "start"
+        ? { title: "Seller is preparing your order", body: `${item.title} in order #${item.order_id} is being prepared for self delivery.`, source: "marketplace_order_preparing" }
+        : action === "on_my_way"
+        ? { title: "Your order has shipped", body: `${item.title} in order #${item.order_id} is on the way with the seller.`, source: "marketplace_order_shipped" }
+        : { title: "Your order was delivered", body: `${item.title} in order #${item.order_id} was marked delivered. Inspect it before sending your private delivery token.`, source: "marketplace_order_delivered" };
+      sendMarketplaceOrderAlertToUserSafely(item.buyer_id, alert.title, alert.body, alert.source);
+    }
     res.json({ item: updated.rows[0] });
   } catch (err) {
     try { await client.query("ROLLBACK"); } catch {}
