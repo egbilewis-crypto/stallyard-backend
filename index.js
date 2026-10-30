@@ -842,6 +842,14 @@ async function requestAutomaticCheckoutRefund(reference, reason, payment = {}) {
     immediatelyProcessed
       ? "Your full refund was processed because the order could not be completed."
       : "Your payment was received, but the order could not be completed. A full automatic refund has been submitted to Paystack.");
+  sendMarketplaceOrderAlertToUserSafely(
+    intent.buyer_id,
+    immediatelyProcessed ? "Marketplace refund completed" : "Marketplace refund started",
+    immediatelyProcessed
+      ? "Your full refund was processed because the order could not be completed."
+      : "Your payment was received, but the order could not be completed. A full automatic refund has been submitted.",
+    immediatelyProcessed ? "marketplace_order_refund_completed" : "marketplace_order_refund_started"
+  );
   return { alreadyHandled: false, status: refundStatus, refundId: refund.id || null };
 }
 
@@ -986,6 +994,28 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
       [reference]
     );
     await client.query("COMMIT");
+
+    const itemsBySeller = new Map();
+    for (const item of insertedItems) {
+      const titles = itemsBySeller.get(item.seller_id) || [];
+      titles.push(item.title);
+      itemsBySeller.set(item.seller_id, titles);
+    }
+    for (const [sellerId, titles] of itemsBySeller) {
+      const summary = titles.slice(0, 2).join(", ") + (titles.length > 2 ? ` and ${titles.length - 2} more` : "");
+      sendMarketplaceOrderAlertToUserSafely(
+        sellerId,
+        "New Marketplace order",
+        `You received a new paid order #${order.id} for ${summary}. Open Stallyard Marketplace to prepare the order.`,
+        "marketplace_order_new"
+      );
+    }
+    sendMarketplaceOrderAlertToUserSafely(
+      intent.buyer_id,
+      "Delivery token ready",
+      `Your private delivery token for order #${order.id} is ready in Stallyard Marketplace. Keep it private and send it to the seller only after receiving and inspecting your order.`,
+      "marketplace_order_token_ready"
+    );
 
     if (intent.save_card && authorization.reusable && authorization.authorization_code) {
       try {
@@ -1140,6 +1170,38 @@ function sendMarketplaceSecurityAlertSafely(stNumber, title, body, source) {
   if (!stNumber) return;
   sendMarketplaceSecurityAlert(stNumber, title, body, source)
     .catch((err) => console.error(`Failed to send Stallyard Text security alert (${source}):`, err.message));
+}
+
+async function sendMarketplaceOrderAlertToUser(userId, title, body, source) {
+  if (!userId) return;
+  const result = await pool.query(
+    "SELECT stallyard_text_number FROM users WHERE id = $1 LIMIT 1",
+    [userId]
+  );
+  const stNumber = result.rows[0]?.stallyard_text_number;
+  if (stNumber) await sendMarketplaceSecurityAlert(stNumber, title, body, source);
+}
+
+function sendMarketplaceOrderAlertToUserSafely(userId, title, body, source) {
+  if (!userId) return;
+  sendMarketplaceOrderAlertToUser(userId, title, body, source)
+    .catch((err) => console.error(`Failed to send Stallyard Text order alert (${source}):`, err.message));
+}
+
+async function sendMarketplaceOrderAlertToSellers(orderId, title, body, source) {
+  const result = await pool.query(
+    "SELECT DISTINCT seller_id FROM order_items WHERE order_id = $1 AND seller_id IS NOT NULL",
+    [orderId]
+  );
+  for (const row of result.rows) {
+    await sendMarketplaceOrderAlertToUser(row.seller_id, title, body, source);
+  }
+}
+
+function sendMarketplaceOrderAlertToSellersSafely(orderId, title, body, source) {
+  if (!orderId) return;
+  sendMarketplaceOrderAlertToSellers(orderId, title, body, source)
+    .catch((err) => console.error(`Failed to send Stallyard Text seller order alert (${source}):`, err.message));
 }
 
 // SMS is a paid, abuse-sensitive channel, so protect it twice:
@@ -9144,6 +9206,12 @@ app.patch("/orders/:id/release", authenticate, requirePermission("finance"), asy
     );
     for (const row of sellerIds.rows) {
       createNotification(row.seller_id, "funds_released", "Funds released for order — payment is now in your available balance.");
+      sendMarketplaceOrderAlertToUserSafely(
+        row.seller_id,
+        "Marketplace payment released",
+        `Payment for order #${updated.rows[0].id} has been released to your seller balance.`,
+        "marketplace_order_payment_released"
+      );
       if (!usedDeliveryOverride) {
         await queueAutomaticSellerPayouts(Number(req.params.id), row.seller_id).catch((err) => {
           console.error(`Automatic payout scheduling failed after finance release for order #${req.params.id}, seller #${row.seller_id}:`, err.message);
@@ -9330,6 +9398,18 @@ app.patch("/orders/:id/refund", authenticate, requirePermission("finance"), asyn
       "refund_started",
       `Your refund for order #${order.id} has been submitted for processing.`
     );
+    sendMarketplaceOrderAlertToUserSafely(
+      order.buyer_id,
+      "Marketplace refund started",
+      `Your refund for order #${order.id} has been submitted for processing. We will notify you when its status changes.`,
+      "marketplace_order_refund_started"
+    );
+    sendMarketplaceOrderAlertToSellersSafely(
+      order.id,
+      "Marketplace order refund started",
+      `A refund for order #${order.id} has been submitted for processing. Open Stallyard Marketplace for details.`,
+      "marketplace_order_refund_started"
+    );
     res.json({ order: updated.rows[0], paystackMessage: paystackData.message || "Refund queued" });
   } catch (err) {
     try { await client.query("ROLLBACK"); } catch {}
@@ -9511,6 +9591,18 @@ app.patch("/orders/:id/refund/partial", authenticate, requirePermission("finance
       `Requested partial refund of ${formatMoneyServer(amount, order.currency)} for order #${order.id}, dispute #${disputeId}`);
     createNotification(order.buyer_id, "refund_started",
       `A partial refund of ${formatMoneyServer(amount, order.currency)} for order #${order.id} has been submitted for processing.`);
+    sendMarketplaceOrderAlertToUserSafely(
+      order.buyer_id,
+      "Marketplace partial refund started",
+      `A partial refund of ${formatMoneyServer(amount, order.currency)} for order #${order.id} has been submitted for processing.`,
+      "marketplace_order_refund_started"
+    );
+    sendMarketplaceOrderAlertToSellersSafely(
+      order.id,
+      "Marketplace partial refund started",
+      `A partial refund for order #${order.id} has been submitted for processing.`,
+      "marketplace_order_refund_started"
+    );
     res.json({ order: updated.rows[0], paystackMessage: paystackData.message || "Partial refund queued" });
   } catch (err) {
     try { await client.query("ROLLBACK"); } catch {}
@@ -9806,7 +9898,11 @@ const ORDER_ITEM_STATUSES = new Set(["new", "preparing", "shipped", "delivered",
 app.patch("/order-items/:id", authenticate, async (req, res) => {
   try {
     const existing = await pool.query(
-      "SELECT seller_id, cancellation_status, fulfillment_status, carrier, self_delivery_status, estimated_delivery_start, estimated_delivery_end FROM order_items WHERE id = $1",
+      `SELECT oi.seller_id, oi.cancellation_status, oi.fulfillment_status, oi.carrier,
+              oi.self_delivery_status, oi.estimated_delivery_start, oi.estimated_delivery_end,
+              oi.title, oi.order_id, o.buyer_id
+         FROM order_items oi JOIN orders o ON o.id = oi.order_id
+        WHERE oi.id = $1`,
       [req.params.id]
     );
     if (existing.rows.length === 0) return res.status(404).json({ error: "Order item not found" });
@@ -9952,6 +10048,15 @@ app.patch("/order-items/:id", authenticate, async (req, res) => {
     }
     if (!isOwnSellerItem) {
       logAdminAction(req.user.id, "order_item_fulfillment_updated", `Updated fulfillment details for order item #${req.params.id}`);
+    }
+    if (fulfillmentStatus && fulfillmentStatus !== existing.rows[0].fulfillment_status && ["preparing", "shipped"].includes(fulfillmentStatus)) {
+      const statusText = fulfillmentStatus === "preparing" ? "is being prepared by the seller" : "has been shipped";
+      sendMarketplaceOrderAlertToUserSafely(
+        existing.rows[0].buyer_id,
+        fulfillmentStatus === "preparing" ? "Seller is preparing your order" : "Your order has shipped",
+        `${existing.rows[0].title} in order #${existing.rows[0].order_id} ${statusText}. Open Stallyard Marketplace for details.`,
+        `marketplace_order_${fulfillmentStatus}`
+      );
     }
     res.json({ item: result.rows[0] });
   } catch (err) {
@@ -11873,6 +11978,12 @@ async function markItemReceivedAndMaybeRelease(itemId, token, sellerId) {
       const sellerIds = [...new Set(relevant.map((r) => r.seller_id))];
       for (const sellerId of sellerIds) {
         createNotification(sellerId, "funds_released", "Funds released for order — payment is now in your available balance.");
+        sendMarketplaceOrderAlertToUserSafely(
+          sellerId,
+          "Marketplace payment released",
+          `Payment for order #${order.id} has been released to your seller balance.`,
+          "marketplace_order_payment_released"
+        );
       }
     }
     try {
@@ -12445,6 +12556,18 @@ app.post("/webhook/paystack", async (req, res) => {
                 : isPartialRefund
                 ? `Your partial refund of ${formatMoneyServer(order.refund_amount || 0, order.currency)} for order #${order.id} has been processed.`
                 : `Your refund for order #${order.id} has been processed.`);
+              sendMarketplaceOrderAlertToUserSafely(
+                order.buyer_id,
+                "Marketplace refund completed",
+                `Your ${isPartialRefund ? "partial " : ""}refund for order #${order.id} has been processed.`,
+                "marketplace_order_refund_completed"
+              );
+              sendMarketplaceOrderAlertToSellersSafely(
+                order.id,
+                "Marketplace order refund completed",
+                `The ${isPartialRefund ? "partial " : ""}refund for order #${order.id} has been processed.`,
+                "marketplace_order_refund_completed"
+              );
             } else if (event.event === "refund.failed") {
               await pool.query(
                 `UPDATE orders SET
@@ -12456,6 +12579,18 @@ app.post("/webhook/paystack", async (req, res) => {
                 [data.id || null, data.reason || "Paystack reported that the refund failed", order.id]
               );
               createNotification(order.buyer_id, "refund_failed", `The refund for order #${order.id} could not be completed. Stallyard support will review it.`);
+              sendMarketplaceOrderAlertToUserSafely(
+                order.buyer_id,
+                "Marketplace refund needs attention",
+                `The refund for order #${order.id} could not be completed. Stallyard support will review it.`,
+                "marketplace_order_refund_failed"
+              );
+              sendMarketplaceOrderAlertToSellersSafely(
+                order.id,
+                "Marketplace order refund needs attention",
+                `The refund for order #${order.id} could not be completed and is under review.`,
+                "marketplace_order_refund_failed"
+              );
             } else {
               await pool.query(
                 `UPDATE orders SET
