@@ -1007,7 +1007,8 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
         sellerId,
         "New Marketplace order",
         `You received a new paid order #${order.id} for ${summary}. Open Stallyard Marketplace to prepare the order.`,
-        "marketplace_order_new"
+        "marketplace_order_new",
+        "seller"
       );
     }
     sendMarketplaceOrderAlertToUserSafely(
@@ -1114,7 +1115,12 @@ async function sendStallyardTextVerification(tokens, number, code, systemMessage
     priority: "high",
     title,
     body,
-    data: { type: "verification", number, systemMessageId },
+    data: {
+      type: "verification",
+      number,
+      systemMessageId,
+      ...(options.data || {}),
+    },
     channelId: "messages",
   }));
   const response = await fetch("https://exp.host/--/api/v2/push/send", {
@@ -1146,7 +1152,7 @@ function marketplaceDeviceLabel(userAgent) {
   return `${browser} on ${platform}`;
 }
 
-async function sendMarketplaceSecurityAlert(stNumber, title, body, source) {
+async function sendMarketplaceSecurityAlert(stNumber, title, body, source, pushData = {}) {
   if (!stNumber) return;
   const profiles = await stallyardTextRest(`profiles?stallyard_number=eq.${encodeURIComponent(stNumber)}&select=id&limit=1`);
   if (!profiles.length) return;
@@ -1159,10 +1165,15 @@ async function sendMarketplaceSecurityAlert(stNumber, title, body, source) {
       source,
       title,
       body,
+      action_url: pushData.marketplaceUrl || null,
     }),
   });
   if (pushTokens.length) {
-    await sendStallyardTextVerification(pushTokens, stNumber, "", inboxMessages?.[0]?.id, { title, body });
+    await sendStallyardTextVerification(pushTokens, stNumber, "", inboxMessages?.[0]?.id, {
+      title,
+      body,
+      data: { source, ...pushData },
+    });
   }
 }
 
@@ -1172,19 +1183,32 @@ function sendMarketplaceSecurityAlertSafely(stNumber, title, body, source) {
     .catch((err) => console.error(`Failed to send Stallyard Text security alert (${source}):`, err.message));
 }
 
-async function sendMarketplaceOrderAlertToUser(userId, title, body, source) {
+function marketplaceOrderAlertUrl(body, destination = "buyer") {
+  const match = String(body || "").match(/order\s*#(\d+)/i);
+  const orderId = match ? Number(match[1]) : null;
+  if (destination === "seller") return "https://stallyard.com/seller/orders?status=all";
+  if (!orderId) return "https://stallyard.com/buyer/orders?status=all";
+  const orderNumber = `STY-${String(orderId).padStart(6, "0")}`;
+  return `https://stallyard.com/buyer/orders?status=all&search=${encodeURIComponent(orderNumber)}`;
+}
+
+async function sendMarketplaceOrderAlertToUser(userId, title, body, source, destination = "buyer") {
   if (!userId) return;
   const result = await pool.query(
     "SELECT stallyard_text_number FROM users WHERE id = $1 LIMIT 1",
     [userId]
   );
   const stNumber = result.rows[0]?.stallyard_text_number;
-  if (stNumber) await sendMarketplaceSecurityAlert(stNumber, title, body, source);
+  if (stNumber) {
+    await sendMarketplaceSecurityAlert(stNumber, title, body, source, {
+      marketplaceUrl: marketplaceOrderAlertUrl(body, destination),
+    });
+  }
 }
 
-function sendMarketplaceOrderAlertToUserSafely(userId, title, body, source) {
+function sendMarketplaceOrderAlertToUserSafely(userId, title, body, source, destination = "buyer") {
   if (!userId) return;
-  sendMarketplaceOrderAlertToUser(userId, title, body, source)
+  sendMarketplaceOrderAlertToUser(userId, title, body, source, destination)
     .catch((err) => console.error(`Failed to send Stallyard Text order alert (${source}):`, err.message));
 }
 
@@ -1194,7 +1218,7 @@ async function sendMarketplaceOrderAlertToSellers(orderId, title, body, source) 
     [orderId]
   );
   for (const row of result.rows) {
-    await sendMarketplaceOrderAlertToUser(row.seller_id, title, body, source);
+    await sendMarketplaceOrderAlertToUser(row.seller_id, title, body, source, "seller");
   }
 }
 
@@ -9210,7 +9234,8 @@ app.patch("/orders/:id/release", authenticate, requirePermission("finance"), asy
         row.seller_id,
         "Marketplace payment released",
         `Payment for order #${updated.rows[0].id} has been released to your seller balance.`,
-        "marketplace_order_payment_released"
+        "marketplace_order_payment_released",
+        "seller"
       );
       if (!usedDeliveryOverride) {
         await queueAutomaticSellerPayouts(Number(req.params.id), row.seller_id).catch((err) => {
@@ -12004,7 +12029,8 @@ async function markItemReceivedAndMaybeRelease(itemId, token, sellerId) {
           sellerId,
           "Marketplace payment released",
           `Payment for order #${order.id} has been released to your seller balance.`,
-          "marketplace_order_payment_released"
+          "marketplace_order_payment_released",
+          "seller"
         );
       }
     }
