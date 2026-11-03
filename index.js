@@ -6758,6 +6758,42 @@ function normalizedPersonName(value) {
   return String(value || "").toLowerCase().replace(/[^a-z]/g, "");
 }
 
+function personNameParts(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .split(/[^a-z]+/)
+    .filter((part) => part.length > 1);
+}
+
+function legalNameMatchesAccount(account, legalName) {
+  const submittedParts = new Set(personNameParts(legalName));
+  const requiredParts = [account?.first_name, account?.last_name]
+    .flatMap(personNameParts)
+    .filter(Boolean);
+  if (requiredParts.length >= 2) return requiredParts.every((part) => submittedParts.has(part));
+
+  const profileParts = personNameParts(account?.display_name || account?.username);
+  return profileParts.length >= 2 && profileParts.every((part) => submittedParts.has(part));
+}
+
+const CASUAL_AUTOMATIC_CHECK_MESSAGES = {
+  age18OrOlder: "Age requirement could not be confirmed",
+  nigeriaAccount: "Your account country must be Nigeria",
+  emailVerified: "Email address is not verified",
+  phoneVerified: "Phone number is not verified",
+  nameMatchesProfile: "Legal name does not match the first and last name on your account",
+  evidenceFilesPresent: "One or more required live photos are missing",
+  evidenceFilesDistinct: "Each required photo must be captured separately",
+  randomizedChallengesComplete: "All three camera challenges were not completed",
+  serverIssuedChallengeValid: "The secure camera challenge expired or was invalid",
+  awsLivenessVerified: "AWS face-liveness confidence was below the required level",
+  cameraFacePresenceChecks: "A clear single face was not detected in every camera capture",
+  liveSelfieMatchesHoldingPhoto: "The live face did not sufficiently match the selfie holding the ID",
+  duplicateFaceNotFound: "This face may already be connected to another seller account",
+};
+
 function ageOnDate(dateOfBirth, now = new Date()) {
   const birth = new Date(`${dateOfBirth}T00:00:00Z`);
   if (Number.isNaN(birth.getTime()) || birth > now) return -1;
@@ -7012,9 +7048,9 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, reject
     if (!account.is_email_verified || !account.is_phone_verified) {
       throw Object.assign(new Error("Verify both your email and phone number before applying"), { statusCode: 400, code: "CONTACT_VERIFICATION_REQUIRED" });
     }
-    const accountName = normalizedPersonName(`${account.last_name || ""} ${account.first_name || ""} ${account.other_name || ""}`) || normalizedPersonName(account.display_name);
-    const submittedName = normalizedPersonName(legalName);
-    const nameMatches = !!accountName && (submittedName.includes(accountName) || accountName.includes(submittedName));
+    // Match the required first and last names as whole tokens, regardless of order.
+    // A middle/other name remains optional because many IDs omit it.
+    const nameMatches = legalNameMatchesAccount(account, legalName);
     const clientFaceChecks = faceDetectionSupported === true && Array.isArray(faceChecks) && faceChecks.length >= 5 && faceChecks.every(Boolean);
     const faceDescriptor = Array.isArray(faceMatch?.selfieDescriptor) && faceMatch.selfieDescriptor.length === 128 &&
       faceMatch.selfieDescriptor.every((value) => Number.isFinite(Number(value)) && Math.abs(Number(value)) < 10)
@@ -7048,7 +7084,11 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, reject
     }
     const approved = Object.values(checks).every(Boolean);
     const status = approved ? "approved" : "review_required";
-    const failedLabels = Object.entries(checks).filter(([, passed]) => !passed).map(([name]) => name);
+    const failedChecks = Object.entries(checks)
+      .filter(([, passed]) => !passed)
+      .map(([name]) => ({ key: name, message: CASUAL_AUTOMATIC_CHECK_MESSAGES[name] || name }));
+    const failedSummary = failedChecks.map((check) => check.message).join("; ");
+    const decisionReason = approved ? "All automatic checks passed" : `Automatic verification needs attention: ${failedSummary}`;
     const reference = `CSV-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
     const applicationInsert = await client.query(
       `INSERT INTO casual_seller_applications
@@ -7060,7 +7100,7 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, reject
       [reference, req.user.id, String(legalName).trim(), dateOfBirth, null, null, null,
        null, JSON.stringify(Object.fromEntries(Object.entries(images).map(([k, v]) => [k, v.sha256]))),
        JSON.stringify(challenges), JSON.stringify(checks), status,
-       approved ? "All automatic checks passed" : `Automatic verification needs attention: ${failedLabels.join(", ")}`,
+       decisionReason,
        CASUAL_SELLER_CONSENT_VERSION, identityDigest(getClientIp(req) || "unknown"), String(req.headers["user-agent"] || "").slice(0, 500)]
     );
     const applicationId = applicationInsert.rows[0].id;
@@ -7081,8 +7121,13 @@ app.post("/casual-seller/apply", authenticate, rejectAdminMarketplaceUse, reject
     await deleteSecurityState("rekognition-liveness-result", req.user.id).catch(() => {});
     createNotification(req.user.id, approved ? "seller_verified" : "verification_problem",
       approved ? "Your casual-seller identity verification passed. You may publish up to ₦500,000 in combined active listings."
-        : "Your automatic identity verification needs attention. Please review the results and try again.");
-    res.status(201).json({ reference, status, checks, livenessConfidence: awsLiveness.confidence, faceSimilarity: serverFaceSimilarity, limit: CASUAL_SELLER_LIMIT_NGN });
+        : decisionReason);
+    res.status(201).json({
+      reference, status, checks, decisionReason, failedChecks,
+      livenessConfidence: awsLiveness.confidence,
+      faceSimilarity: serverFaceSimilarity,
+      limit: CASUAL_SELLER_LIMIT_NGN,
+    });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     await Promise.all(uploadedPaths.map((path) => deletePrivateVerificationObject(path))).catch(() => {});
