@@ -3704,6 +3704,22 @@ const SCHEMA_MIGRATIONS = [
     `CREATE UNIQUE INDEX IF NOT EXISTS users_stallyard_text_number_unique
        ON users(stallyard_text_number) WHERE stallyard_text_number IS NOT NULL`,
   ] },
+  { version: 93, name: "premium-seller-strengthened-review", statements: [
+    `ALTER TABLE premium_seller_applications
+       ADD COLUMN IF NOT EXISTS business_type TEXT NOT NULL DEFAULT 'individual',
+       ADD COLUMN IF NOT EXISTS cac_number TEXT,
+       ADD COLUMN IF NOT EXISTS cac_document_path TEXT,
+       ADD COLUMN IF NOT EXISTS address_proof_path TEXT,
+       ADD COLUMN IF NOT EXISTS inventory_proof_path TEXT,
+       ADD COLUMN IF NOT EXISTS inventory_source TEXT,
+       ADD COLUMN IF NOT EXISTS liveness_image_path TEXT,
+       ADD COLUMN IF NOT EXISTS liveness_confidence NUMERIC(5,2),
+       ADD COLUMN IF NOT EXISTS liveness_completed_at TIMESTAMP,
+       ADD COLUMN IF NOT EXISTS consent_version TEXT NOT NULL DEFAULT '2026-11-03'`,
+    `ALTER TABLE premium_seller_applications DROP CONSTRAINT IF EXISTS premium_seller_business_type_check`,
+    `ALTER TABLE premium_seller_applications ADD CONSTRAINT premium_seller_business_type_check
+       CHECK (business_type IN ('individual','business'))`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -7290,6 +7306,100 @@ function pdfText(value) {
   return String(value ?? "").replace(/[^\x20-\x7E]/g, "?").replace(/([\\()])/g, "\\$1");
 }
 
+async function requirePremiumSellerCandidate(userId) {
+  const result = await pool.query(
+    `SELECT id,is_approved,is_suspended,seller_suspended,seller_tier,is_email_verified,is_phone_verified
+       FROM users WHERE id=$1`, [userId]
+  );
+  const user = result.rows[0];
+  if (!user || user.is_suspended || user.seller_suspended) {
+    throw Object.assign(new Error("This account cannot apply for Premium Seller"), { statusCode: 403 });
+  }
+  if (!user.is_approved || user.seller_tier !== "verified") {
+    throw Object.assign(new Error("Approved Verified Seller status is required first"), { statusCode: 400 });
+  }
+  if (!user.is_email_verified || !user.is_phone_verified) {
+    throw Object.assign(new Error("Verify your email and phone number first"), { statusCode: 400 });
+  }
+  return user;
+}
+
+app.post("/premium-seller/rekognition/session", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction,
+  requireCompleteProfile, requireVerifiedEmailAndPhone, requireNigeriaMarketplaceUser,
+  rekognitionSessionUserLimit, rekognitionSessionIpLimit, async (req, res) => {
+    try {
+      await requirePremiumSellerCandidate(req.user.id);
+      const roleArn = String(process.env.AWS_LIVENESS_ROLE_ARN || "").trim();
+      if (!roleArn) throw new Error("AWS_LIVENESS_ROLE_ARN is not configured");
+      const session = await rekognitionClient().send(new CreateFaceLivenessSessionCommand({
+        Settings: { AuditImagesLimit: 0 },
+      }));
+      if (!session.SessionId) throw new Error("AWS did not create a liveness session");
+      const assumed = await stsClient().send(new AssumeRoleCommand({
+        RoleArn: roleArn,
+        RoleSessionName: `stallyard-premium-${req.user.id}-${Date.now()}`.slice(0, 64),
+        DurationSeconds: 900,
+      }));
+      const credentials = assumed.Credentials;
+      if (!credentials?.AccessKeyId || !credentials?.SecretAccessKey || !credentials?.SessionToken) {
+        throw new Error("AWS did not issue temporary liveness credentials");
+      }
+      await setSecurityState("premium-rekognition-liveness-session", req.user.id, { sessionId: session.SessionId }, 15 * 60 * 1000);
+      res.setHeader("Cache-Control", "no-store");
+      res.json({
+        sessionId: session.SessionId,
+        region: awsRegion(),
+        credentials: {
+          accessKeyId: credentials.AccessKeyId,
+          secretAccessKey: credentials.SecretAccessKey,
+          sessionToken: credentials.SessionToken,
+          expiration: credentials.Expiration,
+        },
+        remainingAttempts: req.rateLimitState?.["rekognition-liveness-user"]?.remaining ?? 0,
+        attemptLimit: 3,
+        attemptsResetAt: req.rateLimitState?.["rekognition-liveness-user"]?.resetsAt || null,
+      });
+    } catch (err) {
+      if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
+      sendInternalError(res, err, "create Premium Seller liveness session");
+    }
+  }
+);
+
+app.post("/premium-seller/rekognition/complete", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction,
+  requireCompleteProfile, requireVerifiedEmailAndPhone, requireNigeriaMarketplaceUser, async (req, res) => {
+    try {
+      await requirePremiumSellerCandidate(req.user.id);
+      const issued = await getSecurityState("premium-rekognition-liveness-session", req.user.id);
+      const sessionId = String(req.body?.sessionId || "");
+      if (!issued?.sessionId || sessionId !== issued.sessionId) {
+        return res.status(400).json({ error: "The Premium Seller liveness session is invalid or expired" });
+      }
+      const result = await rekognitionClient().send(new GetFaceLivenessSessionResultsCommand({ SessionId: sessionId }));
+      if (result.Status !== "SUCCEEDED" || !result.ReferenceImage?.Bytes) {
+        return res.status(409).json({ error: "AWS could not confirm the liveness check. Please try again." });
+      }
+      const confidence = Number(result.Confidence || 0);
+      if (confidence < REKOGNITION_LIVENESS_MIN_CONFIDENCE) {
+        return res.status(409).json({ error: "The liveness confidence was too low. Improve the lighting and try again." });
+      }
+      const verificationToken = crypto.randomBytes(24).toString("base64url");
+      await setSecurityState("premium-rekognition-liveness-result", req.user.id, {
+        sessionId,
+        verificationToken,
+        confidence,
+        referenceImage: Buffer.from(result.ReferenceImage.Bytes).toString("base64"),
+      }, CASUAL_LIVENESS_TTL_MS);
+      await deleteSecurityState("premium-rekognition-liveness-session", req.user.id);
+      res.setHeader("Cache-Control", "no-store");
+      res.json({ verified: true, confidence, verificationToken, expiresInSeconds: CASUAL_LIVENESS_TTL_MS / 1000 });
+    } catch (err) {
+      if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
+      sendInternalError(res, err, "complete Premium Seller liveness session");
+    }
+  }
+);
+
 app.post("/premium-seller/apply", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   const client = await pool.connect();
   const uploadedPaths = [];
@@ -7299,7 +7409,29 @@ app.post("/premium-seller/apply", authenticate, rejectAdminMarketplaceUse, rejec
     if (!Number.isFinite(requestedLimit) || requestedLimit < PREMIUM_SELLER_MIN_LIMIT_NGN) {
       return res.status(400).json({ error: "Choose a requested limit above ₦20,000,000" });
     }
-    const document = parsePrivateApplicationDocument(req.body?.supportingDocument, "Premium supporting document");
+    const businessType = String(req.body?.businessType || "individual").trim().toLowerCase();
+    if (!new Set(["individual", "business"]).has(businessType)) {
+      return res.status(400).json({ error: "Choose whether you are applying as an individual or registered business" });
+    }
+    const inventorySource = String(req.body?.inventorySource || "").trim().slice(0, 1000);
+    if (inventorySource.length < 20) {
+      return res.status(400).json({ error: "Explain where your Premium inventory comes from" });
+    }
+    const cacNumber = businessType === "business" ? String(req.body?.cacNumber || "").trim().toUpperCase().slice(0, 80) : null;
+    if (businessType === "business" && !cacNumber) {
+      return res.status(400).json({ error: "Enter the CAC registration number for the business" });
+    }
+    const document = parsePrivateApplicationDocument(req.body?.supportingDocument, "Recent bank statement or financial supporting document");
+    const addressProof = parsePrivateApplicationDocument(req.body?.addressProof, "Proof of address");
+    const inventoryProof = parsePrivateApplicationDocument(req.body?.inventoryProof, "Inventory ownership or supply proof");
+    const cacDocument = businessType === "business"
+      ? parsePrivateApplicationDocument(req.body?.cacDocument, "CAC registration document")
+      : null;
+    const livenessResult = await getSecurityState("premium-rekognition-liveness-result", req.user.id);
+    const livenessVerificationToken = String(req.body?.livenessVerificationToken || "");
+    if (!livenessResult?.verificationToken || livenessVerificationToken !== livenessResult.verificationToken || !livenessResult.referenceImage) {
+      return res.status(400).json({ error: "Complete a fresh Premium Seller face-liveness check before applying" });
+    }
     await client.query("BEGIN");
     const userResult = await client.query(
       `SELECT id,username,is_approved,is_suspended,seller_suspended,seller_tier,seller_listing_limit,
@@ -7324,16 +7456,47 @@ app.post("/premium-seller/apply", authenticate, rejectAdminMarketplaceUse, rejec
     const pending = await client.query("SELECT reference FROM premium_seller_applications WHERE user_id=$1 AND status='pending'", [req.user.id]);
     if (pending.rows.length) throw Object.assign(new Error(`Premium Seller application ${pending.rows[0].reference} is already awaiting review`), { statusCode: 409 });
     const reference = `PSA-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
-    const path = `user-${req.user.id}/premium-seller/${reference}/support-${document.sha256.slice(0, 12)}.${document.extension}`;
-    await uploadPrivateVerificationObject(path, document.buffer, document.contentType);
-    uploadedPaths.push(path);
+    const basePath = `user-${req.user.id}/premium-seller/${reference}`;
+    const path = `${basePath}/financial-${document.sha256.slice(0, 12)}.${document.extension}`;
+    const addressProofPath = `${basePath}/address-${addressProof.sha256.slice(0, 12)}.${addressProof.extension}`;
+    const inventoryProofPath = `${basePath}/inventory-${inventoryProof.sha256.slice(0, 12)}.${inventoryProof.extension}`;
+    const cacDocumentPath = cacDocument ? `${basePath}/cac-${cacDocument.sha256.slice(0, 12)}.${cacDocument.extension}` : null;
+    const livenessImagePath = `${basePath}/liveness-${crypto.randomBytes(6).toString("hex")}.jpg`;
+    const uploads = [
+      [path, document.buffer, document.contentType],
+      [addressProofPath, addressProof.buffer, addressProof.contentType],
+      [inventoryProofPath, inventoryProof.buffer, inventoryProof.contentType],
+      [livenessImagePath, Buffer.from(livenessResult.referenceImage, "base64"), "image/jpeg"],
+      ...(cacDocument ? [[cacDocumentPath, cacDocument.buffer, cacDocument.contentType]] : []),
+    ];
+    for (const [uploadPath, bytes, contentType] of uploads) {
+      await uploadPrivateVerificationObject(uploadPath, bytes, contentType);
+      uploadedPaths.push(uploadPath);
+    }
     await client.query(
-      `INSERT INTO premium_seller_applications(reference,user_id,verified_application_id,requested_limit,supporting_document_path,requirements_snapshot,consented_at)
-       VALUES($1,$2,$3,$4,$5,$6,NOW())`,
-      [reference, req.user.id, verifiedApplication.rows[0].id, requestedLimit, path,
-       JSON.stringify({ emailVerified:true, phoneVerified:true, payoutBankVerified:true, addressId:address.rows[0].id, currentTier:user.seller_tier })]
+      `INSERT INTO premium_seller_applications(
+         reference,user_id,verified_application_id,requested_limit,supporting_document_path,
+         business_type,cac_number,cac_document_path,address_proof_path,inventory_proof_path,inventory_source,
+         liveness_image_path,liveness_confidence,liveness_completed_at,requirements_snapshot,consented_at,consent_version
+       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW(),$14,NOW(),'2026-11-03')`,
+      [
+        reference, req.user.id, verifiedApplication.rows[0].id, requestedLimit, path,
+        businessType, cacNumber, cacDocumentPath, addressProofPath, inventoryProofPath, inventorySource,
+        livenessImagePath, Number(livenessResult.confidence || 0),
+        JSON.stringify({
+          emailVerified:true,
+          phoneVerified:true,
+          payoutBankVerified:true,
+          addressId:address.rows[0].id,
+          currentTier:user.seller_tier,
+          verifiedApplicationId:verifiedApplication.rows[0].id,
+          freshLiveness:true,
+          businessType,
+        }),
+      ]
     );
     await client.query("COMMIT");
+    await deleteSecurityState("premium-rekognition-liveness-result", req.user.id).catch(() => {});
     createNotification(req.user.id, "seller_application", `Your Premium Seller application ${reference} was submitted for review.`);
     res.status(201).json({ reference, status:"pending", requestedLimit });
   } catch (err) {
@@ -7349,6 +7512,11 @@ app.get("/admin/premium-seller-applications", authenticate, requireSuperAdmin, a
   try {
     const result = await pool.query(
       `SELECT a.id,a.reference,a.user_id,a.requested_limit,a.status,a.decision_reason,a.created_at,a.reviewed_at,
+              a.business_type,a.cac_number,a.inventory_source,a.liveness_confidence,a.liveness_completed_at,
+              (a.cac_document_path IS NOT NULL) AS has_cac_document,
+              (a.address_proof_path IS NOT NULL) AS has_address_proof,
+              (a.inventory_proof_path IS NOT NULL) AS has_inventory_proof,
+              (a.liveness_image_path IS NOT NULL) AS has_liveness_image,
               u.username,u.display_name,u.email,u.phone
          FROM premium_seller_applications a JOIN users u ON u.id=a.user_id
         WHERE u.is_preview=false
@@ -7358,15 +7526,26 @@ app.get("/admin/premium-seller-applications", authenticate, requireSuperAdmin, a
   } catch (err) { sendInternalError(res, err); }
 });
 
-app.get("/admin/premium-seller-applications/:id/document", authenticate, requireSuperAdmin, async (req, res) => {
+app.get("/admin/premium-seller-applications/:id/document/:documentType?", authenticate, requireSuperAdmin, async (req, res) => {
   try {
-    const result = await pool.query("SELECT reference,supporting_document_path FROM premium_seller_applications WHERE id=$1", [req.params.id]);
+    const documentType = String(req.params.documentType || "financial").toLowerCase();
+    const columns = {
+      financial: "supporting_document_path",
+      address: "address_proof_path",
+      inventory: "inventory_proof_path",
+      cac: "cac_document_path",
+      liveness: "liveness_image_path",
+    };
+    const column = columns[documentType];
+    if (!column) return res.status(400).json({ error:"Unsupported Premium Seller document type" });
+    const result = await pool.query(`SELECT reference,${column} AS document_path FROM premium_seller_applications WHERE id=$1`, [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error:"Application not found" });
-    const bytes = await fetchPrivateVerificationObject(result.rows[0].supporting_document_path);
-    const isPdf = result.rows[0].supporting_document_path.endsWith(".pdf");
-    logAdminAction(req.user.id, "premium_seller_document_viewed", `Viewed supporting document for ${result.rows[0].reference}`);
+    if (!result.rows[0].document_path) return res.status(404).json({ error:"This document was not supplied" });
+    const bytes = await fetchPrivateVerificationObject(result.rows[0].document_path);
+    const isPdf = result.rows[0].document_path.endsWith(".pdf");
+    logAdminAction(req.user.id, "premium_seller_document_viewed", `Viewed ${documentType} document for ${result.rows[0].reference}`);
     res.setHeader("Content-Type", isPdf ? "application/pdf" : "image/jpeg");
-    res.setHeader("Content-Disposition", `inline; filename="${result.rows[0].reference}-support.${isPdf ? "pdf" : "jpg"}` + '"');
+    res.setHeader("Content-Disposition", `inline; filename="${result.rows[0].reference}-${documentType}.${isPdf ? "pdf" : "jpg"}` + '"');
     res.setHeader("Cache-Control", "private, no-store");
     res.send(bytes);
   } catch (err) { sendInternalError(res, err); }
@@ -7399,12 +7578,17 @@ app.patch("/admin/premium-seller-applications/:id/approve", authenticate, requir
         AND street<>'' AND city<>'' AND state<>'' AND LOWER(country)='nigeria' LIMIT 1`,
       [application.user_id]
     );
-    let supportingDocumentAvailable = false;
-    if (application.supporting_document_path) {
-      supportingDocumentAvailable = await fetchPrivateVerificationObject(application.supporting_document_path)
-        .then((bytes) => bytes.length > 0)
-        .catch(() => false);
-    }
+    const documentChecks = await Promise.all(
+      [
+        application.supporting_document_path,
+        application.address_proof_path,
+        application.inventory_proof_path,
+        application.liveness_image_path,
+        ...(application.business_type === "business" ? [application.cac_document_path] : []),
+      ].map((path) => path
+        ? fetchPrivateVerificationObject(path).then((bytes) => bytes.length > 0).catch(() => false)
+        : false)
+    );
     const failedChecks = [];
     if (application.is_suspended || application.seller_suspended) failedChecks.push("seller account is suspended");
     if (!application.is_approved || application.seller_tier !== "verified") failedChecks.push("Verified Seller approval is no longer active");
@@ -7412,7 +7596,16 @@ app.patch("/admin/premium-seller-applications/:id/approve", authenticate, requir
     if (!application.paystack_recipient_code) failedChecks.push("verified payout bank is missing");
     if (!verifiedRecord.rows.length) failedChecks.push("approved Verified Seller record is missing");
     if (!currentAddress.rows.length) failedChecks.push("complete default Nigerian address is missing");
-    if (!supportingDocumentAvailable) failedChecks.push("Premium supporting document is missing");
+    if (!documentChecks[0]) failedChecks.push("recent financial supporting document is missing");
+    if (!documentChecks[1]) failedChecks.push("proof of address is missing");
+    if (!documentChecks[2]) failedChecks.push("inventory ownership or supply proof is missing");
+    if (!documentChecks[3] || !application.liveness_completed_at || Number(application.liveness_confidence || 0) < REKOGNITION_LIVENESS_MIN_CONFIDENCE) {
+      failedChecks.push("fresh Premium Seller liveness verification is missing or invalid");
+    }
+    if (!String(application.inventory_source || "").trim()) failedChecks.push("inventory source explanation is missing");
+    if (application.business_type === "business" && (!application.cac_number || !documentChecks[4])) {
+      failedChecks.push("CAC number or registration document is missing");
+    }
     if (!application.consented_at) failedChecks.push("Premium Seller declaration is missing");
     if (failedChecks.length) {
       await client.query("ROLLBACK");
