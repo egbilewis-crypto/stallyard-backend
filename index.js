@@ -7350,7 +7350,6 @@ app.post("/premium-seller/apply", authenticate, rejectAdminMarketplaceUse, rejec
     if (!user || user.is_suspended || user.seller_suspended) throw Object.assign(new Error("This account cannot apply"), { statusCode: 403 });
     if (!user.is_approved || !["verified", "premium"].includes(user.seller_tier)) throw Object.assign(new Error("Verified Seller approval is required first"), { statusCode: 400 });
     if (user.seller_tier === "premium") throw Object.assign(new Error("Your account is already a Premium Seller"), { statusCode: 409 });
-    if (!user.is_email_verified || !user.is_phone_verified) throw Object.assign(new Error("Verify your email and phone number first"), { statusCode: 400 });
     if (!user.paystack_recipient_code) throw Object.assign(new Error("Keep a verified payout bank account before applying"), { statusCode: 400 });
     const address = await client.query(
       `SELECT id FROM user_addresses WHERE user_id=$1 AND is_default=true AND street<>'' AND city<>'' AND state<>'' AND LOWER(country)='nigeria' LIMIT 1`,
@@ -7389,8 +7388,7 @@ app.post("/premium-seller/apply", authenticate, rejectAdminMarketplaceUse, rejec
         reference, req.user.id, verifiedApplication.rows[0].id, path,
         businessType, cacNumber, cacDocumentPath, addressProofPath, inventoryProofPath, inventorySource,
         JSON.stringify({
-          emailVerified:true,
-          phoneVerified:true,
+          contactVerificationReused:true,
           payoutBankVerified:true,
           addressId:address.rows[0].id,
           currentTier:user.seller_tier,
@@ -7490,7 +7488,6 @@ app.patch("/admin/premium-seller-applications/:id/approve", authenticate, requir
     const failedChecks = [];
     if (application.is_suspended || application.seller_suspended) failedChecks.push("seller account is suspended");
     if (!application.is_approved || application.seller_tier !== "verified") failedChecks.push("Verified Seller approval is no longer active");
-    if (!application.is_email_verified || !application.is_phone_verified) failedChecks.push("email and phone must remain verified");
     if (!application.paystack_recipient_code) failedChecks.push("verified payout bank is missing");
     if (!verifiedRecord.rows.length) failedChecks.push("approved Verified Seller record is missing");
     if (!currentAddress.rows.length) failedChecks.push("complete default Nigerian address is missing");
