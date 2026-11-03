@@ -3717,6 +3717,18 @@ const SCHEMA_MIGRATIONS = [
     `ALTER TABLE premium_seller_applications ADD CONSTRAINT premium_seller_business_type_check
        CHECK (business_type IN ('individual','business'))`,
   ] },
+  { version: 94, name: "premium-seller-business-only-unlimited", statements: [
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS premium_unlimited BOOLEAN NOT NULL DEFAULT false`,
+    `UPDATE users SET premium_unlimited = true WHERE seller_tier = 'premium'`,
+    `ALTER TABLE premium_seller_applications ALTER COLUMN requested_limit DROP NOT NULL`,
+    `ALTER TABLE premium_seller_applications
+       ADD COLUMN IF NOT EXISTS unlimited_requested BOOLEAN NOT NULL DEFAULT false,
+       ADD COLUMN IF NOT EXISTS site_verification_consent BOOLEAN NOT NULL DEFAULT false`,
+    `UPDATE premium_seller_applications SET unlimited_requested = true WHERE status = 'pending'`,
+    `ALTER TABLE premium_seller_applications DROP CONSTRAINT IF EXISTS premium_seller_business_type_check`,
+    `ALTER TABLE premium_seller_applications ADD CONSTRAINT premium_seller_business_only_check
+       CHECK (business_type = 'business' OR consent_version <> '2026-11-03-business-unlimited') NOT VALID`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -4562,7 +4574,7 @@ const USER_RETURNING_FIELDS = `id, username, email, phone, stallyard_text_number
   license_number, license_photos, id_verification_exempt, has_applied_to_sell, verification_status,
   bank_statement_url, rejection_reason, created_at, avatar_url, store_bio, store_policies, two_factor_enabled,
   is_email_verified, is_phone_verified, token_version, admin_role, casual_seller_status,
-  casual_seller_limit, casual_seller_approved_at, seller_tier, seller_listing_limit,
+  casual_seller_limit, casual_seller_approved_at, seller_tier, seller_listing_limit, premium_unlimited,
   profile_complete, onboarding_intent, onboarding_completed_at`;
 
 app.patch("/users/:id/verify", authenticate, requirePermission("user_management"), async (req, res) => {
@@ -5484,7 +5496,7 @@ const SESSION_USER_FIELDS = `id, username, email, phone, display_name, first_nam
   country, is_admin, is_approved, is_verified, is_suspended, is_preview, seller_suspended, seller_suspended_reason, account_type,
   has_applied_to_sell, verification_status, avatar_url, store_bio, store_policies,
   two_factor_enabled, is_email_verified, is_phone_verified, token_version, admin_role,
-  casual_seller_status, casual_seller_limit, casual_seller_approved_at, seller_tier, seller_listing_limit,
+  casual_seller_status, casual_seller_limit, casual_seller_approved_at, seller_tier, seller_listing_limit, premium_unlimited,
   profile_complete, onboarding_intent, onboarding_completed_at`;
 
 app.get("/session/me", authenticate, async (req, res) => {
@@ -6580,7 +6592,6 @@ const LISTING_SUBCATEGORIES = {
 
 const CASUAL_SELLER_LIMIT_NGN = 500000;
 const VERIFIED_SELLER_LIMIT_NGN = 20000000;
-const PREMIUM_SELLER_MIN_LIMIT_NGN = 20000000.01;
 const CASUAL_SELLER_ID_TYPES = new Set(["nin", "passport", "drivers_license", "voters_card", "cerpac"]);
 const CASUAL_SELLER_CONSENT_VERSION = "2026-09-12";
 const CASUAL_LIVENESS_TTL_MS = 10 * 60 * 1000;
@@ -6768,7 +6779,7 @@ async function activeListingValue(client, ownerId, excludeListingId = null) {
 
 async function assertSellerMayPublish(client, ownerId, proposedPrice, proposedQuantity, excludeListingId = null) {
   const userResult = await client.query(
-      `SELECT is_approved, is_suspended, is_preview, seller_suspended, casual_seller_status, casual_seller_limit, seller_tier, seller_listing_limit, username, display_name
+      `SELECT is_approved, is_suspended, is_preview, seller_suspended, casual_seller_status, casual_seller_limit, seller_tier, seller_listing_limit, premium_unlimited, username, display_name
        FROM users WHERE id = $1 FOR UPDATE`,
     [ownerId]
   );
@@ -6784,6 +6795,12 @@ async function assertSellerMayPublish(client, ownerId, proposedPrice, proposedQu
   const quantity = Math.max(1, Number(proposedQuantity || 1));
   const current = await activeListingValue(client, ownerId, excludeListingId);
   if (seller.is_approved) {
+    if (seller.seller_tier === "premium" && seller.premium_unlimited) {
+      if (!Number.isFinite(price) || price <= 0) {
+        throw Object.assign(new Error("Enter a valid listing price."), { statusCode: 400, code: "INVALID_LISTING_PRICE" });
+      }
+      return seller;
+    }
     const verifiedLimit = Number(seller.seller_listing_limit || VERIFIED_SELLER_LIMIT_NGN);
     const approvedTier = seller.seller_tier === "premium" ? "Premium Seller" : "Verified Seller";
     const limitCode = seller.seller_tier === "premium" ? "PREMIUM_LISTING_LIMIT" : "VERIFIED_LISTING_LIMIT";
@@ -6811,7 +6828,7 @@ app.get("/casual-seller/status", authenticate, rejectAdminMarketplaceUse, async 
     const user = await pool.query(
       `SELECT casual_seller_status, casual_seller_limit, casual_seller_approved_at,
               is_approved, is_email_verified, is_phone_verified,
-              seller_tier, seller_listing_limit
+              seller_tier, seller_listing_limit, premium_unlimited
          FROM users WHERE id = $1`, [req.user.id]
     );
     const latest = await pool.query(
@@ -6819,7 +6836,7 @@ app.get("/casual-seller/status", authenticate, rejectAdminMarketplaceUse, async 
          FROM casual_seller_applications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`, [req.user.id]
     );
     const latestPremium = await pool.query(
-      `SELECT reference, requested_limit, status, decision_reason, created_at, reviewed_at
+      `SELECT reference, requested_limit, unlimited_requested, status, decision_reason, created_at, reviewed_at
          FROM premium_seller_applications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`, [req.user.id]
     );
     const currentValue = await activeListingValue(pool, req.user.id);
@@ -6827,15 +6844,17 @@ app.get("/casual-seller/status", authenticate, rejectAdminMarketplaceUse, async 
     const sellerTier = account.is_approved
       ? (account.seller_tier === "premium" ? "premium" : "verified")
       : (account.casual_seller_status === "approved" ? "casual" : "buyer");
+    const unlimited = sellerTier === "premium" && !!account.premium_unlimited;
     const effectiveLimit = account.is_approved
-      ? Number(account.seller_listing_limit || VERIFIED_SELLER_LIMIT_NGN)
+      ? (unlimited ? null : Number(account.seller_listing_limit || VERIFIED_SELLER_LIMIT_NGN))
       : Number(account.casual_seller_limit || CASUAL_SELLER_LIMIT_NGN);
     res.json({
       status: account.casual_seller_status || "none",
       sellerTier,
       limit: effectiveLimit,
+      unlimited,
       currentActiveValue: currentValue,
-      remainingValue: Math.max(0, effectiveLimit - currentValue),
+      remainingValue: unlimited ? null : Math.max(0, effectiveLimit - currentValue),
       fullyApprovedSeller: !!account.is_approved,
       emailVerified: !!account.is_email_verified,
       phoneVerified: !!account.is_phone_verified,
@@ -7308,28 +7327,19 @@ app.post("/premium-seller/apply", authenticate, rejectAdminMarketplaceUse, rejec
   const uploadedPaths = [];
   try {
     if (req.body?.consent !== true) return res.status(400).json({ error: "Accept the Premium Seller declaration before applying" });
-    const requestedLimit = Number(req.body?.requestedLimit);
-    if (!Number.isFinite(requestedLimit) || requestedLimit < PREMIUM_SELLER_MIN_LIMIT_NGN) {
-      return res.status(400).json({ error: "Choose a requested limit above ₦20,000,000" });
-    }
-    const businessType = String(req.body?.businessType || "individual").trim().toLowerCase();
-    if (!new Set(["individual", "business"]).has(businessType)) {
-      return res.status(400).json({ error: "Choose whether you are applying as an individual or registered business" });
-    }
+    if (req.body?.siteVerificationConsent !== true) return res.status(400).json({ error: "Accept the annual business-location verification declaration before applying" });
+    const businessType = String(req.body?.businessType || "").trim().toLowerCase();
+    if (businessType !== "business") return res.status(400).json({ error: "Premium Seller is available only to registered businesses" });
     const inventorySource = String(req.body?.inventorySource || "").trim().slice(0, 1000);
     if (inventorySource.length < 20) {
       return res.status(400).json({ error: "Explain where your Premium inventory comes from" });
     }
-    const cacNumber = businessType === "business" ? String(req.body?.cacNumber || "").trim().toUpperCase().slice(0, 80) : null;
-    if (businessType === "business" && !cacNumber) {
-      return res.status(400).json({ error: "Enter the CAC registration number for the business" });
-    }
+    const cacNumber = String(req.body?.cacNumber || "").trim().toUpperCase().slice(0, 80);
+    if (!cacNumber) return res.status(400).json({ error: "Enter the CAC registration number for the business" });
     const document = parsePrivateApplicationDocument(req.body?.supportingDocument, "Recent bank statement or financial supporting document");
     const addressProof = parsePrivateApplicationDocument(req.body?.addressProof, "Proof of address");
     const inventoryProof = parsePrivateApplicationDocument(req.body?.inventoryProof, "Inventory ownership or supply proof");
-    const cacDocument = businessType === "business"
-      ? parsePrivateApplicationDocument(req.body?.cacDocument, "CAC registration document")
-      : null;
+    const cacDocument = parsePrivateApplicationDocument(req.body?.cacDocument, "CAC registration document");
     await client.query("BEGIN");
     const userResult = await client.query(
       `SELECT id,username,is_approved,is_suspended,seller_suspended,seller_tier,seller_listing_limit,
@@ -7358,12 +7368,12 @@ app.post("/premium-seller/apply", authenticate, rejectAdminMarketplaceUse, rejec
     const path = `${basePath}/financial-${document.sha256.slice(0, 12)}.${document.extension}`;
     const addressProofPath = `${basePath}/address-${addressProof.sha256.slice(0, 12)}.${addressProof.extension}`;
     const inventoryProofPath = `${basePath}/inventory-${inventoryProof.sha256.slice(0, 12)}.${inventoryProof.extension}`;
-    const cacDocumentPath = cacDocument ? `${basePath}/cac-${cacDocument.sha256.slice(0, 12)}.${cacDocument.extension}` : null;
+    const cacDocumentPath = `${basePath}/cac-${cacDocument.sha256.slice(0, 12)}.${cacDocument.extension}`;
     const uploads = [
       [path, document.buffer, document.contentType],
       [addressProofPath, addressProof.buffer, addressProof.contentType],
       [inventoryProofPath, inventoryProof.buffer, inventoryProof.contentType],
-      ...(cacDocument ? [[cacDocumentPath, cacDocument.buffer, cacDocument.contentType]] : []),
+      [cacDocumentPath, cacDocument.buffer, cacDocument.contentType],
     ];
     for (const [uploadPath, bytes, contentType] of uploads) {
       await uploadPrivateVerificationObject(uploadPath, bytes, contentType);
@@ -7373,10 +7383,10 @@ app.post("/premium-seller/apply", authenticate, rejectAdminMarketplaceUse, rejec
       `INSERT INTO premium_seller_applications(
          reference,user_id,verified_application_id,requested_limit,supporting_document_path,
          business_type,cac_number,cac_document_path,address_proof_path,inventory_proof_path,inventory_source,
-         requirements_snapshot,consented_at,consent_version
-       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),'2026-11-03')`,
+         requirements_snapshot,consented_at,consent_version,unlimited_requested,site_verification_consent
+       ) VALUES($1,$2,$3,NULL,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),'2026-11-03-business-unlimited',true,true)`,
       [
-        reference, req.user.id, verifiedApplication.rows[0].id, requestedLimit, path,
+        reference, req.user.id, verifiedApplication.rows[0].id, path,
         businessType, cacNumber, cacDocumentPath, addressProofPath, inventoryProofPath, inventorySource,
         JSON.stringify({
           emailVerified:true,
@@ -7387,12 +7397,14 @@ app.post("/premium-seller/apply", authenticate, rejectAdminMarketplaceUse, rejec
           verifiedApplicationId:verifiedApplication.rows[0].id,
           identityVerificationReused:true,
           businessType,
+          unlimitedRequested:true,
+          annualUnannouncedLocationVisitConsented:true,
         }),
       ]
     );
     await client.query("COMMIT");
     createNotification(req.user.id, "seller_application", `Your Premium Seller application ${reference} was submitted for review.`);
-    res.status(201).json({ reference, status:"pending", requestedLimit });
+    res.status(201).json({ reference, status:"pending", unlimited:true });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     await Promise.all(uploadedPaths.map((path) => deletePrivateVerificationObject(path))).catch(() => {});
@@ -7405,7 +7417,7 @@ app.post("/premium-seller/apply", authenticate, rejectAdminMarketplaceUse, rejec
 app.get("/admin/premium-seller-applications", authenticate, requireSuperAdmin, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT a.id,a.reference,a.user_id,a.requested_limit,a.status,a.decision_reason,a.created_at,a.reviewed_at,
+      `SELECT a.id,a.reference,a.user_id,a.requested_limit,a.unlimited_requested,a.site_verification_consent,a.status,a.decision_reason,a.created_at,a.reviewed_at,
               a.business_type,a.cac_number,a.inventory_source,
               (a.cac_document_path IS NOT NULL) AS has_cac_document,
               (a.address_proof_path IS NOT NULL) AS has_address_proof,
@@ -7456,11 +7468,6 @@ app.patch("/admin/premium-seller-applications/:id/approve", authenticate, requir
     const application = applicationResult.rows[0];
     if (!application) { await client.query("ROLLBACK"); return res.status(404).json({ error:"Application not found" }); }
     if (application.status !== "pending") { await client.query("ROLLBACK"); return res.status(409).json({ error:"Only a pending Premium Seller application can be approved" }); }
-    const approvedLimit = Number(req.body?.approvedLimit || application.requested_limit);
-    if (!Number.isFinite(approvedLimit) || approvedLimit < PREMIUM_SELLER_MIN_LIMIT_NGN) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ error:"Approved limit must be above ₦20,000,000" });
-    }
     const verifiedRecord = await client.query(
       "SELECT id FROM verified_seller_applications WHERE id=$1 AND user_id=$2 AND status='approved'",
       [application.verified_application_id, application.user_id]
@@ -7475,7 +7482,7 @@ app.patch("/admin/premium-seller-applications/:id/approve", authenticate, requir
         application.supporting_document_path,
         application.address_proof_path,
         application.inventory_proof_path,
-        ...(application.business_type === "business" ? [application.cac_document_path] : []),
+        application.cac_document_path,
       ].map((path) => path
         ? fetchPrivateVerificationObject(path).then((bytes) => bytes.length > 0).catch(() => false)
         : false)
@@ -7491,25 +7498,26 @@ app.patch("/admin/premium-seller-applications/:id/approve", authenticate, requir
     if (!documentChecks[1]) failedChecks.push("proof of address is missing");
     if (!documentChecks[2]) failedChecks.push("inventory ownership or supply proof is missing");
     if (!String(application.inventory_source || "").trim()) failedChecks.push("inventory source explanation is missing");
-    if (application.business_type === "business" && (!application.cac_number || !documentChecks[3])) {
-      failedChecks.push("CAC number or registration document is missing");
-    }
+    if (application.business_type !== "business") failedChecks.push("Premium Seller is restricted to registered businesses");
+    if (!application.cac_number || !documentChecks[3]) failedChecks.push("CAC number or registration document is missing");
     if (!application.consented_at) failedChecks.push("Premium Seller declaration is missing");
+    if (!application.unlimited_requested) failedChecks.push("unlimited Premium Seller access was not requested");
+    if (!application.site_verification_consent) failedChecks.push("annual business-location verification consent is missing");
     if (failedChecks.length) {
       await client.query("ROLLBACK");
       return res.status(409).json({ error:`Premium Seller cannot be approved: ${failedChecks.join("; ")}`, failedChecks });
     }
     const userResult = await client.query(
-      `UPDATE users SET seller_tier='premium',seller_listing_limit=$1,is_approved=true,verification_status='approved'
-        WHERE id=$2 AND is_suspended=false AND seller_suspended=false RETURNING ${USER_RETURNING_FIELDS}`, [approvedLimit, application.user_id]
+      `UPDATE users SET seller_tier='premium',premium_unlimited=true,is_approved=true,verification_status='approved'
+        WHERE id=$1 AND is_suspended=false AND seller_suspended=false RETURNING ${USER_RETURNING_FIELDS}`, [application.user_id]
     );
     if (!userResult.rows.length) { await client.query("ROLLBACK"); return res.status(409).json({ error:"The seller account is unavailable or suspended" }); }
     await client.query("UPDATE premium_seller_applications SET status='approved',decision_reason=$1,reviewed_by=$2,reviewed_at=NOW(),updated_at=NOW() WHERE id=$3",
-      [`Approved with ₦${approvedLimit.toLocaleString("en-NG")} active-listing limit`, req.user.id, application.id]);
+      ["Approved with unlimited combined active listings", req.user.id, application.id]);
     await client.query("COMMIT");
-    logAdminAction(req.user.id, "premium_seller_approved", `Approved Premium Seller application ${application.reference} with limit NGN ${approvedLimit}`);
-    createNotification(application.user_id, "seller_application", `Your Premium Seller application was approved with a ₦${approvedLimit.toLocaleString("en-NG")} combined active-listing limit.`);
-    res.json({ user:userResult.rows[0], applicationId:application.id, approvedLimit });
+    logAdminAction(req.user.id, "premium_seller_approved", `Approved Premium Seller application ${application.reference} with unlimited combined active listings`);
+    createNotification(application.user_id, "seller_application", "Your Premium Seller application was approved with unlimited combined active listings.");
+    res.json({ user:userResult.rows[0], applicationId:application.id, unlimited:true });
   } catch (err) { await client.query("ROLLBACK").catch(() => {}); sendInternalError(res, err); }
   finally { client.release(); }
 });
@@ -7764,7 +7772,9 @@ async function buildPremiumSellerReportPdf(applications, reportDate, reportPassw
     const lines = [
       `Daily report: ${reportDate}`, `Application: ${application.reference}`, `Seller: ${fullName} (@${application.username})`,
       `Email: ${application.email || "not provided"}   Phone: ${application.phone || "not provided"}`,
-      `Requested limit: NGN ${Number(application.requested_limit).toLocaleString("en-NG")}`,
+      "Requested combined active-listing limit: Unlimited",
+      `Registered business: CAC ${application.cac_number || "not provided"}`,
+      `Annual unannounced location-verification consent: ${application.site_verification_consent ? "accepted" : "not recorded"}`,
       `Approved: ${application.reviewed_at ? new Date(application.reviewed_at).toISOString() : "not recorded"}`,
       `Decision: ${application.decision_reason || "Approved by authorized administrator"}`,
       isImage ? "Supporting document: image reproduced below and original retained securely" : "Supporting document: original PDF retained securely",
