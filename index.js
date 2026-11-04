@@ -3864,12 +3864,21 @@ app.patch("/profile/complete", authenticate, async (req, res) => {
       return res.status(403).json({ error: "Stallyard is available in Nigeria only" });
     }
 
-    if (!phone) return res.status(400).json({ error: "Enter your Nigerian phone number" });
-    const normalizedPhone = normalizeNigerianPhone(phone);
-    if (!normalizedPhone) return res.status(400).json({ error: "Enter a valid Nigerian phone number" });
-    const phoneCheck = await checkPhoneNumber(normalizedPhone);
-    if (phoneCheck?.blocked) {
-      return res.status(400).json({ error: phoneCheck.reason });
+    const existing = await pool.query(
+      `SELECT date_of_birth, profile_complete, phone, stallyard_text_number, is_phone_verified
+         FROM users WHERE id=$1`,
+      [req.user.id]
+    );
+    if (!existing.rows.length) return res.status(404).json({ error: "User not found" });
+    const hasVerifiedStNumber = !!existing.rows[0].is_phone_verified && !!existing.rows[0].stallyard_text_number;
+    let normalizedPhone = null;
+    if (String(phone || "").trim()) {
+      normalizedPhone = normalizeNigerianPhone(phone);
+      if (!normalizedPhone) return res.status(400).json({ error: "Enter a valid Nigerian phone number" });
+      const phoneCheck = await checkPhoneNumber(normalizedPhone);
+      if (phoneCheck?.blocked) return res.status(400).json({ error: phoneCheck.reason });
+    } else if (!hasVerifiedStNumber && !existing.rows[0].phone) {
+      return res.status(400).json({ error: "Enter your Nigerian phone number or verify your Stallyard Text number" });
     }
 
     if (!dateOfBirth || ageOnDate(dateOfBirth) < 18) {
@@ -3885,8 +3894,6 @@ app.patch("/profile/complete", authenticate, async (req, res) => {
     const normalizedLga = String(lgaOfResidence || "").trim();
     if (!normalizedLga) return res.status(400).json({ error: "Select your Local Government Area" });
 
-    const existing = await pool.query("SELECT date_of_birth, profile_complete FROM users WHERE id=$1", [req.user.id]);
-    if (!existing.rows.length) return res.status(404).json({ error: "User not found" });
     if (existing.rows[0].profile_complete && existing.rows[0].date_of_birth && String(existing.rows[0].date_of_birth).slice(0, 10) !== dateOfBirth) {
       return res.status(409).json({ error: "Date of birth cannot be changed after account setup. Contact Stallyard support if it is incorrect." });
     }
@@ -3901,7 +3908,7 @@ app.patch("/profile/complete", authenticate, async (req, res) => {
          nationality = COALESCE($6, nationality),
          state_of_residence = COALESCE($7, state_of_residence),
          lga_of_residence = $8,
-         phone = $9,
+         phone = COALESCE($9, phone),
          country = 'Nigeria',
          account_type = 'personal',
          profile_complete = true,
