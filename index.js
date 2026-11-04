@@ -8389,6 +8389,12 @@ function quoteListingShipping(listing, item, method) {
   return { fee: Number(routes[index].amount), route: routes[index] };
 }
 
+function requireListingLocation(state) {
+  if (typeof state !== "string" || !(Object.prototype.hasOwnProperty.call(NIGERIA_LGAS, state) || state === "FCT (Abuja)")) {
+    throw Object.assign(new Error("Select the state where the item is located before publishing."), { statusCode: 400 });
+  }
+}
+
 function requireListingShippingMethods(methods) {
   const allowed = new Set(["pickup", "dhl", "self_delivery", "local_delivery_driver"]);
   if (!Array.isArray(methods) || methods.length === 0 || methods.some((method) => !allowed.has(method))) {
@@ -8431,6 +8437,7 @@ app.post("/listings", authenticate, rejectAdminMarketplaceUse, rejectPreviewReal
     if (listingStatus === "active") {
       requireListingPhotos(images);
       requireListingShippingMethods(shippingMethods);
+      requireListingLocation(state);
     }
     const allowedSubcategories = LISTING_SUBCATEGORIES[category || "Other"] || [];
     if (listingStatus !== "draft" && (!subcategory || !allowedSubcategories.includes(subcategory))) {
@@ -8662,6 +8669,7 @@ app.patch("/listings/:id", authenticate, async (req, res) => {
     const nextStatusRaw = Object.prototype.hasOwnProperty.call(req.body, "status") ? req.body.status : existing.rows[0].status;
     const nextStatus = nextStatusRaw === "approved" ? "active" : nextStatusRaw;
     if (nextStatus === "active") {
+      requireListingLocation(Object.prototype.hasOwnProperty.call(req.body, "state") ? req.body.state : existing.rows[0].state);
       requireListingShippingMethods(Object.prototype.hasOwnProperty.call(req.body, "shippingMethods") ? req.body.shippingMethods : existing.rows[0].shipping_methods);
       requireListingPhotos(
         Object.prototype.hasOwnProperty.call(req.body, "images") ? req.body.images : existing.rows[0].images,
