@@ -3745,6 +3745,9 @@ const SCHEMA_MIGRATIONS = [
     `ALTER TABLE listings ADD COLUMN IF NOT EXISTS pickup_location_encrypted TEXT`,
     `ALTER TABLE order_items ADD COLUMN IF NOT EXISTS pickup_location_encrypted TEXT`,
   ] },
+  { version: 99, name: "listing-delivery-method-charges", statements: [
+    `ALTER TABLE listings ADD COLUMN IF NOT EXISTS shipping_method_fees JSONB NOT NULL DEFAULT '{}'::jsonb`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -8348,7 +8351,7 @@ app.post("/admin/premium-seller-reports/run", authenticate, requireSuperAdmin, a
 });
 
 function chooseListingShippingMethod(listing, selected) {
-  const known = new Set(["pickup", "dhl", "self_delivery", "local_delivery_driver"]);
+  const known = new Set(["free_shipping", "pickup", "dhl", "self_delivery", "local_delivery_driver"]);
   const offered = Array.isArray(listing.shipping_methods) ? [...new Set(listing.shipping_methods.filter((method) => known.has(method)))] : [];
   const allowed = offered.length ? offered : ["seller_delivery"];
   const method = selected === undefined && allowed.length === 1 ? allowed[0] : selected;
@@ -8385,14 +8388,31 @@ function validateShippingRoute(route, fee) {
 }
 
 function quoteListingShipping(listing, item, method) {
-  if (method === "pickup") return { fee: 0, route: null };
+  if (method === "pickup" || method === "free_shipping") return { fee: 0, route: null };
+  const methodFees = validateDeliveryMethodFees(listing.shipping_method_fees || {}, [method], true);
+  const methodFee = methodFees[method];
   const saved = listing.shipping_route || {};
   const routes = Array.isArray(saved.routes) ? saved.routes : saved.shippingFromState && saved.shippingToState ? [{ ...saved, amount: Number(listing.shipping_fee) || 0 }] : [];
-  if (!routes.length) return { fee: Number(listing.shipping_fee) || 0, route: null };
+  if (!routes.length) return { fee: methodFee ?? (Number(listing.shipping_fee) || 0), route: null };
   const selected = item.shippingRouteIndex ?? (routes.length === 1 ? 0 : "");
   const index = Number(selected);
   if (!["string", "number"].includes(typeof selected) || selected === "" || !Number.isInteger(index) || index < 0 || !routes[index]) throw Object.assign(new Error(`Choose one shipping route for ${listing.title}.`), { statusCode: 400 });
-  return { fee: Number(routes[index].amount), route: routes[index] };
+  return { fee: methodFee ?? Number(routes[index].amount), route: routes[index] };
+}
+
+function validateDeliveryMethodFees(fees, methods, published) {
+  if (!fees || typeof fees !== "object" || Array.isArray(fees)) throw Object.assign(new Error("Invalid delivery charges."), { statusCode: 400 });
+  const normalized = {};
+  for (const method of ["self_delivery", "local_delivery_driver"]) {
+    const value = fees[method];
+    const missing = value === undefined || value === null || value === "";
+    if (published && methods?.includes("local_delivery_driver") && method === "local_delivery_driver" && missing) throw Object.assign(new Error("Enter the Local Delivery Driver charge before publishing."), { statusCode: 400 });
+    if (missing) continue;
+    const amount = Number(value);
+    if (!Number.isFinite(amount) || amount < 0 || (method === "local_delivery_driver" && amount < 0.01)) throw Object.assign(new Error("Enter a valid delivery charge. Local Delivery Driver charge must be greater than zero."), { statusCode: 400 });
+    normalized[method] = Math.round(amount * 100) / 100;
+  }
+  return normalized;
 }
 
 function paidBuyerPickupItem(item) {
@@ -8423,7 +8443,7 @@ function requireListingLocation(state) {
 }
 
 function requireListingShippingMethods(methods) {
-  const allowed = new Set(["pickup", "dhl", "self_delivery", "local_delivery_driver"]);
+  const allowed = new Set(["free_shipping", "pickup", "dhl", "self_delivery", "local_delivery_driver"]);
   if (!Array.isArray(methods) || methods.length === 0 || methods.some((method) => !allowed.has(method))) {
     throw Object.assign(new Error("Choose at least one delivery or pickup method before publishing."), { statusCode: 400 });
   }
@@ -8448,6 +8468,7 @@ app.post("/listings", authenticate, rejectAdminMarketplaceUse, rejectPreviewReal
       status, auctionEndTime, quantity, sku, brand, state, shippingMethods,
       returnPolicy, vin,
     } = req.body;
+    const methodFees = validateDeliveryMethodFees(req.body.shippingMethodFees || {}, shippingMethods, status !== "draft");
     const pickupLocation = normalizePickupLocation(req.body.pickupLocation);
     const shippingRoute = validateShippingRoute(req.body.shippingRoute || {}, shippingFee);
     const ownerId = req.user.id; // always the signed-in user — never trust a client-supplied owner
@@ -8482,9 +8503,9 @@ app.post("/listings", authenticate, rejectAdminMarketplaceUse, rejectPreviewReal
          owner_id, title, description, price, category, subcategory, condition, shipping_fee,
          emoji, fit_make, fit_model, fit_year, images, listing_type, currency,
          status, auction_end_time, quantity, sku, brand, state, shipping_methods,
-         return_policy, vin, shipping_route, pickup_location_encrypted
+         return_policy, vin, shipping_route, pickup_location_encrypted, shipping_method_fees
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
        RETURNING *`,
       [
         ownerId, title, description || "", price, category || "Other", subcategory || "", condition || "New", shippingFee || 0,
@@ -8493,7 +8514,7 @@ app.post("/listings", authenticate, rejectAdminMarketplaceUse, rejectPreviewReal
         auctionEndTime ? new Date(auctionEndTime) : null,
         quantity === "" || quantity === undefined || quantity === null ? null : Number(quantity),
         sku || "", brand || "", state || "", JSON.stringify(shippingMethods || []),
-        returnPolicy || "", vin || "", JSON.stringify(shippingRoute), pickupLocation ? encryptField(pickupLocation) : null,
+        returnPolicy || "", vin || "", JSON.stringify(shippingRoute), pickupLocation ? encryptField(pickupLocation) : null, JSON.stringify(methodFees),
       ]
     );
 
@@ -8543,6 +8564,7 @@ function publicListingRow(row) {
     brand: row.brand,
     state: row.state,
     shipping_methods: row.shipping_methods,
+    shipping_method_fees: row.shipping_method_fees || {},
     return_policy: row.return_policy,
     vin: row.vin,
     seller_name: row.seller_name,
@@ -8633,6 +8655,7 @@ const LISTING_FIELD_MAP = {
   shippingFee: "shipping_fee",
   shippingRoute: "shipping_route",
   pickupLocation: "pickup_location_encrypted",
+  shippingMethodFees: "shipping_method_fees",
   emoji: "emoji",
   fitMake: "fit_make",
   fitModel: "fit_model",
@@ -8653,7 +8676,7 @@ const LISTING_FIELD_MAP = {
   returnPolicy: "return_policy",
   vin: "vin",
 };
-const LISTING_JSON_FIELDS = new Set(["images", "bidHistory", "shippingMethods", "shippingRoute"]);
+const LISTING_JSON_FIELDS = new Set(["images", "bidHistory", "shippingMethods", "shippingRoute", "shippingMethodFees"]);
 
 app.patch("/listings/:id", authenticate, async (req, res) => {
   const client = await pool.connect();
@@ -8678,6 +8701,9 @@ app.patch("/listings/:id", authenticate, async (req, res) => {
         throw Object.assign(new Error("Choose a valid subcategory for this category."), { statusCode: 400 });
       }
     }
+    const effectiveStatus = req.body.status ?? existing.rows[0].status;
+    const validatedFees = validateDeliveryMethodFees(req.body.shippingMethodFees ?? existing.rows[0].shipping_method_fees ?? {}, req.body.shippingMethods ?? existing.rows[0].shipping_methods, ["active", "approved"].includes(effectiveStatus));
+    if (Object.prototype.hasOwnProperty.call(req.body, "shippingMethodFees")) req.body.shippingMethodFees = validatedFees;
     let i = 1;
     for (const [key, column] of Object.entries(LISTING_FIELD_MAP)) {
       if (!Object.prototype.hasOwnProperty.call(req.body, key)) continue;
