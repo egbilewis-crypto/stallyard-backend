@@ -8389,6 +8389,13 @@ function quoteListingShipping(listing, item, method) {
   return { fee: Number(routes[index].amount), route: routes[index] };
 }
 
+function requireListingShippingMethods(methods) {
+  const allowed = new Set(["pickup", "dhl", "self_delivery", "local_delivery_driver"]);
+  if (!Array.isArray(methods) || methods.length === 0 || methods.some((method) => !allowed.has(method))) {
+    throw Object.assign(new Error("Choose at least one delivery or pickup method before publishing."), { statusCode: 400 });
+  }
+}
+
 const MIN_PUBLISH_LISTING_PHOTOS = 3;
 function requireListingPhotos(images, hiddenImages = []) {
   const hidden = new Set(Array.isArray(hiddenImages) ? hiddenImages : []);
@@ -8421,7 +8428,10 @@ app.post("/listings", authenticate, rejectAdminMarketplaceUse, rejectPreviewReal
     // "active" is the one canonical live listing status across browse, checkout, and moderation.
     // Approved sellers may create a draft or publish live; legacy client value "approved" is treated as live.
     const listingStatus = status === "draft" ? "draft" : "active";
-    if (listingStatus === "active") requireListingPhotos(images);
+    if (listingStatus === "active") {
+      requireListingPhotos(images);
+      requireListingShippingMethods(shippingMethods);
+    }
     const allowedSubcategories = LISTING_SUBCATEGORIES[category || "Other"] || [];
     if (listingStatus !== "draft" && (!subcategory || !allowedSubcategories.includes(subcategory))) {
       return res.status(400).json({ error: "Choose a valid subcategory for this category." });
@@ -8652,6 +8662,7 @@ app.patch("/listings/:id", authenticate, async (req, res) => {
     const nextStatusRaw = Object.prototype.hasOwnProperty.call(req.body, "status") ? req.body.status : existing.rows[0].status;
     const nextStatus = nextStatusRaw === "approved" ? "active" : nextStatusRaw;
     if (nextStatus === "active") {
+      requireListingShippingMethods(Object.prototype.hasOwnProperty.call(req.body, "shippingMethods") ? req.body.shippingMethods : existing.rows[0].shipping_methods);
       requireListingPhotos(
         Object.prototype.hasOwnProperty.call(req.body, "images") ? req.body.images : existing.rows[0].images,
         existing.rows[0].hidden_image_urls
