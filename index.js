@@ -926,7 +926,7 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
       if (!(price > 0)) throw new Error("Payment integrity check failed: invalid item price snapshot");
       subtotal += price * qty;
       shippingTotal += shippingFee * qty;
-      resolvedItems.push({ listing, qty, price, shippingFee });
+      resolvedItems.push({ listing, qty, price, shippingFee, shippingMethod: cartItem.shippingMethod || "seller_delivery", shippingRoute: cartItem.shippingRoute || null });
     }
 
     const commissionRate = await getCommissionRate();
@@ -959,21 +959,21 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
     const order = orderResult.rows[0];
 
     const insertedItems = [];
-    for (const { listing, qty, price, shippingFee } of resolvedItems) {
+    for (const { listing, qty, price, shippingFee, shippingMethod, shippingRoute } of resolvedItems) {
       const sellerResult = await client.query("SELECT username, display_name FROM users WHERE id = $1", [listing.owner_id]);
       const seller = sellerResult.rows[0];
       const itemResult = await client.query(
         `INSERT INTO order_items (
            order_id, listing_id, title, emoji, price, qty, shipping_fee,
            seller_id, seller_username, seller_name, fulfillment_status,
-           delivery_token, delivery_token_generated_at
+           delivery_token, delivery_token_generated_at, shipping_method, shipping_route
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'new', $11, NOW())
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'new', $11, NOW(), $12, $13)
          RETURNING *`,
         [
           order.id, listing.id, listing.title, listing.emoji, price, qty, shippingFee,
           listing.owner_id, seller?.username, seller?.display_name,
-          generateDeliveryTokenValue(),
+          generateDeliveryTokenValue(), shippingMethod, JSON.stringify(shippingRoute),
         ]
       );
       insertedItems.push(itemResult.rows[0]);
@@ -3732,6 +3732,12 @@ const SCHEMA_MIGRATIONS = [
   ] },
   { version: 95, name: "listing-shipping-route", statements: [
     `ALTER TABLE listings ADD COLUMN IF NOT EXISTS shipping_route JSONB NOT NULL DEFAULT '{}'::jsonb`,
+  ] },
+  { version: 96, name: "order-item-shipping-method", statements: [
+    `ALTER TABLE order_items ADD COLUMN IF NOT EXISTS shipping_method TEXT`,
+  ] },
+  { version: 97, name: "order-item-selected-shipping-route", statements: [
+    `ALTER TABLE order_items ADD COLUMN IF NOT EXISTS shipping_route JSONB`,
   ] },
 ];
 
@@ -8335,18 +8341,52 @@ app.post("/admin/premium-seller-reports/run", authenticate, requireSuperAdmin, a
   res.json(result);
 });
 
-function validateShippingRoute(route, fee) {
-  if (fee !== undefined && (fee === null || !Number.isFinite(Number(fee)) || Number(fee) < 0)) {
-    throw Object.assign(new Error("Enter a valid shipping amount of zero or more."), { statusCode: 400 });
+function chooseListingShippingMethod(listing, selected) {
+  const known = new Set(["pickup", "dhl", "self_delivery", "local_delivery_driver"]);
+  const offered = Array.isArray(listing.shipping_methods) ? [...new Set(listing.shipping_methods.filter((method) => known.has(method)))] : [];
+  const allowed = offered.length ? offered : ["seller_delivery"];
+  const method = selected === undefined && allowed.length === 1 ? allowed[0] : selected;
+  if (typeof method !== "string" || !allowed.includes(method)) {
+    throw Object.assign(new Error(`Choose one available shipping option for ${listing.title}.`), { statusCode: 400 });
   }
-  if (!route || typeof route !== "object" || Array.isArray(route)) throw Object.assign(new Error("Invalid shipping route."), { statusCode: 400 });
+  return method;
+}
+
+function validateShippingRoute(route, fee) {
+  const bad = (message) => { throw Object.assign(new Error(message), { statusCode: 400 }); };
+  if (fee !== undefined && (fee === null || !Number.isFinite(Number(fee)) || Number(fee) < 0)) bad("Enter a valid shipping amount.");
+  if (!route || typeof route !== "object" || Array.isArray(route)) bad("Invalid shipping route.");
+  if (Object.prototype.hasOwnProperty.call(route, "routes")) {
+    if (!Array.isArray(route.routes) || route.routes.length > 3) bad("Add a maximum of 3 shipping routes.");
+    const seen = new Set();
+    const routes = route.routes.map((row) => {
+      if (!row || typeof row !== "object") bad("Invalid shipping route.");
+      const from = String(row.shippingFromState || "").trim(), to = String(row.shippingToState || "").trim();
+      if (!Object.prototype.hasOwnProperty.call(NIGERIA_LGAS, from) || !Object.prototype.hasOwnProperty.call(NIGERIA_LGAS, to)) bad("Choose valid From and To states for every route.");
+      if (row.amount === "" || row.amount === null || row.amount === undefined || !Number.isFinite(Number(row.amount)) || Number(row.amount) < 0) bad("Enter a valid amount for every shipping route.");
+      const key = `${from}:${to}`;
+      if (seen.has(key)) bad("Shipping routes must have different From/To combinations.");
+      seen.add(key);
+      return { shippingFromState: from, shippingToState: to, amount: Math.round(Number(row.amount) * 100) / 100 };
+    });
+    return { routes };
+  }
   const fields = ["shippingFromState", "shippingToState"];
   const normalized = Object.fromEntries(fields.map((key) => [key, typeof route[key] === "string" ? route[key].trim() : ""]));
   if (!Object.values(normalized).some(Boolean)) return {};
-  if (!fields.every((key) => Object.prototype.hasOwnProperty.call(NIGERIA_LGAS, normalized[key]))) {
-    throw Object.assign(new Error("Choose valid states for Shipping From and Shipping To."), { statusCode: 400 });
-  }
+  if (!fields.every((key) => Object.prototype.hasOwnProperty.call(NIGERIA_LGAS, normalized[key]))) bad("Choose valid states for Shipping From and Shipping To.");
   return normalized;
+}
+
+function quoteListingShipping(listing, item, method) {
+  if (method === "pickup") return { fee: 0, route: null };
+  const saved = listing.shipping_route || {};
+  const routes = Array.isArray(saved.routes) ? saved.routes : saved.shippingFromState && saved.shippingToState ? [{ ...saved, amount: Number(listing.shipping_fee) || 0 }] : [];
+  if (!routes.length) return { fee: Number(listing.shipping_fee) || 0, route: null };
+  const selected = item.shippingRouteIndex ?? (routes.length === 1 ? 0 : "");
+  const index = Number(selected);
+  if (!["string", "number"].includes(typeof selected) || selected === "" || !Number.isInteger(index) || index < 0 || !routes[index]) throw Object.assign(new Error(`Choose one shipping route for ${listing.title}.`), { statusCode: 400 });
+  return { fee: Number(routes[index].amount), route: routes[index] };
 }
 
 const MIN_PUBLISH_LISTING_PHOTOS = 3;
@@ -8879,7 +8919,7 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, reject
       return res.status(400).json({ error: "Cart is empty" });
     }
     const normalizedShippingAddress = normalizePrivateShippingAddress(shippingAddress);
-    if (!privateShippingAddressIsComplete(normalizedShippingAddress)) {
+    if (!items.every((item) => item.shippingMethod === "pickup") && !privateShippingAddressIsComplete(normalizedShippingAddress)) {
       return res.status(400).json({ error: "Recipient name, phone, street, city, and postal code are required" });
     }
     if (!process.env.PAYSTACK_SECRET_KEY) {
@@ -8918,10 +8958,16 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, reject
       }
       const price = Number(listing.price);
       if (!(price > 0)) return res.status(400).json({ error: "Listing has an invalid price" });
-      const shippingFee = Number(listing.shipping_fee) || 0;
+      let shippingMethod;
+      try { shippingMethod = chooseListingShippingMethod(listing, cartItem.shippingMethod); }
+      catch (err) { return res.status(400).json({ error: err.message }); }
+      let shippingQuote;
+      try { shippingQuote = quoteListingShipping(listing, cartItem, shippingMethod); }
+      catch (err) { return res.status(400).json({ error: err.message }); }
+      const shippingFee = shippingQuote.fee;
       subtotal += price * qty;
       shippingTotal += shippingFee * qty;
-      itemSnapshots.push({ listingId: listing.id, qty, unitPrice: price, shippingFee });
+      itemSnapshots.push({ listingId: listing.id, qty, unitPrice: price, shippingFee, shippingMethod, shippingRoute: shippingQuote.route });
     }
 
     const commissionRate = await getCommissionRate();
@@ -9065,7 +9111,7 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
       return res.status(400).json({ error: "Cart is empty" });
     }
     const normalizedShippingAddress = normalizePrivateShippingAddress(shippingAddress);
-    if (!privateShippingAddressIsComplete(normalizedShippingAddress)) {
+    if (!items.every((item) => item.shippingMethod === "pickup") && !privateShippingAddressIsComplete(normalizedShippingAddress)) {
       return res.status(400).json({ error: "Recipient name, phone, street, city, and postal code are required" });
     }
     if (!cardId) return res.status(400).json({ error: "Pick a saved card" });
@@ -9113,10 +9159,16 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
       }
       const price = Number(listing.price);
       if (!(price > 0)) return res.status(400).json({ error: "Listing has an invalid price" });
-      const shippingFee = Number(listing.shipping_fee) || 0;
+      let shippingMethod;
+      try { shippingMethod = chooseListingShippingMethod(listing, cartItem.shippingMethod); }
+      catch (err) { return res.status(400).json({ error: err.message }); }
+      let shippingQuote;
+      try { shippingQuote = quoteListingShipping(listing, cartItem, shippingMethod); }
+      catch (err) { return res.status(400).json({ error: err.message }); }
+      const shippingFee = shippingQuote.fee;
       subtotal += price * qty;
       shippingTotal += shippingFee * qty;
-      itemSnapshots.push({ listingId: listing.id, qty, unitPrice: price, shippingFee });
+      itemSnapshots.push({ listingId: listing.id, qty, unitPrice: price, shippingFee, shippingMethod, shippingRoute: shippingQuote.route });
     }
     const taxRate = await getTaxRate();
     const taxAmount = Math.round(subtotal * taxRate * 100) / 100;
