@@ -8128,6 +8128,37 @@ async function protectLegacySellerReports() {
   }
 }
 
+// Return document references only; existing protected routes serve the private bytes.
+app.get("/admin/members/:id/approved-documents", authenticate, requireSuperAdmin, async (req, res) => {
+  res.setHeader("Cache-Control", "private, no-store");
+  try {
+    const userId = Number(req.params.id);
+    if (!Number.isSafeInteger(userId) || userId <= 0) return res.status(400).json({ error: "Invalid member" });
+    const [casual, verified, premium] = await Promise.all([
+      pool.query("SELECT id,reference,evidence_paths FROM casual_seller_applications WHERE user_id=$1 AND approved_at IS NOT NULL ORDER BY created_at DESC", [userId]),
+      pool.query("SELECT id,reference,id_front_path,id_back_path,bank_statement_path FROM verified_seller_applications WHERE user_id=$1 AND status='approved' ORDER BY created_at DESC", [userId]),
+      pool.query("SELECT id,reference,supporting_document_path,address_proof_path,inventory_proof_path,cac_document_path FROM premium_seller_applications WHERE user_id=$1 AND status='approved' ORDER BY created_at DESC", [userId]),
+    ]);
+    const documents = [];
+    for (const application of casual.rows) {
+      for (const [key, label] of Object.entries({ live_selfie: "Live selfie", holding_id_selfie: "Selfie holding ID", id_front: "ID front", id_back: "ID back", challenge_1: "Challenge photo 1", challenge_2: "Challenge photo 2", challenge_3: "Challenge photo 3" })) {
+        if (application.evidence_paths?.[key]) documents.push({ label: `Casual Seller · ${label}`, reference: application.reference, url: `/admin/casual-seller-applications/${application.id}/evidence/${key}` });
+      }
+    }
+    for (const application of verified.rows) {
+      for (const [column, label, suffix] of [["id_front_path", "ID front", "identification/front"], ["id_back_path", "ID back", "identification/back"], ["bank_statement_path", "Bank statement", "bank-statement"]]) {
+        if (application[column]) documents.push({ label: `Verified Seller · ${label}`, reference: application.reference, url: `/admin/verified-seller-applications/${application.id}/${suffix}` });
+      }
+    }
+    for (const application of premium.rows) {
+      for (const [column, label, key] of [["supporting_document_path", "Financial document", "financial"], ["address_proof_path", "Address proof", "address"], ["inventory_proof_path", "Inventory proof", "inventory"], ["cac_document_path", "CAC document", "cac"]]) {
+        if (application[column]) documents.push({ label: `Premium Seller · ${label}`, reference: application.reference, url: `/admin/premium-seller-applications/${application.id}/document/${key}` });
+      }
+    }
+    res.json({ documents });
+  } catch (err) { sendInternalError(res, err); }
+});
+
 app.get("/admin/casual-seller-applications", authenticate, requireSuperAdmin, async (req, res) => {
   try {
     const result = await pool.query(
