@@ -12842,6 +12842,36 @@ app.get("/paystack/banks", authenticate, async (req, res) => {
   }
 });
 
+// Only the signed-in owner can read this masked payout-account summary.
+app.get("/sellers/bank-details", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  try {
+    const result = await pool.query(
+      "SELECT bank_code, account_number FROM users WHERE id = $1", [req.user.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: "Account not found" });
+    const bankCode = decryptFieldSafe(result.rows[0].bank_code) || "";
+    const accountNumber = decryptFieldSafe(result.rows[0].account_number) || "";
+    if (!accountNumber) return res.json({ hasBankDetails: false });
+    let bankName = "";
+    try {
+      const response = await fetch("https://api.paystack.co/bank?country=nigeria", {
+        headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` },
+        signal: AbortSignal.timeout(5000),
+      });
+      const banks = await response.json();
+      if (response.ok && banks.status && Array.isArray(banks.data)) {
+        bankName = banks.data.find((bank) => String(bank.code) === bankCode)?.name || "";
+      }
+    } catch {
+      // A bank-directory outage must not hide the saved account summary.
+    }
+    res.json({ hasBankDetails: true, bankName, bankCode, accountNumberLast4: accountNumber.slice(-4) });
+  } catch (err) {
+    sendInternalError(res, err);
+  }
+});
+
 function bankNameTokens(value) {
   return String(value || "").toLowerCase().replace(/[^a-z\s]/g, " ").split(/\s+/).filter((token) => token.length > 1);
 }
