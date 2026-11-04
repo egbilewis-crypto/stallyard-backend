@@ -8340,12 +8340,11 @@ function validateShippingRoute(route, fee) {
     throw Object.assign(new Error("Enter a valid shipping amount of zero or more."), { statusCode: 400 });
   }
   if (!route || typeof route !== "object" || Array.isArray(route)) throw Object.assign(new Error("Invalid shipping route."), { statusCode: 400 });
-  const fields = ["shippingFromState", "shippingFromLga", "shippingToState", "shippingToLga"];
+  const fields = ["shippingFromState", "shippingToState"];
   const normalized = Object.fromEntries(fields.map((key) => [key, typeof route[key] === "string" ? route[key].trim() : ""]));
   if (!Object.values(normalized).some(Boolean)) return {};
-  if (!(NIGERIA_LGAS[normalized.shippingFromState] || []).includes(normalized.shippingFromLga) ||
-      !(NIGERIA_LGAS[normalized.shippingToState] || []).includes(normalized.shippingToLga)) {
-    throw Object.assign(new Error("Choose valid states and local governments for Shipping From and Shipping To."), { statusCode: 400 });
+  if (!fields.every((key) => Object.prototype.hasOwnProperty.call(NIGERIA_LGAS, normalized[key]))) {
+    throw Object.assign(new Error("Choose valid states for Shipping From and Shipping To."), { statusCode: 400 });
   }
   return normalized;
 }
