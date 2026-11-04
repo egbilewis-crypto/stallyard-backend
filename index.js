@@ -8331,6 +8331,16 @@ app.post("/admin/premium-seller-reports/run", authenticate, requireSuperAdmin, a
   res.json(result);
 });
 
+const MIN_PUBLISH_LISTING_PHOTOS = 3;
+function requireListingPhotos(images, hiddenImages = []) {
+  const hidden = new Set(Array.isArray(hiddenImages) ? hiddenImages : []);
+  const valid = Array.isArray(images) && images.every((image) => typeof image === "string" && /^https?:\/\/[^\s]+$/i.test(image));
+  const visible = valid ? new Set(images.filter((image) => !hidden.has(image))).size : 0;
+  if (!valid || visible < MIN_PUBLISH_LISTING_PHOTOS) {
+    throw Object.assign(new Error(`Add at least ${MIN_PUBLISH_LISTING_PHOTOS} photos before publishing.`), { statusCode: 400 });
+  }
+}
+
 app.post("/listings", authenticate, rejectAdminMarketplaceUse, rejectPreviewRealWorldAction, requireCompleteProfile, requireNigeriaMarketplaceUser, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -8352,6 +8362,7 @@ app.post("/listings", authenticate, rejectAdminMarketplaceUse, rejectPreviewReal
     // "active" is the one canonical live listing status across browse, checkout, and moderation.
     // Approved sellers may create a draft or publish live; legacy client value "approved" is treated as live.
     const listingStatus = status === "draft" ? "draft" : "active";
+    if (listingStatus === "active") requireListingPhotos(images);
     const allowedSubcategories = LISTING_SUBCATEGORIES[category || "Other"] || [];
     if (listingStatus !== "draft" && (!subcategory || !allowedSubcategories.includes(subcategory))) {
       return res.status(400).json({ error: "Choose a valid subcategory for this category." });
@@ -8575,6 +8586,12 @@ app.patch("/listings/:id", authenticate, async (req, res) => {
     if (sets.length === 0) throw Object.assign(new Error("No valid fields to update"), { statusCode: 400 });
     const nextStatusRaw = Object.prototype.hasOwnProperty.call(req.body, "status") ? req.body.status : existing.rows[0].status;
     const nextStatus = nextStatusRaw === "approved" ? "active" : nextStatusRaw;
+    if (nextStatus === "active") {
+      requireListingPhotos(
+        Object.prototype.hasOwnProperty.call(req.body, "images") ? req.body.images : existing.rows[0].images,
+        existing.rows[0].hidden_image_urls
+      );
+    }
     if (existing.rows[0].is_preview && nextStatus === "active") {
       throw Object.assign(new Error("Preview listings cannot be activated in the live marketplace."), { statusCode: 403, code: "PREVIEW_ACCOUNT_RESTRICTED" });
     }
