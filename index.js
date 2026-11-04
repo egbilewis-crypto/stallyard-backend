@@ -1,6 +1,7 @@
 // Stage 5 Supabase identity-media build: stores driver selfie and ID evidence
 // in private object storage and returns only short-lived signed viewing links.
 const express = require("express");
+const { NIGERIA_LGAS } = require("./NigeriaLocations");
 const { Pool } = require("pg");
 const bcrypt = require("bcrypt");
 const fetch = require("node-fetch");
@@ -3728,6 +3729,9 @@ const SCHEMA_MIGRATIONS = [
     `ALTER TABLE premium_seller_applications DROP CONSTRAINT IF EXISTS premium_seller_business_type_check`,
     `ALTER TABLE premium_seller_applications ADD CONSTRAINT premium_seller_business_only_check
        CHECK (business_type = 'business' OR consent_version <> '2026-11-03-business-unlimited') NOT VALID`,
+  ] },
+  { version: 95, name: "listing-shipping-route", statements: [
+    `ALTER TABLE listings ADD COLUMN IF NOT EXISTS shipping_route JSONB NOT NULL DEFAULT '{}'::jsonb`,
   ] },
 ];
 
@@ -8331,6 +8335,21 @@ app.post("/admin/premium-seller-reports/run", authenticate, requireSuperAdmin, a
   res.json(result);
 });
 
+function validateShippingRoute(route, fee) {
+  if (fee !== undefined && (fee === null || !Number.isFinite(Number(fee)) || Number(fee) < 0)) {
+    throw Object.assign(new Error("Enter a valid shipping amount of zero or more."), { statusCode: 400 });
+  }
+  if (!route || typeof route !== "object" || Array.isArray(route)) throw Object.assign(new Error("Invalid shipping route."), { statusCode: 400 });
+  const fields = ["shippingFromState", "shippingFromLga", "shippingToState", "shippingToLga"];
+  const normalized = Object.fromEntries(fields.map((key) => [key, typeof route[key] === "string" ? route[key].trim() : ""]));
+  if (!Object.values(normalized).some(Boolean)) return {};
+  if (!(NIGERIA_LGAS[normalized.shippingFromState] || []).includes(normalized.shippingFromLga) ||
+      !(NIGERIA_LGAS[normalized.shippingToState] || []).includes(normalized.shippingToLga)) {
+    throw Object.assign(new Error("Choose valid states and local governments for Shipping From and Shipping To."), { statusCode: 400 });
+  }
+  return normalized;
+}
+
 const MIN_PUBLISH_LISTING_PHOTOS = 3;
 function requireListingPhotos(images, hiddenImages = []) {
   const hidden = new Set(Array.isArray(hiddenImages) ? hiddenImages : []);
@@ -8350,6 +8369,7 @@ app.post("/listings", authenticate, rejectAdminMarketplaceUse, rejectPreviewReal
       status, auctionEndTime, quantity, sku, brand, state, shippingMethods,
       returnPolicy, vin,
     } = req.body;
+    const shippingRoute = validateShippingRoute(req.body.shippingRoute || {}, shippingFee);
     const ownerId = req.user.id; // always the signed-in user — never trust a client-supplied owner
 
     if (!title) {
@@ -8377,9 +8397,9 @@ app.post("/listings", authenticate, rejectAdminMarketplaceUse, rejectPreviewReal
          owner_id, title, description, price, category, subcategory, condition, shipping_fee,
          emoji, fit_make, fit_model, fit_year, images, listing_type, currency,
          status, auction_end_time, quantity, sku, brand, state, shipping_methods,
-         return_policy, vin
+         return_policy, vin, shipping_route
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
        RETURNING *`,
       [
         ownerId, title, description || "", price, category || "Other", subcategory || "", condition || "New", shippingFee || 0,
@@ -8388,7 +8408,7 @@ app.post("/listings", authenticate, rejectAdminMarketplaceUse, rejectPreviewReal
         auctionEndTime ? new Date(auctionEndTime) : null,
         quantity === "" || quantity === undefined || quantity === null ? null : Number(quantity),
         sku || "", brand || "", state || "", JSON.stringify(shippingMethods || []),
-        returnPolicy || "", vin || "",
+        returnPolicy || "", vin || "", JSON.stringify(shippingRoute),
       ]
     );
 
@@ -8421,6 +8441,7 @@ function publicListingRow(row) {
     subcategory: row.subcategory || "",
     condition: row.condition,
     shipping_fee: row.shipping_fee,
+    shipping_route: row.shipping_route || {},
     emoji: row.emoji,
     fit_make: row.fit_make,
     fit_model: row.fit_model,
@@ -8525,6 +8546,7 @@ const LISTING_FIELD_MAP = {
   subcategory: "subcategory",
   condition: "condition",
   shippingFee: "shipping_fee",
+  shippingRoute: "shipping_route",
   emoji: "emoji",
   fitMake: "fit_make",
   fitModel: "fit_model",
@@ -8545,7 +8567,7 @@ const LISTING_FIELD_MAP = {
   returnPolicy: "return_policy",
   vin: "vin",
 };
-const LISTING_JSON_FIELDS = new Set(["images", "bidHistory", "shippingMethods"]);
+const LISTING_JSON_FIELDS = new Set(["images", "bidHistory", "shippingMethods", "shippingRoute"]);
 
 app.patch("/listings/:id", authenticate, async (req, res) => {
   const client = await pool.connect();
@@ -8555,6 +8577,10 @@ app.patch("/listings/:id", authenticate, async (req, res) => {
     if (existing.rows.length === 0) throw Object.assign(new Error("Listing not found"), { statusCode: 404 });
     if (existing.rows[0].owner_id !== req.user.id && !hasPermission(req.user, "listing_moderation")) {
       throw Object.assign(new Error("You can only edit your own listings"), { statusCode: 403 });
+    }
+    if (Object.prototype.hasOwnProperty.call(req.body, "shippingRoute") || Object.prototype.hasOwnProperty.call(req.body, "shippingFee")) {
+      const route = validateShippingRoute(req.body.shippingRoute ?? existing.rows[0].shipping_route ?? {}, req.body.shippingFee ?? existing.rows[0].shipping_fee);
+      if (Object.prototype.hasOwnProperty.call(req.body, "shippingRoute")) req.body.shippingRoute = route;
     }
     const sets = [];
     const values = [];
