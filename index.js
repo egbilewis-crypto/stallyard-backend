@@ -877,7 +877,8 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
         [reference]
       );
       await client.query("COMMIT");
-      return { order: existing.rows[0], items: itemsResult.rows, alreadyFinalized: true };
+      const buyerItems = itemsResult.rows.map(paidBuyerPickupItem);
+      return { order: { ...existing.rows[0], items: buyerItems }, items: buyerItems, alreadyFinalized: true };
     }
     if (["requesting", "pending", "processed", "request_unknown"].includes(intent.refund_status)
         || ["refund_pending", "refunded"].includes(intent.status)) {
@@ -926,7 +927,7 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
       if (!(price > 0)) throw new Error("Payment integrity check failed: invalid item price snapshot");
       subtotal += price * qty;
       shippingTotal += shippingFee * qty;
-      resolvedItems.push({ listing, qty, price, shippingFee, shippingMethod: cartItem.shippingMethod || "seller_delivery", shippingRoute: cartItem.shippingRoute || null });
+      resolvedItems.push({ listing, qty, price, shippingFee, shippingMethod: cartItem.shippingMethod || "seller_delivery", shippingRoute: cartItem.shippingRoute || null, pickupLocationEncrypted: cartItem.pickupLocationEncrypted || null });
     }
 
     const commissionRate = await getCommissionRate();
@@ -959,21 +960,21 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
     const order = orderResult.rows[0];
 
     const insertedItems = [];
-    for (const { listing, qty, price, shippingFee, shippingMethod, shippingRoute } of resolvedItems) {
+    for (const { listing, qty, price, shippingFee, shippingMethod, shippingRoute, pickupLocationEncrypted } of resolvedItems) {
       const sellerResult = await client.query("SELECT username, display_name FROM users WHERE id = $1", [listing.owner_id]);
       const seller = sellerResult.rows[0];
       const itemResult = await client.query(
         `INSERT INTO order_items (
            order_id, listing_id, title, emoji, price, qty, shipping_fee,
            seller_id, seller_username, seller_name, fulfillment_status,
-           delivery_token, delivery_token_generated_at, shipping_method, shipping_route
+           delivery_token, delivery_token_generated_at, shipping_method, shipping_route, pickup_location_encrypted
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'new', $11, NOW(), $12, $13)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'new', $11, NOW(), $12, $13, $14)
          RETURNING *`,
         [
           order.id, listing.id, listing.title, listing.emoji, price, qty, shippingFee,
           listing.owner_id, seller?.username, seller?.display_name,
-          generateDeliveryTokenValue(), shippingMethod, JSON.stringify(shippingRoute),
+          generateDeliveryTokenValue(), shippingMethod, JSON.stringify(shippingRoute), pickupLocationEncrypted,
         ]
       );
       insertedItems.push(itemResult.rows[0]);
@@ -1036,7 +1037,8 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
         console.error("Couldn't save card for future checkout:", err.message);
       }
     }
-    return { order: { ...order, items: insertedItems }, items: insertedItems, alreadyFinalized: false };
+    const buyerItems = insertedItems.map(paidBuyerPickupItem);
+    return { order: { ...order, items: buyerItems }, items: buyerItems, alreadyFinalized: false };
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;
@@ -3738,6 +3740,10 @@ const SCHEMA_MIGRATIONS = [
   ] },
   { version: 97, name: "order-item-selected-shipping-route", statements: [
     `ALTER TABLE order_items ADD COLUMN IF NOT EXISTS shipping_route JSONB`,
+  ] },
+  { version: 98, name: "private-pickup-locations", statements: [
+    `ALTER TABLE listings ADD COLUMN IF NOT EXISTS pickup_location_encrypted TEXT`,
+    `ALTER TABLE order_items ADD COLUMN IF NOT EXISTS pickup_location_encrypted TEXT`,
   ] },
 ];
 
@@ -8389,6 +8395,27 @@ function quoteListingShipping(listing, item, method) {
   return { fee: Number(routes[index].amount), route: routes[index] };
 }
 
+function paidBuyerPickupItem(item) {
+  const { pickup_location_encrypted, ...safe } = item;
+  return { ...safe, ...(item.shipping_method === "pickup" ? { pickup_location: decryptFieldSafe(pickup_location_encrypted) || "" } : {}) };
+}
+
+function normalizePickupLocation(value) {
+  if (typeof value !== "string") return "";
+  const location = value.trim();
+  if (location.length > 1000) throw Object.assign(new Error("Pickup location must be 1,000 characters or fewer."), { statusCode: 400 });
+  return location;
+}
+function requirePickupLocation(methods, location) {
+  if (Array.isArray(methods) && methods.includes("pickup") && !location) {
+    throw Object.assign(new Error("Enter a pickup address or meeting location before publishing with Pickup."), { statusCode: 400 });
+  }
+}
+function ownListingWithPickup(row) {
+  const { pickup_location_encrypted, ...safe } = row;
+  return { ...safe, pickup_location: decryptFieldSafe(pickup_location_encrypted) || "" };
+}
+
 function requireListingLocation(state) {
   if (typeof state !== "string" || !(Object.prototype.hasOwnProperty.call(NIGERIA_LGAS, state) || state === "FCT (Abuja)")) {
     throw Object.assign(new Error("Select the state where the item is located before publishing."), { statusCode: 400 });
@@ -8421,6 +8448,7 @@ app.post("/listings", authenticate, rejectAdminMarketplaceUse, rejectPreviewReal
       status, auctionEndTime, quantity, sku, brand, state, shippingMethods,
       returnPolicy, vin,
     } = req.body;
+    const pickupLocation = normalizePickupLocation(req.body.pickupLocation);
     const shippingRoute = validateShippingRoute(req.body.shippingRoute || {}, shippingFee);
     const ownerId = req.user.id; // always the signed-in user — never trust a client-supplied owner
 
@@ -8438,6 +8466,7 @@ app.post("/listings", authenticate, rejectAdminMarketplaceUse, rejectPreviewReal
       requireListingPhotos(images);
       requireListingShippingMethods(shippingMethods);
       requireListingLocation(state);
+      requirePickupLocation(shippingMethods, pickupLocation);
     }
     const allowedSubcategories = LISTING_SUBCATEGORIES[category || "Other"] || [];
     if (listingStatus !== "draft" && (!subcategory || !allowedSubcategories.includes(subcategory))) {
@@ -8453,9 +8482,9 @@ app.post("/listings", authenticate, rejectAdminMarketplaceUse, rejectPreviewReal
          owner_id, title, description, price, category, subcategory, condition, shipping_fee,
          emoji, fit_make, fit_model, fit_year, images, listing_type, currency,
          status, auction_end_time, quantity, sku, brand, state, shipping_methods,
-         return_policy, vin, shipping_route
+         return_policy, vin, shipping_route, pickup_location_encrypted
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
        RETURNING *`,
       [
         ownerId, title, description || "", price, category || "Other", subcategory || "", condition || "New", shippingFee || 0,
@@ -8464,12 +8493,12 @@ app.post("/listings", authenticate, rejectAdminMarketplaceUse, rejectPreviewReal
         auctionEndTime ? new Date(auctionEndTime) : null,
         quantity === "" || quantity === undefined || quantity === null ? null : Number(quantity),
         sku || "", brand || "", state || "", JSON.stringify(shippingMethods || []),
-        returnPolicy || "", vin || "", JSON.stringify(shippingRoute),
+        returnPolicy || "", vin || "", JSON.stringify(shippingRoute), pickupLocation ? encryptField(pickupLocation) : null,
       ]
     );
 
     const listingWithOwner = {
-      ...result.rows[0],
+      ...ownListingWithPickup(result.rows[0]),
       owner_username: seller.username,
       seller_name: seller.display_name,
     };
@@ -8568,7 +8597,7 @@ app.get("/listings", async (req, res) => {
     const rows = result.rows.map((row) => {
       if (validUserId && row.owner_id === validUserId) {
         const { seller_is_approved, casual_seller_status, seller_is_suspended, seller_suspended, ...ownRow } = row;
-        return ownRow;
+        return ownListingWithPickup(ownRow);
       }
       return publicListingRow(row);
     });
@@ -8603,6 +8632,7 @@ const LISTING_FIELD_MAP = {
   condition: "condition",
   shippingFee: "shipping_fee",
   shippingRoute: "shipping_route",
+  pickupLocation: "pickup_location_encrypted",
   emoji: "emoji",
   fitMake: "fit_make",
   fitModel: "fit_model",
@@ -8653,7 +8683,10 @@ app.patch("/listings/:id", authenticate, async (req, res) => {
       if (!Object.prototype.hasOwnProperty.call(req.body, key)) continue;
       sets.push(`${column} = $${i}`);
       const raw = req.body[key];
-      if (key === "quantity") {
+      if (key === "pickupLocation") {
+        const location = normalizePickupLocation(raw);
+        values.push(location ? encryptField(location) : null);
+      } else if (key === "quantity") {
         values.push(raw === "" || raw === undefined || raw === null ? null : Number(raw));
       } else if (key === "status") {
         const normalizedStatus = raw === "approved" ? "active" : raw;
@@ -8669,6 +8702,10 @@ app.patch("/listings/:id", authenticate, async (req, res) => {
     const nextStatusRaw = Object.prototype.hasOwnProperty.call(req.body, "status") ? req.body.status : existing.rows[0].status;
     const nextStatus = nextStatusRaw === "approved" ? "active" : nextStatusRaw;
     if (nextStatus === "active") {
+      requirePickupLocation(
+        Object.prototype.hasOwnProperty.call(req.body, "shippingMethods") ? req.body.shippingMethods : existing.rows[0].shipping_methods,
+        Object.prototype.hasOwnProperty.call(req.body, "pickupLocation") ? normalizePickupLocation(req.body.pickupLocation) : decryptFieldSafe(existing.rows[0].pickup_location_encrypted)
+      );
       requireListingLocation(Object.prototype.hasOwnProperty.call(req.body, "state") ? req.body.state : existing.rows[0].state);
       requireListingShippingMethods(Object.prototype.hasOwnProperty.call(req.body, "shippingMethods") ? req.body.shippingMethods : existing.rows[0].shipping_methods);
       requireListingPhotos(
@@ -8694,7 +8731,7 @@ app.patch("/listings/:id", authenticate, async (req, res) => {
       logAdminAction(req.user.id, "listing_moderated", `Updated listing "${result.rows[0].title}" (${Object.keys(req.body).join(", ")})`);
     }
     if (req.body.status === "rejected") createNotification(existing.rows[0].owner_id, "listing_rejected", `Your listing "${result.rows[0].title}" was rejected`);
-    res.json({ listing: result.rows[0] });
+    res.json({ listing: req.user.id === existing.rows[0].owner_id ? ownListingWithPickup(result.rows[0]) : publicListingRow(result.rows[0]) });
     if (Object.prototype.hasOwnProperty.call(req.body, "images")) moderateListingImagesAsync(result.rows[0].id, req.body.images);
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
@@ -8986,7 +9023,7 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, reject
       const shippingFee = shippingQuote.fee;
       subtotal += price * qty;
       shippingTotal += shippingFee * qty;
-      itemSnapshots.push({ listingId: listing.id, qty, unitPrice: price, shippingFee, shippingMethod, shippingRoute: shippingQuote.route });
+      itemSnapshots.push({ listingId: listing.id, qty, unitPrice: price, shippingFee, shippingMethod, shippingRoute: shippingQuote.route, pickupLocationEncrypted: shippingMethod === "pickup" ? listing.pickup_location_encrypted : null });
     }
 
     const commissionRate = await getCommissionRate();
@@ -9187,7 +9224,7 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
       const shippingFee = shippingQuote.fee;
       subtotal += price * qty;
       shippingTotal += shippingFee * qty;
-      itemSnapshots.push({ listingId: listing.id, qty, unitPrice: price, shippingFee, shippingMethod, shippingRoute: shippingQuote.route });
+      itemSnapshots.push({ listingId: listing.id, qty, unitPrice: price, shippingFee, shippingMethod, shippingRoute: shippingQuote.route, pickupLocationEncrypted: shippingMethod === "pickup" ? listing.pickup_location_encrypted : null });
     }
     const taxRate = await getTaxRate();
     const taxAmount = Math.round(subtotal * taxRate * 100) / 100;
@@ -9309,8 +9346,10 @@ async function fetchOrdersWithItems(whereClause, params, { includeDeliveryTokens
     [itemsResult.rows.map((item) => item.id)]
   );
   const safeItems = itemsResult.rows.map((item) => {
+    const { pickup_location_encrypted, ...publicItem } = item;
     const withHistory = {
-      ...item,
+      ...publicItem,
+      ...(includeDeliveryTokens && item.shipping_method === "pickup" ? { pickup_location: decryptFieldSafe(pickup_location_encrypted) || "" } : {}),
       status_history: historiesResult.rows.filter((event) => event.order_item_id === item.id),
     };
     // The paid buyer can see the token immediately. A seller receives it only
