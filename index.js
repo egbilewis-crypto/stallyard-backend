@@ -3748,6 +3748,9 @@ const SCHEMA_MIGRATIONS = [
   { version: 99, name: "listing-delivery-method-charges", statements: [
     `ALTER TABLE listings ADD COLUMN IF NOT EXISTS shipping_method_fees JSONB NOT NULL DEFAULT '{}'::jsonb`,
   ] },
+  { version: 100, name: "editable-homepage-category-strip", statements: [
+    `ALTER TABLE site_settings ADD COLUMN IF NOT EXISTS category_strip JSONB`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -8855,6 +8858,31 @@ app.delete("/listings/by-owner/:ownerId", authenticate, requirePermission("user_
   } catch (err) {
     sendInternalError(res, err);
   }
+});
+
+app.get("/homepage-category-strip", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    const result = await pool.query("SELECT category_strip FROM site_settings WHERE id=1");
+    res.json({ strip: result.rows[0]?.category_strip || null });
+  } catch (err) { sendInternalError(res, err); }
+});
+
+app.patch("/homepage-category-strip", authenticate, requireSuperAdmin, async (req, res) => {
+  try {
+    const { title, enabled, tiles } = req.body;
+    if (typeof title !== "string" || !title.trim() || title.length > 100 || typeof enabled !== "boolean" || !Array.isArray(tiles) || tiles.length > 12) return res.status(400).json({ error: "Enter a heading and up to 12 category tiles." });
+    const validCategories = new Set(["All", ...Object.keys(LISTING_SUBCATEGORIES)]);
+    const cleanTiles = [];
+    for (const tile of tiles) {
+      if (!tile || typeof tile.label !== "string" || !tile.label.trim() || tile.label.length > 60 || !validCategories.has(tile.category) || typeof tile.imageUrl !== "string" || !/^https:\/\/[^\s]+$/i.test(tile.imageUrl) || tile.imageUrl.length > 2000) return res.status(400).json({ error: "Every tile needs a label, category and uploaded image or HTTPS image URL." });
+      cleanTiles.push({ label: tile.label.trim(), category: tile.category, imageUrl: tile.imageUrl });
+    }
+    const strip = { title: title.trim(), enabled, tiles: cleanTiles };
+    await pool.query("UPDATE site_settings SET category_strip=$1 WHERE id=1", [JSON.stringify(strip)]);
+    logAdminAction(req.user.id, "homepage_category_strip_updated", `Updated homepage category strip (${cleanTiles.length} tiles)`);
+    res.json({ strip });
+  } catch (err) { sendInternalError(res, err); }
 });
 
 app.get("/settings", async (req, res) => {
