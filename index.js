@@ -42,7 +42,6 @@ function validateProductionSecrets() {
     "FIELD_ENCRYPTION_KEY",
     "PAYSTACK_SECRET_KEY",
     "SUPABASE_URL",
-    "RESEND_API_KEY",
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_REGION",
@@ -1613,37 +1612,147 @@ const EMAIL_CODE_TTL_MS = 15 * 60 * 1000;
 
 const EMAIL_VERIFIED_TTL_MS = 30 * 60 * 1000;
 
+const STALSEND_API_BASE_URL = String(process.env.STALSEND_API_BASE_URL || "https://api.stalsend.com").replace(/\/+$/, "");
+
+function authEmailProviderAvailability() {
+  return {
+    stalsend: !!String(process.env.STALSEND_API_KEY || "").trim(),
+    resend: !!String(process.env.RESEND_API_KEY || "").trim(),
+  };
+}
+
+async function getAuthEmailProviderSettings() {
+  try {
+    const result = await pool.query("SELECT auth_email_provider_mode, auth_email_active_provider FROM site_settings WHERE id = 1");
+    const row = result.rows[0] || {};
+    return {
+      mode: ["automatic", "stalsend", "resend"].includes(row.auth_email_provider_mode) ? row.auth_email_provider_mode : "automatic",
+      activeProvider: row.auth_email_active_provider === "resend" ? "resend" : "stalsend",
+    };
+  } catch {
+    return { mode: "automatic", activeProvider: "stalsend" };
+  }
+}
+
+function makeAuthEmailOtpError(message, { safeToFailover = false, status = 503 } = {}) {
+  const error = new Error(message);
+  error.emailOtpSafeToFailover = safeToFailover;
+  error.emailOtpStatus = status;
+  return error;
+}
+
+async function sendAuthEmailCode({ email, purpose, resendSubject, resendHtml }) {
+  const config = await getAuthEmailProviderSettings();
+  const available = authEmailProviderAvailability();
+  const primary = config.mode === "automatic" ? config.activeProvider : config.mode;
+  const other = primary === "stalsend" ? "resend" : "stalsend";
+  const providers = config.mode === "automatic"
+    ? [primary, other].filter((provider, index, all) => available[provider] && all.indexOf(provider) === index)
+    : [primary].filter((provider) => available[provider]);
+  if (!providers.length) {
+    throw makeAuthEmailOtpError("No configured authentication email provider is available", { status: 503 });
+  }
+
+  let lastError;
+  for (let index = 0; index < providers.length; index += 1) {
+    const provider = providers[index];
+    try {
+      let result;
+      if (provider === "stalsend") {
+        const context = `${purpose}_${crypto.randomBytes(24).toString("hex")}`;
+        let response;
+        try {
+          response = await fetch(`${STALSEND_API_BASE_URL}/api/v1/otp/send`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${String(process.env.STALSEND_API_KEY || "").trim()}` },
+            body: JSON.stringify({ email, purpose: "login", context }),
+          });
+        } catch {
+          throw makeAuthEmailOtpError("We couldn't confirm whether the email code was sent. Wait briefly before requesting another code.", { status: 503 });
+        }
+        const data = await response.json().catch(() => ({}));
+        if (response.status !== 202 || !data.challengeId) {
+          const definite = (response.status < 500 && response.status !== 202) || response.status === 503;
+          throw makeAuthEmailOtpError(data.message || "StalSend couldn't send the email code", { safeToFailover: definite, status: response.status || 502 });
+        }
+        result = { provider, purpose: "login", context, challengeId: data.challengeId, expiresAt: data.expiresAt };
+      } else {
+        const code = generateSecurityCode();
+        let response;
+        try {
+          response = await fetch("https://api.resend.com/emails", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
+            body: JSON.stringify({
+              from: process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>",
+              to: [email],
+              subject: resendSubject(code),
+              html: resendHtml(code),
+            }),
+          });
+        } catch {
+          throw makeAuthEmailOtpError("We couldn't confirm whether the email code was sent. Wait briefly before requesting another code.", { status: 503 });
+        }
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const definite = response.status < 500 || response.status === 503;
+          throw makeAuthEmailOtpError(data.message || "Resend couldn't send the email code", { safeToFailover: definite, status: response.status });
+        }
+        result = { provider, code };
+      }
+      if (config.mode === "automatic" && config.activeProvider !== provider) {
+        await pool.query("UPDATE site_settings SET auth_email_active_provider = $1 WHERE id = 1", [provider]);
+      }
+      return result;
+    } catch (error) {
+      lastError = error;
+      const mayTryOther = config.mode === "automatic" && index < providers.length - 1 && error.emailOtpSafeToFailover === true;
+      if (!mayTryOther) throw error;
+    }
+  }
+  throw lastError || makeAuthEmailOtpError("Email code delivery failed", { status: 503 });
+}
+
+async function verifyAuthEmailCode(stored, submittedCode) {
+  if (stored?.provider !== "stalsend") return stored?.code === String(submittedCode).trim();
+  let response;
+  try {
+    response = await fetch(`${STALSEND_API_BASE_URL}/api/v1/otp/verify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${String(process.env.STALSEND_API_KEY || "").trim()}` },
+      body: JSON.stringify({
+        challengeId: stored.challengeId,
+        code: String(submittedCode).trim(),
+        purpose: stored.purpose,
+        context: stored.context,
+      }),
+    });
+  } catch {
+    throw makeAuthEmailOtpError("The email code service is temporarily unavailable. Try again shortly.", { status: 503 });
+  }
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = makeAuthEmailOtpError(data.message || "That email code doesn't match or has expired", { status: response.status });
+    error.codeMismatch = response.status === 400 || response.status === 409;
+    throw error;
+  }
+  return data.verified === true;
+}
+
 app.post("/email-verify/send", codeRateLimit, async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: "Missing email address" });
-    if (!process.env.RESEND_API_KEY) {
-      return res.status(500).json({ error: "Email verification isn't configured yet" });
-    }
-
-    const code = generateSecurityCode();
-    const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
-
-    const resendRes = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
-      },
-      body: JSON.stringify({
-        from: fromAddress,
-        to: [email],
-        subject: `Your Stallyard verification code is ${code}`,
-        html: `<p>Your Stallyard verification code is <strong>${code}</strong>.</p><p>This code expires in 15 minutes. If you didn't request this, you can ignore this email.</p>`,
-      }),
+    const delivery = await sendAuthEmailCode({
+      email,
+      purpose: "email_verification",
+      resendSubject: (code) => `Your Stallyard verification code is ${code}`,
+      resendHtml: (code) => `<p>Your Stallyard verification code is <strong>${code}</strong>.</p><p>This code expires in 15 minutes. If you didn't request this, you can ignore this email.</p>`,
     });
-    const data = await resendRes.json();
-    if (!resendRes.ok) {
-      return res.status(400).json({ error: data.message || "Couldn't send that email — check the address and try again" });
-    }
-    await setSecurityState("email-otp", email.toLowerCase(), { code }, EMAIL_CODE_TTL_MS);
+    await setSecurityState("email-otp", email.toLowerCase(), delivery, EMAIL_CODE_TTL_MS);
     res.json({ success: true });
   } catch (err) {
+    if (err.emailOtpStatus) return res.status(err.emailOtpStatus).json({ error: err.message });
     sendInternalError(res, err);
   }
 });
@@ -1657,7 +1766,14 @@ app.post("/email-verify/check", codeRateLimit, async (req, res) => {
     if (!stored) {
       return res.status(400).json({ error: "That code has expired — request a new one" });
     }
-    const valid = stored.code === String(code).trim();
+    let valid = false;
+    try {
+      valid = await verifyAuthEmailCode(stored, code);
+    } catch (err) {
+      if (err.codeMismatch) return res.status(400).json({ error: err.message });
+      if (err.emailOtpStatus) return res.status(err.emailOtpStatus).json({ error: err.message });
+      throw err;
+    }
     if (valid) {
       await deleteSecurityState("email-otp", email.toLowerCase());
       await setSecurityState("email-verified", email.toLowerCase(), { verified: true }, EMAIL_VERIFIED_TTL_MS);
@@ -2080,7 +2196,7 @@ app.post("/password-reset/send", authRateLimit, async (req, res) => {
     const { username } = req.body;
     const method = req.body?.method === "stallyard_text" ? "stallyard_text" : "email";
     if (!username) return res.status(400).json({ error: "Enter your username" });
-    if (method === "email" && !process.env.RESEND_API_KEY) {
+    if (method === "email" && !authEmailProviderAvailability().stalsend && !authEmailProviderAvailability().resend) {
       return res.status(500).json({ error: "Password reset isn't configured yet" });
     }
 
@@ -2120,7 +2236,8 @@ app.post("/password-reset/send", authRateLimit, async (req, res) => {
       return res.json(genericResponse);
     }
 
-    const code = generateSecurityCode();
+    let code = generateSecurityCode();
+    let emailDelivery = null;
     if (method === "stallyard_text") {
       const profiles = await stallyardTextRest(`profiles?stallyard_number=eq.${encodeURIComponent(stNumber)}&select=id&limit=1`);
       if (!profiles.length) return res.json(genericResponse);
@@ -2143,27 +2260,20 @@ app.post("/password-reset/send", authRateLimit, async (req, res) => {
       });
       await sendStallyardTextVerification(pushTokens, stNumber, code, inboxMessages?.[0]?.id, { title, body });
     } else {
-      const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
-      const resendRes = await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
-        body: JSON.stringify({
-          from: fromAddress,
-          to: [email],
-          subject: `Your Stallyard password reset code is ${code}`,
-          html: `<p>Your Stallyard password reset code is <strong>${code}</strong>.</p><p>This code expires in 15 minutes. If you didn't request this, you can ignore this email — your password won't change.</p>`,
-        }),
+      emailDelivery = await sendAuthEmailCode({
+        email,
+        purpose: "password_reset",
+        resendSubject: (resetCode) => `Your Stallyard password reset code is ${resetCode}`,
+        resendHtml: (resetCode) => `<p>Your Stallyard password reset code is <strong>${resetCode}</strong>.</p><p>This code expires in 15 minutes. If you didn't request this, you can ignore this email — your password won't change.</p>`,
       });
-      const data = await resendRes.json();
-      if (!resendRes.ok) {
-        return res.status(400).json({ error: data.message || "Couldn't send that email — try again" });
-      }
+      if (emailDelivery.code) code = emailDelivery.code;
     }
 
-    await setSecurityState("password-reset", key, { code, userId, username: accountUsername }, PASSWORD_RESET_CODE_TTL_MS);
+    await setSecurityState("password-reset", key, { ...(emailDelivery || { code }), userId, username: accountUsername }, PASSWORD_RESET_CODE_TTL_MS);
     const maskedEmail = method === "email" ? email.replace(/^(.{1,2}).*(@.*)$/, (m, a, b) => `${a}***${b}`) : undefined;
     res.json({ ...genericResponse, method, maskedEmail, maskedStNumber: method === "stallyard_text" ? stNumber : undefined });
   } catch (err) {
+    if (err.emailOtpStatus) return res.status(err.emailOtpStatus).json({ error: err.message });
     sendInternalError(res, err);
   }
 });
@@ -2179,9 +2289,15 @@ app.post("/password-reset/verify-code", codeRateLimit, async (req, res) => {
       await deleteSecurityState("password-reset", key);
       return res.status(400).json({ error: "That code has expired — request a new one" });
     }
-    if (stored.code !== String(code).trim()) {
-      return res.status(400).json({ error: "That code doesn't match — check and try again" });
+    let resetCodeValid = false;
+    try {
+      resetCodeValid = await verifyAuthEmailCode(stored, code);
+    } catch (err) {
+      if (err.codeMismatch) return res.status(400).json({ error: err.message });
+      if (err.emailOtpStatus) return res.status(err.emailOtpStatus).json({ error: err.message });
+      throw err;
     }
+    if (!resetCodeValid) return res.status(400).json({ error: "That code doesn't match — check and try again" });
 
     // Re-check account status from PostgreSQL at verification time. This closes
     // the door if an account was promoted to admin after the code was issued.
@@ -3751,6 +3867,14 @@ const SCHEMA_MIGRATIONS = [
   { version: 100, name: "editable-homepage-category-strip", statements: [
     `ALTER TABLE site_settings ADD COLUMN IF NOT EXISTS category_strip JSONB`,
   ] },
+  { version: 101, name: "selectable-authentication-email-provider", statements: [
+    `ALTER TABLE site_settings ADD COLUMN IF NOT EXISTS auth_email_provider_mode TEXT NOT NULL DEFAULT 'automatic'`,
+    `ALTER TABLE site_settings ADD COLUMN IF NOT EXISTS auth_email_active_provider TEXT NOT NULL DEFAULT 'stalsend'`,
+    `ALTER TABLE site_settings DROP CONSTRAINT IF EXISTS site_settings_auth_email_provider_mode_check`,
+    `ALTER TABLE site_settings ADD CONSTRAINT site_settings_auth_email_provider_mode_check CHECK (auth_email_provider_mode IN ('automatic', 'stalsend', 'resend'))`,
+    `ALTER TABLE site_settings DROP CONSTRAINT IF EXISTS site_settings_auth_email_active_provider_check`,
+    `ALTER TABLE site_settings ADD CONSTRAINT site_settings_auth_email_active_provider_check CHECK (auth_email_active_provider IN ('stalsend', 'resend'))`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -4218,27 +4342,16 @@ app.post("/profile/two-factor/enable/send", authenticate, async (req, res) => {
     if (!check.rows.length || !check.rows[0].email) {
       return res.status(400).json({ error: "Add a verified email to your account before turning this on" });
     }
-    if (!process.env.RESEND_API_KEY) {
-      return res.status(500).json({ error: "Two-factor isn't configured — contact support" });
-    }
-    const code = generateSecurityCode();
-    const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
-    const resendRes = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
-      body: JSON.stringify({
-        from: fromAddress,
-        to: [check.rows[0].email],
-        subject: `Your Stallyard two-factor code is ${code}`,
-        html: `<p>Your code to turn on two-factor authentication is <strong>${code}</strong>.</p><p>Expires in 10 minutes. If this wasn't you, change your password immediately.</p>`,
-      }),
+    const delivery = await sendAuthEmailCode({
+      email: check.rows[0].email,
+      purpose: "enable_two_factor",
+      resendSubject: (code) => `Your Stallyard two-factor code is ${code}`,
+      resendHtml: (code) => `<p>Your code to turn on two-factor authentication is <strong>${code}</strong>.</p><p>Expires in 10 minutes. If this wasn't you, change your password immediately.</p>`,
     });
-    if (!resendRes.ok) {
-      return res.status(400).json({ error: "Couldn't send your code — try again" });
-    }
-    await setSecurityState("2fa-enable", req.user.id, { code }, TWO_FACTOR_CODE_TTL_MS);
+    await setSecurityState("2fa-enable", req.user.id, delivery, TWO_FACTOR_CODE_TTL_MS);
     res.json({ sent: true });
   } catch (err) {
+    if (err.emailOtpStatus) return res.status(err.emailOtpStatus).json({ error: err.message });
     sendInternalError(res, err);
   }
 });
@@ -4253,9 +4366,14 @@ app.post("/profile/two-factor/enable/verify", authenticate, async (req, res) => 
     if (!stored) {
       return res.status(400).json({ error: "That code has expired — request a new one" });
     }
-    if (stored.code !== String(code || "").trim()) {
-      return res.status(400).json({ error: "That code doesn't match" });
+    let emailCodeValid = false;
+    try { emailCodeValid = await verifyAuthEmailCode(stored, code); }
+    catch (err) {
+      if (err.codeMismatch) return res.status(400).json({ error: err.message });
+      if (err.emailOtpStatus) return res.status(err.emailOtpStatus).json({ error: err.message });
+      throw err;
     }
+    if (!emailCodeValid) return res.status(400).json({ error: "That code doesn't match" });
     await deleteSecurityState("2fa-enable", req.user.id);
     const result = await pool.query(
       "UPDATE users SET two_factor_enabled = true WHERE id = $1 RETURNING two_factor_enabled",
@@ -4352,28 +4470,16 @@ app.post("/admin/reauth/verify", authenticate, authRateLimit, async (req, res) =
     if (!result.rows[0].email) {
       return res.status(400).json({ error: "This account has no email on file — contact support" });
     }
-    if (!process.env.RESEND_API_KEY) {
-      return res.status(500).json({ error: "Email step isn't configured — contact support" });
-    }
-    const emailCode = generateSecurityCode();
-    const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
-    const resendRes = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
-      body: JSON.stringify({
-        from: fromAddress,
-        to: [result.rows[0].email],
-        subject: `Your Stallyard admin access code is ${emailCode}`,
-        html: `<p>Your code to unlock the admin panel is <strong>${emailCode}</strong>.</p><p>Expires in 10 minutes. If this wasn't you, change your password immediately.</p>`,
-      }),
+    const delivery = await sendAuthEmailCode({
+      email: result.rows[0].email,
+      purpose: "admin_reauthentication",
+      resendSubject: (emailCode) => `Your Stallyard admin access code is ${emailCode}`,
+      resendHtml: (emailCode) => `<p>Your code to unlock the admin panel is <strong>${emailCode}</strong>.</p><p>Expires in 10 minutes. If this wasn't you, change your password immediately.</p>`,
     });
-    if (!resendRes.ok) {
-      return res.status(400).json({ error: "Couldn't send the email step's code — try again" });
-    }
     await setSecurityState(
       "admin-reauth-email",
       Number(req.user.id),
-      { code: emailCode, challenge: challengeState.challenge },
+      { ...delivery, challenge: challengeState.challenge },
       TWO_FACTOR_CODE_TTL_MS
     );
     await setSecurityState(
@@ -4384,6 +4490,7 @@ app.post("/admin/reauth/verify", authenticate, authRateLimit, async (req, res) =
     );
     res.json({ emailStepRequired: true });
   } catch (err) {
+    if (err.emailOtpStatus) return res.status(err.emailOtpStatus).json({ error: err.message });
     sendInternalError(res, err);
   }
 });
@@ -4402,9 +4509,14 @@ app.post("/admin/reauth/verify-email", authenticate, authRateLimit, async (req, 
       await deleteSecurityState("admin-reauth-email", Number(req.user.id));
       return res.status(400).json({ error: "Your admin authentication sequence expired — start over" });
     }
-    if (stored.code !== String(code || "").trim()) {
-      return res.status(400).json({ error: "That code doesn't match" });
+    let emailCodeValid = false;
+    try { emailCodeValid = await verifyAuthEmailCode(stored, code); }
+    catch (err) {
+      if (err.codeMismatch) return res.status(400).json({ error: err.message });
+      if (err.emailOtpStatus) return res.status(err.emailOtpStatus).json({ error: err.message });
+      throw err;
     }
+    if (!emailCodeValid) return res.status(400).json({ error: "That code doesn't match" });
     await deleteSecurityState("admin-reauth-challenge", Number(req.user.id));
     await deleteSecurityState("admin-reauth-totp", Number(req.user.id));
     await deleteSecurityState("admin-reauth-email", Number(req.user.id));
@@ -4837,7 +4949,7 @@ app.post("/admin/staff/:id/reset-password", authenticate, requirePermission("rol
     if (targetId === Number(req.user.id)) {
       return res.status(400).json({ error: "Use your own account security controls to change your password." });
     }
-    if (!process.env.RESEND_API_KEY) {
+    if (!authEmailProviderAvailability().stalsend && !authEmailProviderAvailability().resend) {
       return res.status(500).json({ error: "Password reset email isn't configured" });
     }
 
@@ -4857,25 +4969,21 @@ app.post("/admin/staff/:id/reset-password", authenticate, requirePermission("rol
       return res.status(400).json({ error: "This admin account has no email on file" });
     }
 
-    const code = generateSecurityCode();
-    const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
-    const resendRes = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
-      body: JSON.stringify({
-        from: fromAddress,
-        to: [target.email],
-        subject: `Stallyard admin password reset code: ${code}`,
-        html: `<p>A Stallyard Super Admin started a password reset for your admin account.</p><p>Your password reset code is <strong>${code}</strong>.</p><p>This code expires in 15 minutes. Go to Stallyard sign in, choose <strong>Forgot password</strong>, enter your admin username <strong>${target.username}</strong>, and use this code to set a new password.</p><p>Your existing sessions have been signed out for security. If you did not expect this reset, contact the Stallyard Super Admin immediately.</p>`,
-      }),
-    });
-    const resendData = await resendRes.json().catch(() => ({}));
-    if (!resendRes.ok) {
+    let delivery;
+    try {
+      delivery = await sendAuthEmailCode({
+        email: target.email,
+        purpose: "admin_password_reset",
+        resendSubject: (code) => `Stallyard admin password reset code: ${code}`,
+        resendHtml: (code) => `<p>A Stallyard Super Admin started a password reset for your admin account.</p><p>Your password reset code is <strong>${code}</strong>.</p><p>This code expires in 15 minutes. Go to Stallyard sign in, choose <strong>Forgot password</strong>, enter your admin username <strong>${target.username}</strong>, and use this code to set a new password.</p><p>Your existing sessions have been signed out for security. If you did not expect this reset, contact the Stallyard Super Admin immediately.</p>`,
+      });
+    } catch (err) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ error: resendData.message || "Couldn't send the password reset email" });
+      if (err.emailOtpStatus) return res.status(err.emailOtpStatus).json({ error: err.message });
+      throw err;
     }
 
-    await setSecurityState("password-reset", target.username.trim().toLowerCase(), { code, userId: targetId, adminIssued: true }, PASSWORD_RESET_CODE_TTL_MS, client);
+    await setSecurityState("password-reset", target.username.trim().toLowerCase(), { ...delivery, userId: targetId, username: target.username, adminIssued: true }, PASSWORD_RESET_CODE_TTL_MS, client);
     await client.query(
       "UPDATE users SET token_version = COALESCE(token_version, 0) + 1 WHERE id = $1",
       [targetId]
@@ -5488,7 +5596,7 @@ app.post("/admin/login", authRateLimit, async (req, res) => {
         code: "ADMIN_EMAIL_REQUIRED",
       });
     }
-    if (!process.env.RESEND_API_KEY) {
+    if (!authEmailProviderAvailability().stalsend && !authEmailProviderAvailability().resend) {
       return res.status(500).json({ error: "Admin email verification isn't configured — contact support" });
     }
 
@@ -5598,25 +5706,13 @@ app.post("/login", authRateLimit, async (req, res) => {
       if (!user.email) {
         return res.status(400).json({ error: "Two-factor is on but this account has no email on file — contact support." });
       }
-      if (!process.env.RESEND_API_KEY) {
-        return res.status(500).json({ error: "Two-factor login isn't configured yet" });
-      }
-      const code = generateSecurityCode();
-      const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
-      const resendRes = await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
-        body: JSON.stringify({
-          from: fromAddress,
-          to: [user.email],
-          subject: `Your Stallyard login code is ${code}`,
-          html: `<p>Your Stallyard login code is <strong>${code}</strong>.</p><p>This code expires in 10 minutes. If this wasn't you, change your password right away.</p>`,
-        }),
+      const delivery = await sendAuthEmailCode({
+        email: user.email,
+        purpose: "marketplace_login",
+        resendSubject: (code) => `Your Stallyard login code is ${code}`,
+        resendHtml: (code) => `<p>Your Stallyard login code is <strong>${code}</strong>.</p><p>This code expires in 10 minutes. If this wasn't you, change your password right away.</p>`,
       });
-      if (!resendRes.ok) {
-        return res.status(400).json({ error: "Couldn't send your login code — try again" });
-      }
-      await setSecurityState("2fa-email", user.id, { code }, TWO_FACTOR_CODE_TTL_MS);
+      await setSecurityState("2fa-email", user.id, delivery, TWO_FACTOR_CODE_TTL_MS);
       return res.json({ twoFactorRequired: true, userId: user.id, method: "email" });
     }
 
@@ -5636,6 +5732,7 @@ app.post("/login", authRateLimit, async (req, res) => {
       "marketplace_new_signin"
     );
   } catch (err) {
+    if (err.emailOtpStatus) return res.status(err.emailOtpStatus).json({ error: err.message });
     sendInternalError(res, err);
   }
 });
@@ -5671,28 +5768,16 @@ app.post("/login/verify-2fa", authRateLimit, async (req, res) => {
       if (!user.email) {
         return res.status(400).json({ error: "Two-factor is on but this account has no email on file — contact support." });
       }
-      if (!process.env.RESEND_API_KEY) {
-        return res.status(500).json({ error: "Email step isn't configured — contact support" });
-      }
-      const emailCode = generateSecurityCode();
-      const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
-      const resendRes = await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
-        body: JSON.stringify({
-          from: fromAddress,
-          to: [user.email],
-          subject: `Your Stallyard login code is ${emailCode}`,
-          html: `<p>Your Stallyard login code is <strong>${emailCode}</strong>.</p><p>This code expires in 10 minutes. If this wasn't you, change your password right away.</p>`,
-        }),
+      const delivery = await sendAuthEmailCode({
+        email: user.email,
+        purpose: "admin_login",
+        resendSubject: (emailCode) => `Your Stallyard login code is ${emailCode}`,
+        resendHtml: (emailCode) => `<p>Your Stallyard login code is <strong>${emailCode}</strong>.</p><p>This code expires in 10 minutes. If this wasn't you, change your password right away.</p>`,
       });
-      if (!resendRes.ok) {
-        return res.status(400).json({ error: "Couldn't send the email step's code — try again" });
-      }
       await setSecurityState(
         "admin-login-email",
         Number(userId),
-        { code: emailCode, challenge: loginChallenge.challenge },
+        { ...delivery, challenge: loginChallenge.challenge },
         TWO_FACTOR_CODE_TTL_MS
       );
       await setSecurityState(
@@ -5708,9 +5793,15 @@ app.post("/login/verify-2fa", authRateLimit, async (req, res) => {
     if (!stored) {
       return res.status(400).json({ error: "That code has expired — log in again to get a new one" });
     }
-    if (stored.code !== String(code).trim()) {
-      return res.status(400).json({ error: "That code doesn't match — check and try again" });
+    let emailCodeValid = false;
+    try {
+      emailCodeValid = await verifyAuthEmailCode(stored, code);
+    } catch (err) {
+      if (err.codeMismatch) return res.status(400).json({ error: err.message });
+      if (err.emailOtpStatus) return res.status(err.emailOtpStatus).json({ error: err.message });
+      throw err;
     }
+    if (!emailCodeValid) return res.status(400).json({ error: "That code doesn't match — check and try again" });
     await deleteSecurityState("2fa-email", Number(userId));
 
     delete user.totp_secret;
@@ -5729,6 +5820,7 @@ app.post("/login/verify-2fa", authRateLimit, async (req, res) => {
       "marketplace_new_signin"
     );
   } catch (err) {
+    if (err.emailOtpStatus) return res.status(err.emailOtpStatus).json({ error: err.message });
     sendInternalError(res, err);
   }
 });
@@ -5778,9 +5870,15 @@ app.post("/login/verify-2fa-email", authRateLimit, async (req, res) => {
         return res.status(400).json({ error: "That email code has expired — log in again to get a new one" });
       }
     }
-    if (stored.code !== String(code).trim()) {
-      return res.status(400).json({ error: "That code doesn't match — check and try again" });
+    let emailCodeValid = false;
+    try {
+      emailCodeValid = await verifyAuthEmailCode(stored, code);
+    } catch (err) {
+      if (err.codeMismatch) return res.status(400).json({ error: err.message });
+      if (err.emailOtpStatus) return res.status(err.emailOtpStatus).json({ error: err.message });
+      throw err;
     }
+    if (!emailCodeValid) return res.status(400).json({ error: "That code doesn't match — check and try again" });
     if (preflightUser.is_admin) {
       await deleteSecurityState("admin-login-challenge", Number(userId));
       await deleteSecurityState("admin-login-totp", Number(userId));
@@ -8887,13 +8985,17 @@ app.patch("/homepage-category-strip", authenticate, requireSuperAdmin, async (re
 
 app.get("/settings", async (req, res) => {
   try {
-    const result = await pool.query("SELECT commission_rate, tax_rate, auth_image, sms_provider FROM site_settings WHERE id = 1");
+    const result = await pool.query("SELECT commission_rate, tax_rate, auth_image, sms_provider, auth_email_provider_mode, auth_email_active_provider FROM site_settings WHERE id = 1");
     const row = result.rows[0] || { commission_rate: 0.05, tax_rate: 0, auth_image: "", sms_provider: "termii" };
+    const authEmailAvailability = authEmailProviderAvailability();
     res.json({
       commissionRate: Number(row.commission_rate),
       taxRate: Number(row.tax_rate || 0),
       authImage: row.auth_image || "",
       smsProvider: row.sms_provider === "sendchamp" ? "sendchamp" : "termii",
+      authEmailProviderMode: ["automatic", "stalsend", "resend"].includes(row.auth_email_provider_mode) ? row.auth_email_provider_mode : "automatic",
+      authEmailActiveProvider: row.auth_email_active_provider === "resend" ? "resend" : "stalsend",
+      authEmailProvidersConfigured: authEmailAvailability,
     });
   } catch (err) {
     sendInternalError(res, err);
@@ -8902,7 +9004,7 @@ app.get("/settings", async (req, res) => {
 
 app.patch("/settings", authenticate, async (req, res) => {
   try {
-    const { commissionRate, taxRate, authImage, smsProvider } = req.body;
+    const { commissionRate, taxRate, authImage, smsProvider, authEmailProviderMode } = req.body;
     if (commissionRate !== undefined) {
       if (!hasPermission(req.user, "finance")) {
         return res.status(403).json({ error: "You don't have permission to change the commission rate" });
@@ -8959,12 +9061,41 @@ app.patch("/settings", authenticate, async (req, res) => {
       );
       logAdminAction(req.user.id, "sms_provider_changed", `Changed the phone verification provider to ${normalizedProvider}`);
     }
-    const result = await pool.query("SELECT commission_rate, tax_rate, auth_image, sms_provider FROM site_settings WHERE id = 1");
+    if (authEmailProviderMode !== undefined) {
+      if (!req.user.isAdmin || (req.user.adminRole && req.user.adminRole !== "super_admin")) {
+        return res.status(403).json({ error: "Only the Super Admin can change the authentication email provider" });
+      }
+      const mode = String(authEmailProviderMode).trim().toLowerCase();
+      if (!["automatic", "stalsend", "resend"].includes(mode)) {
+        return res.status(400).json({ error: "Choose Automatic, StalSend, or Resend" });
+      }
+      const configured = authEmailProviderAvailability();
+      if (mode === "automatic" && !configured.stalsend && !configured.resend) {
+        return res.status(400).json({ error: "Configure a StalSend or Resend API key on Railway before enabling email delivery" });
+      }
+      if (mode !== "automatic" && !configured[mode]) {
+        return res.status(400).json({ error: `${mode === "stalsend" ? "StalSend" : "Resend"} cannot be selected until its API key is configured on Railway` });
+      }
+      const current = await getAuthEmailProviderSettings();
+      const activeProvider = mode === "automatic"
+        ? (configured[current.activeProvider] ? current.activeProvider : configured.stalsend ? "stalsend" : "resend")
+        : mode;
+      await pool.query(
+        "INSERT INTO site_settings (id, auth_email_provider_mode, auth_email_active_provider) VALUES (1, $1, $2) ON CONFLICT (id) DO UPDATE SET auth_email_provider_mode = $1, auth_email_active_provider = $2",
+        [mode, activeProvider]
+      );
+      logAdminAction(req.user.id, "authentication_email_provider_changed", `Set authentication email provider mode to ${mode}; active provider is ${activeProvider}`);
+    }
+    const result = await pool.query("SELECT commission_rate, tax_rate, auth_image, sms_provider, auth_email_provider_mode, auth_email_active_provider FROM site_settings WHERE id = 1");
+    const authEmailAvailability = authEmailProviderAvailability();
     res.json({
       commissionRate: Number(result.rows[0].commission_rate),
       taxRate: Number(result.rows[0].tax_rate || 0),
       authImage: result.rows[0].auth_image || "",
       smsProvider: result.rows[0].sms_provider === "sendchamp" ? "sendchamp" : "termii",
+      authEmailProviderMode: ["automatic", "stalsend", "resend"].includes(result.rows[0].auth_email_provider_mode) ? result.rows[0].auth_email_provider_mode : "automatic",
+      authEmailActiveProvider: result.rows[0].auth_email_active_provider === "resend" ? "resend" : "stalsend",
+      authEmailProvidersConfigured: authEmailAvailability,
     });
   } catch (err) {
     sendInternalError(res, err);
@@ -13276,7 +13407,7 @@ app.post(
     if (!email) {
       return res.status(400).json({ error: "No email on file to confirm this change — contact support" });
     }
-    if (!process.env.RESEND_API_KEY) {
+    if (!authEmailProviderAvailability().stalsend && !authEmailProviderAvailability().resend) {
       return res.status(500).json({ error: "Bank-change confirmation isn't configured yet" });
     }
 
@@ -13299,23 +13430,14 @@ app.post(
       });
     }
 
-    const code = generateSecurityCode();
-    const fromAddress = process.env.RESEND_FROM_EMAIL || "Stallyard <onboarding@resend.dev>";
-    const resendRes = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
-      body: JSON.stringify({
-        from: fromAddress,
-        to: [email],
-        subject: `Confirm your bank account change — code ${code}`,
-        html: `<p>Someone (hopefully you) is changing the bank account your Stallyard payouts go to.</p><p>Your confirmation code is <strong>${code}</strong>. It expires in 15 minutes.</p><p>If this wasn't you, change your password immediately and contact support.</p>`,
-      }),
+    const delivery = await sendAuthEmailCode({
+      email,
+      purpose: "bank_change",
+      resendSubject: (code) => `Confirm your bank account change — code ${code}`,
+      resendHtml: (code) => `<p>Someone (hopefully you) is changing the bank account your Stallyard payouts go to.</p><p>Your confirmation code is <strong>${code}</strong>. It expires in 15 minutes.</p><p>If this wasn't you, change your password immediately and contact support.</p>`,
     });
-    if (!resendRes.ok) {
-      return res.status(400).json({ error: "Couldn't send a confirmation code — try again" });
-    }
     await setSecurityState("bank-change", req.user.id, {
-      code,
+      ...delivery,
       sentAt: Date.now(),
       bankCode,
       accountNumber,
@@ -13324,6 +13446,7 @@ app.post(
     }, BANK_CHANGE_CODE_TTL_MS);
     res.json({ confirmationRequired: true });
   } catch (err) {
+    if (err.emailOtpStatus) return res.status(err.emailOtpStatus).json({ error: err.message });
     sendInternalError(res, err);
   }
 });
@@ -13346,10 +13469,14 @@ app.post(
       return res.status(400).json({ error: "That code has expired — start the change again" });
     }
 
-    const expectedBuffer = Buffer.from(String(pending.code));
-    const submittedBuffer = Buffer.from(submittedCode);
-    const codeMatches = expectedBuffer.length === submittedBuffer.length &&
-      crypto.timingSafeEqual(expectedBuffer, submittedBuffer);
+    let codeMatches = false;
+    try { codeMatches = await verifyAuthEmailCode(pending, submittedCode); }
+    catch (err) {
+      if (!err.codeMismatch) {
+        if (err.emailOtpStatus) return res.status(err.emailOtpStatus).json({ error: err.message });
+        throw err;
+      }
+    }
 
     if (!codeMatches) {
       pending.failedAttempts = Number(pending.failedAttempts || 0) + 1;
