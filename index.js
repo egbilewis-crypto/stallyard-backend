@@ -921,6 +921,11 @@ async function finalizeOrderFromPaystackCharge(reference, paystackData) {
       if (!Number.isInteger(qty) || qty <= 0 || qty > availableQuantity) {
         throw new Error(`Paid listing ${cartItem.listingId} no longer has the requested quantity — payment requires an automatic refund`);
       }
+      if (cartItem.offerId) {
+        const price = await acceptedOfferPrice(client, cartItem.offerId, intent.buyer_id, listing.id, qty, paystackData.paid_at || paystackData.paidAt || new Date());
+        if (price !== Number(cartItem.unitPrice)) throw new Error("Accepted offer price changed.");
+        await client.query("UPDATE messages SET offer_status='paid' WHERE id=$1", [cartItem.offerId]);
+      }
       const price = Number(cartItem.unitPrice);
       const shippingFee = Number(cartItem.shippingFee) || 0;
       if (!(price > 0)) throw new Error("Payment integrity check failed: invalid item price snapshot");
@@ -3875,6 +3880,11 @@ const SCHEMA_MIGRATIONS = [
     `ALTER TABLE site_settings DROP CONSTRAINT IF EXISTS site_settings_auth_email_active_provider_check`,
     `ALTER TABLE site_settings ADD CONSTRAINT site_settings_auth_email_active_provider_check CHECK (auth_email_active_provider IN ('stalsend', 'resend'))`,
   ] },
+  { version: 102, name: "preset-messaging-and-offers", statements: [
+    `ALTER TABLE messages ADD COLUMN IF NOT EXISTS offer_accepted_at TIMESTAMPTZ`,
+    `ALTER TABLE messages ADD COLUMN IF NOT EXISTS offer_base_price NUMERIC(14,2)`,
+    `ALTER TABLE cart_items ADD COLUMN IF NOT EXISTS offer_id BIGINT`,
+  ] },
 ];
 
 async function ensureMigrationTable(client = pool) {
@@ -5464,7 +5474,7 @@ app.delete("/follows", authenticate, rejectAdminMarketplaceUse, async (req, res)
 app.get("/cart", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT listing_id, qty, offer_price FROM cart_items WHERE user_id = $1",
+      "SELECT listing_id, qty, offer_price, offer_id FROM cart_items WHERE user_id = $1",
       [req.user.id]
     );
     res.json({ items: result.rows });
@@ -5483,10 +5493,10 @@ app.put("/cart", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
     for (const item of items) {
       if (!item.listingId || !(Number(item.qty) > 0)) continue;
       await client.query(
-        `INSERT INTO cart_items (user_id, listing_id, qty, offer_price)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (user_id, listing_id) DO UPDATE SET qty = $3, offer_price = $4`,
-        [req.user.id, item.listingId, item.qty, item.offerPrice || null]
+        `INSERT INTO cart_items (user_id, listing_id, qty, offer_price, offer_id)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (user_id, listing_id) DO UPDATE SET qty = $3, offer_price = $4, offer_id = $5`,
+        [req.user.id, item.listingId, item.qty, item.offerPrice || null, item.offerId || null]
       );
     }
     await client.query("COMMIT");
@@ -9177,6 +9187,10 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, reject
         return res.status(400).json({ error: "Each cart item needs a valid listingId and a positive quantity" });
       }
       const listingId = Number(cartItem.listingId);
+      if (!Number.isSafeInteger(listingId) || listingId <= 0 || seenListingIds.has(listingId)) {
+        return res.status(400).json({ error: "Each valid listing may appear only once in checkout." });
+      }
+      seenListingIds.add(listingId);
       const listingResult = await pool.query(
         `SELECT listings.* FROM listings
           JOIN users ON users.id = listings.owner_id
@@ -9197,7 +9211,9 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, reject
       if (qty > availableQuantity) {
         return res.status(409).json({ error: `Only ${availableQuantity} unit${availableQuantity === 1 ? " is" : "s are"} available for ${listing.title}` });
       }
-      const price = Number(listing.price);
+      const price = cartItem.offerId
+        ? await acceptedOfferPrice(pool, cartItem.offerId, req.user.id, listing.id, qty)
+        : Number(listing.price);
       if (!(price > 0)) return res.status(400).json({ error: "Listing has an invalid price" });
       let shippingMethod;
       try { shippingMethod = chooseListingShippingMethod(listing, cartItem.shippingMethod); }
@@ -9208,7 +9224,7 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, reject
       const shippingFee = shippingQuote.fee;
       subtotal += price * qty;
       shippingTotal += shippingFee * qty;
-      itemSnapshots.push({ listingId: listing.id, qty, unitPrice: price, shippingFee, shippingMethod, shippingRoute: shippingQuote.route, pickupLocationEncrypted: shippingMethod === "pickup" ? listing.pickup_location_encrypted : null });
+      itemSnapshots.push({ listingId: listing.id, qty, offerId: cartItem.offerId || null, unitPrice: price, shippingFee, shippingMethod, shippingRoute: shippingQuote.route, pickupLocationEncrypted: shippingMethod === "pickup" ? listing.pickup_location_encrypted : null });
     }
 
     const commissionRate = await getCommissionRate();
@@ -9277,6 +9293,7 @@ app.post("/checkout/initialize", authenticate, rejectAdminMarketplaceUse, reject
     await recordPaymentAttempt(req.user.id, { reference, method: "checkout_initialize", status: "initialized", amount: total, currency: "NGN" });
     res.json({ authorizationUrl: paystackData.data.authorization_url, reference });
   } catch (err) {
+    if (err.code === "OFFER_UNAVAILABLE") return res.status(409).json({ error: err.message });
     sendInternalError(res, err);
   }
 });
@@ -9398,7 +9415,9 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
       if (qty > availableQuantity) {
         return res.status(409).json({ error: `Only ${availableQuantity} unit${availableQuantity === 1 ? " is" : "s are"} available for ${listing.title}` });
       }
-      const price = Number(listing.price);
+      const price = cartItem.offerId
+        ? await acceptedOfferPrice(pool, cartItem.offerId, req.user.id, listing.id, qty)
+        : Number(listing.price);
       if (!(price > 0)) return res.status(400).json({ error: "Listing has an invalid price" });
       let shippingMethod;
       try { shippingMethod = chooseListingShippingMethod(listing, cartItem.shippingMethod); }
@@ -9409,7 +9428,7 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
       const shippingFee = shippingQuote.fee;
       subtotal += price * qty;
       shippingTotal += shippingFee * qty;
-      itemSnapshots.push({ listingId: listing.id, qty, unitPrice: price, shippingFee, shippingMethod, shippingRoute: shippingQuote.route, pickupLocationEncrypted: shippingMethod === "pickup" ? listing.pickup_location_encrypted : null });
+      itemSnapshots.push({ listingId: listing.id, qty, offerId: cartItem.offerId || null, unitPrice: price, shippingFee, shippingMethod, shippingRoute: shippingQuote.route, pickupLocationEncrypted: shippingMethod === "pickup" ? listing.pickup_location_encrypted : null });
     }
     const taxRate = await getTaxRate();
     const taxAmount = Math.round(subtotal * taxRate * 100) / 100;
@@ -9507,6 +9526,7 @@ app.post("/checkout/pay-with-saved-card", authenticate, rejectAdminMarketplaceUs
       }
     }
   } catch (err) {
+    if (err.code === "OFFER_UNAVAILABLE") return res.status(409).json({ error: err.message });
     sendInternalError(res, err);
   }
 });
@@ -14627,44 +14647,170 @@ app.get("/threads/:userId", authenticate, rejectAdminMarketplaceUse, async (req,
   }
 });
 
+const MARKETPLACE_PRESETS = {
+  "item_available": "Is this item still available?",
+  "available_yes": "Yes, it’s available.",
+  "available_no": "No, it’s sold.",
+  "condition": "What condition is this item in?",
+  "new": "It’s new.",
+  "used": "It’s used.",
+  "refurbished": "It’s refurbished.",
+  "condition_details": "Please see the condition details on the listing.",
+  "more_pictures": "Can you add more pictures of this item?",
+  "add_pictures": "Yes, I’ll add more photos to the listing.",
+  "added_pictures": "I’ve added more photos to the listing.",
+  "all_pictures": "All available photos are already on the listing.",
+  "included": "What comes with this item?",
+  "included_details": "Please see what’s included on the listing.",
+  "updated_included": "I’ve updated the listing to show what’s included.",
+  "location": "Which state are you located in?",
+  "location_at": "Are you located in {state}?",
+  "location_yes": "Yes, I’m located there.",
+  "location_reply": "I’m located in {state}.",
+  "deliver": "Can you deliver to {state}?",
+  "delivery_yes": "Yes, delivery is available.",
+  "delivery_no": "Delivery isn’t available there.",
+  "pickup_only": "This item is pickup only.",
+  "delivery_cost": "How much is delivery to {state}?",
+  "delivery_price": "Delivery to {state} costs ₦{price}.",
+  "free_delivery": "Delivery is free to that location.",
+  "delivery_details": "Please check the delivery options on the listing.",
+  "pickup": "Is pickup available?",
+  "pickup_yes": "Yes, pickup is available. You’ll see the pickup details after purchase.",
+  "pickup_no": "Pickup isn’t available.",
+  "ship": "When can you ship the item?",
+  "ship_today": "I can ship today.",
+  "ship_short": "I can ship within 1–2 business days.",
+  "ship_long": "I can ship within 3–5 business days."
+};
+const BUYER_PRESETS = ["location", "location_at", "location_yes", "location_reply", "item_available", "condition", "more_pictures", "included", "deliver", "delivery_cost", "pickup", "ship"];
+const SELLER_PRESETS = ["available_yes", "available_no", "new", "used", "refurbished", "condition_details", "add_pictures", "added_pictures", "all_pictures", "included_details", "updated_included", "delivery_yes", "delivery_no", "pickup_only", "delivery_price", "free_delivery", "delivery_details", "pickup_yes", "pickup_no", "ship_today", "ship_short", "ship_long", "location", "location_at", "location_yes", "location_reply"];
+
+async function acceptedOfferPrice(client, offerId, buyerId, listingId, quantity, paidAt = new Date()) {
+  if (!/^[1-9]\d*$/.test(String(offerId)) || quantity !== 1) {
+    throw Object.assign(new Error("This offer is unavailable for the selected quantity."), { code: "OFFER_UNAVAILABLE" });
+  }
+  const result = await client.query(
+    `SELECT m.offer_amount FROM messages m
+       JOIN threads t ON t.id = m.thread_id
+       JOIN listings l ON l.id = t.listing_id AND l.owner_id = t.seller_id
+      WHERE m.id=$1 AND t.buyer_id=$2 AND t.listing_id=$3
+        AND m.message_type='offer' AND m.offer_status='accepted'
+        AND m.offer_accepted_at IS NOT NULL
+        AND $4::timestamptz >= m.offer_accepted_at
+        AND $4::timestamptz < m.offer_accepted_at + interval '24 hours'
+        AND NOT m.is_preview AND NOT t.is_preview AND NOT l.is_preview
+      FOR UPDATE OF m`,
+    [offerId, buyerId, listingId, paidAt]
+  );
+  const price = Number(result.rows[0]?.offer_amount);
+  if (!(price > 0)) {
+    throw Object.assign(new Error("This offer is unavailable, expired, or already used."), { code: "OFFER_UNAVAILABLE" });
+  }
+  return price;
+}
+
 app.post("/messages", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
-    const { threadId, body, messageType, offerAmount, imageUrl, orderId } = req.body;
+    const { threadId, preset, state, discount, counterTo } = req.body;
     const senderId = req.user.id;
 
     if (!threadId) {
       return res.status(400).json({ error: "Missing threadId" });
     }
-    const thread = await pool.query("SELECT buyer_id, seller_id, is_preview FROM threads WHERE id = $1", [threadId]);
-    if (thread.rows.length === 0) return res.status(404).json({ error: "Thread not found" });
-    if (thread.rows[0].buyer_id !== senderId && thread.rows[0].seller_id !== senderId) {
-      return res.status(403).json({ error: "You're not a part of this thread" });
+    const client = await pool.connect();
+    let recipientId;
+    let result;
+    try {
+      await client.query("BEGIN");
+      const { rows: [thread] } = await client.query(
+        `SELECT t.*, l.price, l.status, l.listing_type, l.shipping_route, l.shipping_fee, l.shipping_methods
+           FROM threads t JOIN listings l ON l.id=t.listing_id AND l.owner_id=t.seller_id
+          WHERE t.id=$1 FOR UPDATE OF t`, [threadId]
+      );
+      if (!thread) return res.status(404).json({ error: "Thread not found" });
+      const buyer = thread.buyer_id === senderId;
+      if ((!buyer && thread.seller_id !== senderId) || !!thread.is_preview !== !!req.user.isPreview) {
+        return res.status(403).json({ error: "You're not a part of this thread" });
+      }
+      recipientId = buyer ? thread.seller_id : thread.buyer_id;
+      let text;
+      let amount = null;
+      if (discount !== undefined) {
+        if (!Number.isInteger(discount) || discount < 1 || discount > 50 ||
+          thread.status !== "active" || (thread.listing_type || "fixed") !== "fixed" || !(Number(thread.price) > 0)) {
+          return res.status(400).json({ error: "Choose 1% to 50% off an active fixed-price listing." });
+        }
+        let basePrice = Number(thread.price);
+        if (counterTo) {
+          const offer = await client.query(
+            `UPDATE messages SET offer_status='countered'
+              WHERE id=$1 AND thread_id=$2 AND sender_id=$3 AND message_type='offer'
+                AND offer_status='pending' AND offer_base_price IS NOT NULL
+              RETURNING offer_base_price`, [counterTo, threadId, recipientId]
+          );
+          if (!offer.rowCount) return res.status(409).json({ error: "That offer is no longer open." });
+          basePrice = Number(offer.rows[0].offer_base_price);
+        } else {
+          if (!buyer) return res.status(403).json({ error: "Only the buyer can start an offer." });
+          const open = await client.query(
+            `SELECT 1 FROM messages WHERE thread_id=$1 AND message_type='offer'
+              AND offer_base_price IS NOT NULL AND (offer_status='pending' OR
+                (offer_status='accepted' AND offer_accepted_at > NOW() - interval '24 hours'))`,
+            [threadId]
+          );
+          if (open.rowCount) return res.status(409).json({ error: "This conversation already has an open offer." });
+        }
+        amount = Math.round(basePrice * (100 - discount)) / 100;
+        const formatted = amount.toLocaleString("en-NG", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        if (!(amount > 0)) return res.status(400).json({ error: "The discounted price must be at least one kobo." });
+        text = buyer ? `Would you accept ₦${formatted}, which is ${discount}% off the listed price?`
+          : `I can accept ₦${formatted}, which is ${discount}% off the listed price.`;
+        result = await client.query(
+          `INSERT INTO messages (thread_id,sender_id,message_type,body,offer_amount,offer_status,is_preview,offer_base_price)
+           VALUES ($1,$2,'offer',$3,$4,'pending',$5,$6) RETURNING *`,
+          [threadId,senderId,text,amount,!!req.user.isPreview,basePrice]
+        );
+      } else {
+        if (!(buyer ? BUYER_PRESETS : SELLER_PRESETS).includes(preset)) {
+          return res.status(400).json({ error: "Select an approved preset message." });
+        }
+        text = MARKETPLACE_PRESETS[preset];
+        if (text.includes("{state}") || preset === "free_delivery") {
+          if (typeof state !== "string" || !Object.hasOwn(NIGERIA_LGAS,state)) {
+            return res.status(400).json({ error: "Select a Nigerian state or the FCT." });
+          }
+          text = text.replace("{state}",state);
+        }
+        if (preset === "delivery_price" || preset === "free_delivery") {
+          const saved = thread.shipping_route || {};
+          const routes = Array.isArray(saved.routes) ? saved.routes : saved.shippingToState
+            ? [{ ...saved, amount: Number(thread.shipping_fee) || 0 }] : [];
+          const matching = routes.filter((route) => route.shippingToState === state);
+          const prices = [...new Set(matching.map((route) => Number(route.amount)))];
+          if (preset === "delivery_price" && prices.length === 1 && Number.isFinite(prices[0])) {
+            text = text.replace("{price}", prices[0].toFixed(2));
+          } else if (preset === "free_delivery" && thread.shipping_methods?.includes("free_shipping")) {
+            text = `Delivery is free to ${state}.`;
+          } else {
+            return res.status(400).json({ error: "No single delivery price is configured. Use the listing delivery options reply." });
+          }
+        }
+        result = await client.query(
+          `INSERT INTO messages (thread_id,sender_id,message_type,body,is_preview)
+           VALUES ($1,$2,'text',$3,$4) RETURNING *`,
+          [threadId,senderId,text,!!req.user.isPreview]
+        );
+      }
+      await client.query("COMMIT");
+    } finally {
+      await client.query("ROLLBACK").catch(() => {});
+      client.release();
     }
-    if (!!thread.rows[0].is_preview !== !!req.user.isPreview) {
-      return res.status(403).json({ error: "Preview conversations must remain inside the preview environment", code: "PREVIEW_ACCOUNT_RESTRICTED" });
-    }
-
-    const result = await pool.query(
-      `INSERT INTO messages (thread_id, sender_id, message_type, body, offer_amount, offer_status, image_url, order_id, is_preview)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-       RETURNING *`,
-      [
-        threadId,
-        senderId,
-        messageType || "text",
-        body || "",
-        offerAmount || null,
-        messageType === "offer" ? "pending" : null,
-        imageUrl || null,
-        orderId || null,
-        !!req.user.isPreview,
-      ]
-    );
 
     res.status(201).json({ message: result.rows[0] });
 
     try {
-      const recipientId = senderId === thread.rows[0].buyer_id ? thread.rows[0].seller_id : thread.rows[0].buyer_id;
       const senderInfo = await pool.query("SELECT display_name FROM users WHERE id = $1", [senderId]);
       createNotification(recipientId, "message", `New message from ${senderInfo.rows[0]?.display_name || "a buyer"}`);
     } catch (notifyErr) {
@@ -14700,7 +14846,12 @@ app.get("/messages/:threadId", authenticate, async (req, res) => {
       logAdminAction(req.user.id, "reported_conversation_viewed", `Viewed reported marketplace conversation thread #${req.params.threadId}`);
     }
     const result = await pool.query(
-      "SELECT * FROM messages WHERE thread_id = $1 ORDER BY created_at ASC",
+      `SELECT m.*, CASE
+          WHEN m.offer_status IN ('pending','accepted') AND l.status IS DISTINCT FROM 'active' THEN 'unavailable'
+          WHEN m.offer_status='accepted' AND m.offer_accepted_at <= NOW() - interval '24 hours' THEN 'expired'
+          ELSE m.offer_status END AS offer_status
+        FROM messages m JOIN threads t ON t.id=m.thread_id LEFT JOIN listings l ON l.id=t.listing_id
+        WHERE m.thread_id=$1 ORDER BY m.created_at ASC, m.id ASC`,
       [req.params.threadId]
     );
     res.json({ messages: result.rows });
@@ -14709,7 +14860,7 @@ app.get("/messages/:threadId", authenticate, async (req, res) => {
   }
 });
 
-app.patch("/messages/:id/offer", authenticate, async (req, res) => {
+app.patch("/messages/:id/offer", authenticate, rejectAdminMarketplaceUse, async (req, res) => {
   try {
     const { status } = req.body;
     if (!["accepted", "declined"].includes(status)) {
@@ -14723,19 +14874,30 @@ app.patch("/messages/:id/offer", authenticate, async (req, res) => {
     const msg = msgResult.rows[0];
     if (msg.message_type !== "offer") return res.status(400).json({ error: "That message isn't an offer" });
 
-    const threadResult = await pool.query("SELECT buyer_id, seller_id FROM threads WHERE id = $1", [msg.thread_id]);
+    const threadResult = await pool.query("SELECT buyer_id, seller_id, is_preview FROM threads WHERE id = $1", [msg.thread_id]);
     if (threadResult.rows.length === 0) return res.status(404).json({ error: "Thread not found" });
     const thread = threadResult.rows[0];
     const recipientId = msg.sender_id === thread.buyer_id ? thread.seller_id : thread.buyer_id;
-    if (req.user.id !== recipientId) {
+    if (req.user.id !== recipientId || !!thread.is_preview !== !!req.user.isPreview) {
       return res.status(403).json({ error: "Only the offer recipient can accept or decline it" });
     }
 
     const result = await pool.query(
-      "UPDATE messages SET offer_status = $1 WHERE id = $2 RETURNING *",
+      `UPDATE messages SET offer_status=$1, offer_accepted_at=CASE WHEN $1='accepted' THEN NOW() ELSE NULL END
+        WHERE id=$2 AND offer_status='pending' AND offer_base_price IS NOT NULL
+          AND ($1='declined' OR EXISTS (
+            SELECT 1 FROM threads t JOIN listings l ON l.id=t.listing_id AND l.owner_id=t.seller_id
+            WHERE t.id=messages.thread_id AND l.status='active'
+          )) RETURNING *`,
       [status, req.params.id]
     );
+    if (!result.rowCount) return res.status(409).json({ error: "That offer is no longer open." });
     res.json({ message: result.rows[0] });
+    try {
+      await createNotification(msg.sender_id, "message", status === "accepted" ? "Your offer was accepted." : "Your offer was declined.");
+    } catch (err) {
+      console.error("Failed to notify about offer response:", err.message);
+    }
   } catch (err) {
     sendInternalError(res, err);
   }
